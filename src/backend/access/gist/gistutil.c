@@ -4,7 +4,7 @@
  *	  utilities routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,12 +18,12 @@
 #include "access/gist_private.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
-#include "catalog/pg_opclass.h"
 #include "common/pg_prng.h"
 #include "storage/indexfsm.h"
-#include "storage/lmgr.h"
 #include "utils/float.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
@@ -573,7 +573,7 @@ gistdentryinit(GISTSTATE *giststate, int nkey, GISTENTRY *e,
 
 IndexTuple
 gistFormTuple(GISTSTATE *giststate, Relation r,
-			  Datum *attdata, bool *isnull, bool isleaf)
+			  const Datum *attdata, const bool *isnull, bool isleaf)
 {
 	Datum		compatt[INDEX_MAX_KEYS];
 	IndexTuple	res;
@@ -594,7 +594,7 @@ gistFormTuple(GISTSTATE *giststate, Relation r,
 
 void
 gistCompressValues(GISTSTATE *giststate, Relation r,
-				   Datum *attdata, bool *isnull, bool isleaf, Datum *compatt)
+				   const Datum *attdata, const bool *isnull, bool isleaf, Datum *compatt)
 {
 	int			i;
 
@@ -821,10 +821,9 @@ gistcheckpage(Relation rel, Buffer buf)
  * Caller is responsible for initializing the page by calling GISTInitBuffer
  */
 Buffer
-gistNewBuffer(Relation r)
+gistNewBuffer(Relation r, Relation heaprel)
 {
 	Buffer		buffer;
-	bool		needLock;
 
 	/* First, try to get a page from FSM */
 	for (;;)
@@ -865,7 +864,7 @@ gistNewBuffer(Relation r)
 				 * page's deleteXid.
 				 */
 				if (XLogStandbyInfoActive() && RelationNeedsWAL(r))
-					gistXLogPageReuse(r, blkno, GistPageGetDeleteXid(page));
+					gistXLogPageReuse(r, heaprel, blkno, GistPageGetDeleteXid(page));
 
 				return buffer;
 			}
@@ -878,16 +877,8 @@ gistNewBuffer(Relation r)
 	}
 
 	/* Must extend the file */
-	needLock = !RELATION_IS_LOCAL(r);
-
-	if (needLock)
-		LockRelationForExtension(r, ExclusiveLock);
-
-	buffer = ReadBuffer(r, P_NEW);
-	LockBuffer(buffer, GIST_EXCLUSIVE);
-
-	if (needLock)
-		UnlockRelationForExtension(r, ExclusiveLock);
+	buffer = ExtendBufferedRel(BMR_REL(r), MAIN_FORKNUM, NULL,
+							   EB_LOCK_FIRST);
 
 	return buffer;
 }
@@ -1064,4 +1055,46 @@ gistGetFakeLSN(Relation rel)
 		Assert(rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED);
 		return GetFakeLSNForUnloggedRel();
 	}
+}
+
+/*
+ * Returns the same number that was received.
+ *
+ * This is for GiST opclasses that use the RT*StrategyNumber constants.
+ */
+Datum
+gist_stratnum_identity(PG_FUNCTION_ARGS)
+{
+	StrategyNumber strat = PG_GETARG_UINT16(0);
+
+	PG_RETURN_UINT16(strat);
+}
+
+/*
+ * Returns the opclass's private stratnum used for the given strategy.
+ *
+ * Calls the opclass's GIST_STRATNUM_PROC support function, if any,
+ * and returns the result.
+ * Returns InvalidStrategy if the function is not defined.
+ */
+StrategyNumber
+GistTranslateStratnum(Oid opclass, StrategyNumber strat)
+{
+	Oid			opfamily;
+	Oid			opcintype;
+	Oid			funcid;
+	Datum		result;
+
+	/* Look up the opclass family and input datatype. */
+	if (!get_opclass_opfamily_and_input_type(opclass, &opfamily, &opcintype))
+		return InvalidStrategy;
+
+	/* Check whether the function is provided. */
+	funcid = get_opfamily_proc(opfamily, opcintype, opcintype, GIST_STRATNUM_PROC);
+	if (!OidIsValid(funcid))
+		return InvalidStrategy;
+
+	/* Ask the translation function */
+	result = OidFunctionCall1Coll(funcid, InvalidOid, UInt16GetDatum(strat));
+	return DatumGetUInt16(result);
 }

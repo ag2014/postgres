@@ -204,6 +204,7 @@ select '[{"b": "c"}, {"b": "cc"}]'::jsonb -> 'z';
 select '{"a": "c", "b": null}'::jsonb -> 'b';
 select '"foo"'::jsonb -> 1;
 select '"foo"'::jsonb -> 'z';
+select '[]'::jsonb -> -2147483648;
 
 select '{"a": [{"b": "c"}, {"b": "cc"}]}'::jsonb ->> null::text;
 select '{"a": [{"b": "c"}, {"b": "cc"}]}'::jsonb ->> null::int;
@@ -216,6 +217,7 @@ select '[{"b": "c"}, {"b": "cc"}]'::jsonb ->> 'z';
 select '{"a": "c", "b": null}'::jsonb ->> 'b';
 select '"foo"'::jsonb ->> 1;
 select '"foo"'::jsonb ->> 'z';
+select '[]'::jsonb ->> -2147483648;
 
 -- equality and inequality
 SELECT '{"x":"y"}'::jsonb = '{"x":"y"}'::jsonb;
@@ -412,6 +414,9 @@ SELECT jsonb_object_agg(name, type) FROM foo;
 
 INSERT INTO foo VALUES (999999, NULL, 'bar');
 SELECT jsonb_object_agg(name, type) FROM foo;
+
+-- edge case for parser
+SELECT jsonb_object_agg(DISTINCT 'a', 'abc');
 
 -- jsonb_object
 
@@ -675,6 +680,43 @@ SELECT rec FROM jsonb_populate_record(
 		row('x',3,'2012-12-31 15:30:56')::jbpop,NULL)::jsbrec,
 	'{"rec": {"a": "abc", "c": "01.02.2003", "x": 43.2}}'
 ) q;
+
+-- Tests to check soft-error support for populate_record_field()
+
+-- populate_scalar()
+create type jsb_char2 as (a char(2));
+select jsonb_populate_record_valid(NULL::jsb_char2, '{"a": "aaa"}');
+select * from jsonb_populate_record(NULL::jsb_char2, '{"a": "aaa"}') q;
+select jsonb_populate_record_valid(NULL::jsb_char2, '{"a": "aa"}');
+select * from jsonb_populate_record(NULL::jsb_char2, '{"a": "aa"}') q;
+
+-- populate_array()
+create type jsb_ia as (a int[]);
+create type jsb_ia2 as (a int[][]);
+select jsonb_populate_record_valid(NULL::jsb_ia, '{"a": 43.2}');
+select * from jsonb_populate_record(NULL::jsb_ia, '{"a": 43.2}') q;
+select jsonb_populate_record_valid(NULL::jsb_ia, '{"a": [1, 2]}');
+select * from jsonb_populate_record(NULL::jsb_ia, '{"a": [1, 2]}') q;
+select jsonb_populate_record_valid(NULL::jsb_ia2, '{"a": [[1], [2, 3]]}');
+select * from jsonb_populate_record(NULL::jsb_ia2, '{"a": [[1], [2, 3]]}') q;
+select jsonb_populate_record_valid(NULL::jsb_ia2, '{"a": [[1, 0], [2, 3]]}');
+select * from jsonb_populate_record(NULL::jsb_ia2, '{"a": [[1, 0], [2, 3]]}') q;
+
+-- populate_domain()
+create domain jsb_i_not_null as int not null;
+create domain jsb_i_gt_1 as int check (value > 1);
+create type jsb_i_not_null_rec as (a jsb_i_not_null);
+create type jsb_i_gt_1_rec as (a jsb_i_gt_1);
+select jsonb_populate_record_valid(NULL::jsb_i_not_null_rec, '{"a": null}');
+select * from jsonb_populate_record(NULL::jsb_i_not_null_rec, '{"a": null}') q;
+select jsonb_populate_record_valid(NULL::jsb_i_not_null_rec, '{"a": 1}');
+select * from jsonb_populate_record(NULL::jsb_i_not_null_rec, '{"a": 1}') q;
+select jsonb_populate_record_valid(NULL::jsb_i_gt_1_rec, '{"a": 1}');
+select * from jsonb_populate_record(NULL::jsb_i_gt_1_rec, '{"a": 1}') q;
+select jsonb_populate_record_valid(NULL::jsb_i_gt_1_rec, '{"a": 2}');
+select * from jsonb_populate_record(NULL::jsb_i_gt_1_rec, '{"a": 2}') q;
+drop type jsb_ia, jsb_ia2, jsb_char2, jsb_i_not_null_rec, jsb_i_gt_1_rec;
+drop domain jsb_i_not_null, jsb_i_gt_1;
 
 -- anonymous record type
 SELECT jsonb_populate_record(null::record, '{"x": 0, "y": 1}');
@@ -1145,6 +1187,7 @@ select jsonb_set('{"n":null, "a":1, "b":[1,2], "c":{"1":2}, "d":{"1":[2,3]}}'::j
 select jsonb_delete_path('{"n":null, "a":1, "b":[1,2], "c":{"1":2}, "d":{"1":[2,3]}}', '{n}');
 select jsonb_delete_path('{"n":null, "a":1, "b":[1,2], "c":{"1":2}, "d":{"1":[2,3]}}', '{b,-1}');
 select jsonb_delete_path('{"n":null, "a":1, "b":[1,2], "c":{"1":2}, "d":{"1":[2,3]}}', '{d,1,0}');
+select jsonb_delete_path('{"a":[]}', '{"a",-2147483648}');
 
 select '{"n":null, "a":1, "b":[1,2], "c":{"1":2}, "d":{"1":[2,3]}}'::jsonb #- '{n}';
 select '{"n":null, "a":1, "b":[1,2], "c":{"1":2}, "d":{"1":[2,3]}}'::jsonb #- '{b,-1}';

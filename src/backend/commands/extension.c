@@ -12,7 +12,7 @@
  * postgresql.conf.  An extension also has an installation script file,
  * containing SQL commands to create the extension's objects.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -32,7 +32,6 @@
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
-#include "access/sysattr.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
@@ -55,7 +54,7 @@
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "nodes/makefuncs.h"
+#include "nodes/queryjumble.h"
 #include "storage/fd.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
@@ -66,6 +65,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/varlena.h"
 
 
@@ -90,6 +90,8 @@ typedef struct ExtensionControlFile
 	bool		trusted;		/* allow becoming superuser on the fly? */
 	int			encoding;		/* encoding of the script file, or -1 */
 	List	   *requires;		/* names of prerequisite extensions */
+	List	   *no_relocate;	/* names of prerequisite extensions that
+								 * should not be relocated */
 } ExtensionControlFile;
 
 /*
@@ -105,6 +107,17 @@ typedef struct ExtensionVersionInfo
 	int			distance;		/* current worst-case distance estimate */
 	struct ExtensionVersionInfo *previous;	/* current best predecessor */
 } ExtensionVersionInfo;
+
+/*
+ * Information for script_error_callback()
+ */
+typedef struct
+{
+	const char *sql;			/* entire script file contents */
+	const char *filename;		/* script file pathname */
+	ParseLoc	stmt_location;	/* current stmt start loc, or -1 if unknown */
+	ParseLoc	stmt_len;		/* length in bytes; 0 means "rest of string" */
+} script_error_callback_arg;
 
 /* Local functions */
 static List *find_update_path(List *evi_list,
@@ -129,6 +142,9 @@ static void ApplyExtensionUpdates(Oid extensionOid,
 								  char *origSchemaName,
 								  bool cascade,
 								  bool is_create);
+static void ExecAlterExtensionContentsRecurse(AlterExtensionContentsStmt *stmt,
+											  ObjectAddress extension,
+											  ObjectAddress object);
 static char *read_whole_file(const char *filename, int *length);
 
 
@@ -142,32 +158,9 @@ Oid
 get_extension_oid(const char *extname, bool missing_ok)
 {
 	Oid			result;
-	Relation	rel;
-	SysScanDesc scandesc;
-	HeapTuple	tuple;
-	ScanKeyData entry[1];
 
-	rel = table_open(ExtensionRelationId, AccessShareLock);
-
-	ScanKeyInit(&entry[0],
-				Anum_pg_extension_extname,
-				BTEqualStrategyNumber, F_NAMEEQ,
-				CStringGetDatum(extname));
-
-	scandesc = systable_beginscan(rel, ExtensionNameIndexId, true,
-								  NULL, 1, entry);
-
-	tuple = systable_getnext(scandesc);
-
-	/* We assume that there can be at most one matching tuple */
-	if (HeapTupleIsValid(tuple))
-		result = ((Form_pg_extension) GETSTRUCT(tuple))->oid;
-	else
-		result = InvalidOid;
-
-	systable_endscan(scandesc);
-
-	table_close(rel, AccessShareLock);
+	result = GetSysCacheOid1(EXTENSIONNAME, Anum_pg_extension_oid,
+							 CStringGetDatum(extname));
 
 	if (!OidIsValid(result) && !missing_ok)
 		ereport(ERROR,
@@ -187,32 +180,15 @@ char *
 get_extension_name(Oid ext_oid)
 {
 	char	   *result;
-	Relation	rel;
-	SysScanDesc scandesc;
 	HeapTuple	tuple;
-	ScanKeyData entry[1];
 
-	rel = table_open(ExtensionRelationId, AccessShareLock);
+	tuple = SearchSysCache1(EXTENSIONOID, ObjectIdGetDatum(ext_oid));
 
-	ScanKeyInit(&entry[0],
-				Anum_pg_extension_oid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(ext_oid));
+	if (!HeapTupleIsValid(tuple))
+		return NULL;
 
-	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
-								  NULL, 1, entry);
-
-	tuple = systable_getnext(scandesc);
-
-	/* We assume that there can be at most one matching tuple */
-	if (HeapTupleIsValid(tuple))
-		result = pstrdup(NameStr(((Form_pg_extension) GETSTRUCT(tuple))->extname));
-	else
-		result = NULL;
-
-	systable_endscan(scandesc);
-
-	table_close(rel, AccessShareLock);
+	result = pstrdup(NameStr(((Form_pg_extension) GETSTRUCT(tuple))->extname));
+	ReleaseSysCache(tuple);
 
 	return result;
 }
@@ -222,36 +198,19 @@ get_extension_name(Oid ext_oid)
  *
  * Returns InvalidOid if no such extension.
  */
-static Oid
+Oid
 get_extension_schema(Oid ext_oid)
 {
 	Oid			result;
-	Relation	rel;
-	SysScanDesc scandesc;
 	HeapTuple	tuple;
-	ScanKeyData entry[1];
 
-	rel = table_open(ExtensionRelationId, AccessShareLock);
+	tuple = SearchSysCache1(EXTENSIONOID, ObjectIdGetDatum(ext_oid));
 
-	ScanKeyInit(&entry[0],
-				Anum_pg_extension_oid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(ext_oid));
+	if (!HeapTupleIsValid(tuple))
+		return InvalidOid;
 
-	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
-								  NULL, 1, entry);
-
-	tuple = systable_getnext(scandesc);
-
-	/* We assume that there can be at most one matching tuple */
-	if (HeapTupleIsValid(tuple))
-		result = ((Form_pg_extension) GETSTRUCT(tuple))->extnamespace;
-	else
-		result = InvalidOid;
-
-	systable_endscan(scandesc);
-
-	table_close(rel, AccessShareLock);
+	result = ((Form_pg_extension) GETSTRUCT(tuple))->extnamespace;
+	ReleaseSysCache(tuple);
 
 	return result;
 }
@@ -606,6 +565,21 @@ parse_extension_control_file(ExtensionControlFile *control,
 								item->name)));
 			}
 		}
+		else if (strcmp(item->name, "no_relocate") == 0)
+		{
+			/* Need a modifiable copy of string */
+			char	   *rawnames = pstrdup(item->value);
+
+			/* Parse string into list of identifiers */
+			if (!SplitIdentifierString(rawnames, ',', &control->no_relocate))
+			{
+				/* syntax error in name list */
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("parameter \"%s\" must be a list of extension names",
+								item->name)));
+			}
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -709,7 +683,141 @@ read_extension_script_file(const ExtensionControlFile *control,
 }
 
 /*
+ * error context callback for failures in script-file execution
+ */
+static void
+script_error_callback(void *arg)
+{
+	script_error_callback_arg *callback_arg = (script_error_callback_arg *) arg;
+	const char *query = callback_arg->sql;
+	int			location = callback_arg->stmt_location;
+	int			len = callback_arg->stmt_len;
+	int			syntaxerrposition;
+	const char *lastslash;
+
+	/*
+	 * If there is a syntax error position, convert to internal syntax error;
+	 * otherwise report the current query as an item of context stack.
+	 *
+	 * Note: we'll provide no context except the filename if there's neither
+	 * an error position nor any known current query.  That shouldn't happen
+	 * though: all errors reported during raw parsing should come with an
+	 * error position.
+	 */
+	syntaxerrposition = geterrposition();
+	if (syntaxerrposition > 0)
+	{
+		/*
+		 * If we do not know the bounds of the current statement (as would
+		 * happen for an error occurring during initial raw parsing), we have
+		 * to use a heuristic to decide how much of the script to show.  We'll
+		 * also use the heuristic in the unlikely case that syntaxerrposition
+		 * is outside what we think the statement bounds are.
+		 */
+		if (location < 0 || syntaxerrposition < location ||
+			(len > 0 && syntaxerrposition > location + len))
+		{
+			/*
+			 * Our heuristic is pretty simple: look for semicolon-newline
+			 * sequences, and break at the last one strictly before
+			 * syntaxerrposition and the first one strictly after.  It's
+			 * certainly possible to fool this with semicolon-newline embedded
+			 * in a string literal, but it seems better to do this than to
+			 * show the entire extension script.
+			 *
+			 * Notice we cope with Windows-style newlines (\r\n) regardless of
+			 * platform.  This is because there might be such newlines in
+			 * script files on other platforms.
+			 */
+			int			slen = strlen(query);
+
+			location = len = 0;
+			for (int loc = 0; loc < slen; loc++)
+			{
+				if (query[loc] != ';')
+					continue;
+				if (query[loc + 1] == '\r')
+					loc++;
+				if (query[loc + 1] == '\n')
+				{
+					int			bkpt = loc + 2;
+
+					if (bkpt < syntaxerrposition)
+						location = bkpt;
+					else if (bkpt > syntaxerrposition)
+					{
+						len = bkpt - location;
+						break;	/* no need to keep searching */
+					}
+				}
+			}
+		}
+
+		/* Trim leading/trailing whitespace, for consistency */
+		query = CleanQuerytext(query, &location, &len);
+
+		/*
+		 * Adjust syntaxerrposition.  It shouldn't be pointing into the
+		 * whitespace we just trimmed, but cope if it is.
+		 */
+		syntaxerrposition -= location;
+		if (syntaxerrposition < 0)
+			syntaxerrposition = 0;
+		else if (syntaxerrposition > len)
+			syntaxerrposition = len;
+
+		/* And report. */
+		errposition(0);
+		internalerrposition(syntaxerrposition);
+		internalerrquery(pnstrdup(query, len));
+	}
+	else if (location >= 0)
+	{
+		/*
+		 * Since no syntax cursor will be shown, it's okay and helpful to trim
+		 * the reported query string to just the current statement.
+		 */
+		query = CleanQuerytext(query, &location, &len);
+		errcontext("SQL statement \"%.*s\"", len, query);
+	}
+
+	/*
+	 * Trim the reported file name to remove the path.  We know that
+	 * get_extension_script_filename() inserted a '/', regardless of whether
+	 * we're on Windows.
+	 */
+	lastslash = strrchr(callback_arg->filename, '/');
+	if (lastslash)
+		lastslash++;
+	else
+		lastslash = callback_arg->filename; /* shouldn't happen, but cope */
+
+	/*
+	 * If we have a location (which, as said above, we really always should)
+	 * then report a line number to aid in localizing problems in big scripts.
+	 */
+	if (location >= 0)
+	{
+		int			linenumber = 1;
+
+		for (query = callback_arg->sql; *query; query++)
+		{
+			if (--location < 0)
+				break;
+			if (*query == '\n')
+				linenumber++;
+		}
+		errcontext("extension script file \"%s\", near line %d",
+				   lastslash, linenumber);
+	}
+	else
+		errcontext("extension script file \"%s\"", lastslash);
+}
+
+/*
  * Execute given SQL string.
+ *
+ * The filename the string came from is also provided, for error reporting.
  *
  * Note: it's tempting to just use SPI to execute the string, but that does
  * not work very well.  The really serious problem is that SPI will parse,
@@ -720,11 +828,26 @@ read_extension_script_file(const ExtensionControlFile *control,
  * could be very long.
  */
 static void
-execute_sql_string(const char *sql)
+execute_sql_string(const char *sql, const char *filename)
 {
+	script_error_callback_arg callback_arg;
+	ErrorContextCallback scripterrcontext;
 	List	   *raw_parsetree_list;
 	DestReceiver *dest;
 	ListCell   *lc1;
+
+	/*
+	 * Setup error traceback support for ereport().
+	 */
+	callback_arg.sql = sql;
+	callback_arg.filename = filename;
+	callback_arg.stmt_location = -1;
+	callback_arg.stmt_len = -1;
+
+	scripterrcontext.callback = script_error_callback;
+	scripterrcontext.arg = (void *) &callback_arg;
+	scripterrcontext.previous = error_context_stack;
+	error_context_stack = &scripterrcontext;
 
 	/*
 	 * Parse the SQL string into a list of raw parse trees.
@@ -746,6 +869,10 @@ execute_sql_string(const char *sql)
 					oldcontext;
 		List	   *stmt_list;
 		ListCell   *lc2;
+
+		/* Report location of this query for error context callback */
+		callback_arg.stmt_location = parsetree->stmt_location;
+		callback_arg.stmt_len = parsetree->stmt_len;
 
 		/*
 		 * We do the work for each parsetree in a short-lived context, to
@@ -816,6 +943,8 @@ execute_sql_string(const char *sql)
 		MemoryContextDelete(per_parsetree_context);
 	}
 
+	error_context_stack = scripterrcontext.previous;
+
 	/* Be sure to advance the command counter after the last script command */
 	CommandCounterIncrement();
 }
@@ -845,6 +974,8 @@ extension_is_trusted(ExtensionControlFile *control)
  * Execute the appropriate script file for installing or updating the extension
  *
  * If from_version isn't NULL, it's an update
+ *
+ * Note: requiredSchemas must be one-for-one with the control->requires list
  */
 static void
 execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
@@ -860,6 +991,7 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 	int			save_nestlevel;
 	StringInfoData pathbuf;
 	ListCell   *lc;
+	ListCell   *lc2;
 
 	/*
 	 * Enforce superuser-ness if appropriate.  We postpone these checks until
@@ -947,11 +1079,6 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 	 * searched anyway.  (Listing pg_catalog explicitly in a non-first
 	 * position would be bad for security.)  Finally add pg_temp to ensure
 	 * that temp objects can't take precedence over others.
-	 *
-	 * Note: it might look tempting to use PushOverrideSearchPath for this,
-	 * but we cannot do that.  We have to actually set the search_path GUC in
-	 * case the extension script examines or changes it.  In any case, the
-	 * GUC_ACTION_SAVE method is just as convenient.
 	 */
 	initStringInfo(&pathbuf);
 	appendStringInfoString(&pathbuf, quote_identifier(schemaName));
@@ -980,6 +1107,16 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 	{
 		char	   *c_sql = read_extension_script_file(control, filename);
 		Datum		t_sql;
+
+		/*
+		 * We filter each substitution through quote_identifier().  When the
+		 * arg contains one of the following characters, no one collection of
+		 * quoting can work inside $$dollar-quoted string literals$$,
+		 * 'single-quoted string literals', and outside of any literal.  To
+		 * avoid a security snare for extension authors, error on substitution
+		 * for arguments containing these.
+		 */
+		const char *quoting_relevant_chars = "\"$'\\";
 
 		/* We use various functions that want to operate on text datums */
 		t_sql = CStringGetTextDatum(c_sql);
@@ -1010,6 +1147,11 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 											t_sql,
 											CStringGetTextDatum("@extowner@"),
 											CStringGetTextDatum(qUserName));
+			if (strpbrk(userName, quoting_relevant_chars))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("invalid character in extension owner: must not contain any of \"%s\"",
+								quoting_relevant_chars)));
 		}
 
 		/*
@@ -1021,6 +1163,7 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 		 */
 		if (!control->relocatable)
 		{
+			Datum		old = t_sql;
 			const char *qSchemaName = quote_identifier(schemaName);
 
 			t_sql = DirectFunctionCall3Coll(replace_text,
@@ -1028,6 +1171,38 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 											t_sql,
 											CStringGetTextDatum("@extschema@"),
 											CStringGetTextDatum(qSchemaName));
+			if (t_sql != old && strpbrk(schemaName, quoting_relevant_chars))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("invalid character in extension \"%s\" schema: must not contain any of \"%s\"",
+								control->name, quoting_relevant_chars)));
+		}
+
+		/*
+		 * Likewise, substitute required extensions' schema names for
+		 * occurrences of @extschema:extension_name@.
+		 */
+		Assert(list_length(control->requires) == list_length(requiredSchemas));
+		forboth(lc, control->requires, lc2, requiredSchemas)
+		{
+			Datum		old = t_sql;
+			char	   *reqextname = (char *) lfirst(lc);
+			Oid			reqschema = lfirst_oid(lc2);
+			char	   *schemaName = get_namespace_name(reqschema);
+			const char *qSchemaName = quote_identifier(schemaName);
+			char	   *repltoken;
+
+			repltoken = psprintf("@extschema:%s@", reqextname);
+			t_sql = DirectFunctionCall3Coll(replace_text,
+											C_COLLATION_OID,
+											t_sql,
+											CStringGetTextDatum(repltoken),
+											CStringGetTextDatum(qSchemaName));
+			if (t_sql != old && strpbrk(schemaName, quoting_relevant_chars))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+						 errmsg("invalid character in extension \"%s\" schema: must not contain any of \"%s\"",
+								reqextname, quoting_relevant_chars)));
 		}
 
 		/*
@@ -1046,7 +1221,7 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 		/* And now back to C string */
 		c_sql = text_to_cstring(DatumGetTextPP(t_sql));
 
-		execute_sql_string(c_sql);
+		execute_sql_string(c_sql, filename);
 	}
 	PG_FINALLY();
 	{
@@ -2709,7 +2884,7 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 {
 	Oid			extensionOid;
 	Oid			nspOid;
-	Oid			oldNspOid = InvalidOid;
+	Oid			oldNspOid;
 	AclResult	aclresult;
 	Relation	extRel;
 	ScanKeyData key[2];
@@ -2792,6 +2967,9 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 
 	objsMoved = new_object_addresses();
 
+	/* store the OID of the namespace to-be-changed */
+	oldNspOid = extForm->extnamespace;
+
 	/*
 	 * Scan pg_depend to find objects that depend directly on the extension,
 	 * and alter each one's schema.
@@ -2817,9 +2995,43 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 		Oid			dep_oldNspOid;
 
 		/*
-		 * Ignore non-membership dependencies.  (Currently, the only other
-		 * case we could see here is a normal dependency from another
-		 * extension.)
+		 * If a dependent extension has a no_relocate request for this
+		 * extension, disallow SET SCHEMA.  (XXX it's a bit ugly to do this in
+		 * the same loop that's actually executing the renames: we may detect
+		 * the error condition only after having expended a fair amount of
+		 * work.  However, the alternative is to do two scans of pg_depend,
+		 * which seems like optimizing for failure cases.  The rename work
+		 * will all roll back cleanly enough if we do fail here.)
+		 */
+		if (pg_depend->deptype == DEPENDENCY_NORMAL &&
+			pg_depend->classid == ExtensionRelationId)
+		{
+			char	   *depextname = get_extension_name(pg_depend->objid);
+			ExtensionControlFile *dcontrol;
+			ListCell   *lc;
+
+			dcontrol = read_extension_control_file(depextname);
+			foreach(lc, dcontrol->no_relocate)
+			{
+				char	   *nrextname = (char *) lfirst(lc);
+
+				if (strcmp(nrextname, NameStr(extForm->extname)) == 0)
+				{
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("cannot SET SCHEMA of extension \"%s\" because other extensions prevent it",
+									NameStr(extForm->extname)),
+							 errdetail("Extension \"%s\" requests no relocation of extension \"%s\".",
+									   depextname,
+									   NameStr(extForm->extname))));
+				}
+			}
+		}
+
+		/*
+		 * Otherwise, ignore non-membership dependencies.  (Currently, the
+		 * only other case we could see here is a normal dependency from
+		 * another extension.)
 		 */
 		if (pg_depend->deptype != DEPENDENCY_EXTENSION)
 			continue;
@@ -2838,14 +3050,8 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 												 objsMoved);
 
 		/*
-		 * Remember previous namespace of first object that has one
-		 */
-		if (oldNspOid == InvalidOid && dep_oldNspOid != InvalidOid)
-			oldNspOid = dep_oldNspOid;
-
-		/*
 		 * If not all the objects had the same old namespace (ignoring any
-		 * that are not in namespaces), complain.
+		 * that are not in namespaces or are dependent types), complain.
 		 */
 		if (dep_oldNspOid != InvalidOid && dep_oldNspOid != oldNspOid)
 			ereport(ERROR,
@@ -2872,9 +3078,11 @@ AlterExtensionNamespace(const char *extensionName, const char *newschema, Oid *o
 
 	table_close(extRel, RowExclusiveLock);
 
-	/* update dependencies to point to the new schema */
-	changeDependencyFor(ExtensionRelationId, extensionOid,
-						NamespaceRelationId, oldNspOid, nspOid);
+	/* update dependency to point to the new schema */
+	if (changeDependencyFor(ExtensionRelationId, extensionOid,
+							NamespaceRelationId, oldNspOid, nspOid) != 1)
+		elog(ERROR, "could not change schema dependency for extension %s",
+			 NameStr(extForm->extname));
 
 	InvokeObjectPostAlterHook(ExtensionRelationId, extensionOid, 0);
 
@@ -3198,7 +3406,6 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt,
 	ObjectAddress extension;
 	ObjectAddress object;
 	Relation	relation;
-	Oid			oldExtension;
 
 	switch (stmt->objtype)
 	{
@@ -3252,6 +3459,38 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt,
 	/* Permission check: must own target object, too */
 	check_object_ownership(GetUserId(), stmt->objtype, object,
 						   stmt->object, relation);
+
+	/* Do the update, recursing to any dependent objects */
+	ExecAlterExtensionContentsRecurse(stmt, extension, object);
+
+	/* Finish up */
+	InvokeObjectPostAlterHook(ExtensionRelationId, extension.objectId, 0);
+
+	/*
+	 * If get_object_address() opened the relation for us, we close it to keep
+	 * the reference count correct - but we retain any locks acquired by
+	 * get_object_address() until commit time, to guard against concurrent
+	 * activity.
+	 */
+	if (relation != NULL)
+		relation_close(relation, NoLock);
+
+	return extension;
+}
+
+/*
+ * ExecAlterExtensionContentsRecurse
+ *		Subroutine for ExecAlterExtensionContentsStmt
+ *
+ * Do the bare alteration of object's membership in extension,
+ * without permission checks.  Recurse to dependent objects, if any.
+ */
+static void
+ExecAlterExtensionContentsRecurse(AlterExtensionContentsStmt *stmt,
+								  ObjectAddress extension,
+								  ObjectAddress object)
+{
+	Oid			oldExtension;
 
 	/*
 	 * Check existing extension membership.
@@ -3336,25 +3575,55 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt,
 		removeExtObjInitPriv(object.objectId, object.classId);
 	}
 
-	InvokeObjectPostAlterHook(ExtensionRelationId, extension.objectId, 0);
-
 	/*
-	 * If get_object_address() opened the relation for us, we close it to keep
-	 * the reference count correct - but we retain any locks acquired by
-	 * get_object_address() until commit time, to guard against concurrent
-	 * activity.
+	 * Recurse to any dependent objects; currently, this includes the array
+	 * type of a base type, the multirange type associated with a range type,
+	 * and the rowtype of a table.
 	 */
-	if (relation != NULL)
-		relation_close(relation, NoLock);
+	if (object.classId == TypeRelationId)
+	{
+		ObjectAddress depobject;
 
-	return extension;
+		depobject.classId = TypeRelationId;
+		depobject.objectSubId = 0;
+
+		/* If it has an array type, update that too */
+		depobject.objectId = get_array_type(object.objectId);
+		if (OidIsValid(depobject.objectId))
+			ExecAlterExtensionContentsRecurse(stmt, extension, depobject);
+
+		/* If it is a range type, update the associated multirange too */
+		if (type_is_range(object.objectId))
+		{
+			depobject.objectId = get_range_multirange(object.objectId);
+			if (!OidIsValid(depobject.objectId))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("could not find multirange type for data type %s",
+								format_type_be(object.objectId))));
+			ExecAlterExtensionContentsRecurse(stmt, extension, depobject);
+		}
+	}
+	if (object.classId == RelationRelationId)
+	{
+		ObjectAddress depobject;
+
+		depobject.classId = TypeRelationId;
+		depobject.objectSubId = 0;
+
+		/* It might not have a rowtype, but if it does, update that */
+		depobject.objectId = get_rel_type_id(object.objectId);
+		if (OidIsValid(depobject.objectId))
+			ExecAlterExtensionContentsRecurse(stmt, extension, depobject);
+	}
 }
 
 /*
  * Read the whole of file into memory.
  *
  * The file contents are returned as a single palloc'd chunk. For convenience
- * of the callers, an extra \0 byte is added to the end.
+ * of the callers, an extra \0 byte is added to the end.  That is not counted
+ * in the length returned into *length.
  */
 static char *
 read_whole_file(const char *filename, int *length)
@@ -3383,7 +3652,7 @@ read_whole_file(const char *filename, int *length)
 
 	buf = (char *) palloc(bytes_to_read + 1);
 
-	*length = fread(buf, 1, bytes_to_read, file);
+	bytes_to_read = fread(buf, 1, bytes_to_read, file);
 
 	if (ferror(file))
 		ereport(ERROR,
@@ -3392,6 +3661,31 @@ read_whole_file(const char *filename, int *length)
 
 	FreeFile(file);
 
-	buf[*length] = '\0';
+	buf[bytes_to_read] = '\0';
+
+	/*
+	 * On Windows, manually convert Windows-style newlines (\r\n) to the Unix
+	 * convention of \n only.  This avoids gotchas due to script files
+	 * possibly getting converted when being transferred between platforms.
+	 * Ideally we'd do this by using text mode to read the file, but that also
+	 * causes control-Z to be treated as end-of-file.  Historically we've
+	 * allowed control-Z in script files, so breaking that seems unwise.
+	 */
+#ifdef WIN32
+	{
+		char	   *s,
+				   *d;
+
+		for (s = d = buf; *s; s++)
+		{
+			if (!(*s == '\r' && s[1] == '\n'))
+				*d++ = *s;
+		}
+		*d = '\0';
+		bytes_to_read = d - buf;
+	}
+#endif
+
+	*length = bytes_to_read;
 	return buf;
 }

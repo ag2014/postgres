@@ -3,6 +3,9 @@
 PGFILEDESC = "pg_upgrade - an in-place binary upgrade utility"
 PGAPPICON = win32
 
+# required for 003_upgrade_logical_replication_slots.pl
+EXTRA_INSTALL=contrib/test_decoding
+
 subdir = src/bin/pg_upgrade
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
@@ -22,6 +25,7 @@ OBJS = \
 	relfilenumber.o \
 	server.o \
 	tablespace.o \
+	task.o \
 	util.o \
 	version.o
 
@@ -46,10 +50,12 @@ installdirs:
 uninstall:
 	rm -f '$(DESTDIR)$(bindir)/pg_upgrade$(X)'
 
-clean distclean maintainer-clean:
+clean distclean:
 	rm -f pg_upgrade$(X) $(OBJS)
 	rm -rf delete_old_cluster.sh log/ tmp_check/ \
 	       reindex_hash.sql
+
+export with_icu
 
 check:
 	$(prove_check)

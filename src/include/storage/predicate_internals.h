@@ -4,7 +4,7 @@
  *	  POSTGRES internal predicate locking definitions.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/predicate_internals.h
@@ -196,7 +196,7 @@ typedef struct RWConflictData
 	dlist_node	inLink;			/* link for list of conflicts in to a sxact */
 	SERIALIZABLEXACT *sxactOut;
 	SERIALIZABLEXACT *sxactIn;
-}			RWConflictData;
+} RWConflictData;
 
 typedef struct RWConflictData *RWConflict;
 
@@ -362,7 +362,7 @@ typedef enum PredicateLockTargetType
 {
 	PREDLOCKTAG_RELATION,
 	PREDLOCKTAG_PAGE,
-	PREDLOCKTAG_TUPLE
+	PREDLOCKTAG_TUPLE,
 	/* TODO SSI: Other types may be needed for index locking */
 } PredicateLockTargetType;
 
@@ -424,7 +424,7 @@ typedef struct PredicateLockData
 typedef enum TwoPhasePredicateRecordType
 {
 	TWOPHASEPREDICATERECORD_XACT,
-	TWOPHASEPREDICATERECORD_LOCK
+	TWOPHASEPREDICATERECORD_LOCK,
 } TwoPhasePredicateRecordType;
 
 /*

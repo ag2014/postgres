@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 tests += {
   'name': 'ssl',
@@ -6,8 +6,8 @@ tests += {
   'bd': meson.current_build_dir(),
   'tap': {
     'env': {
-      'with_ssl': get_option('ssl'),
-      'OPENSSL': openssl.path(),
+      'with_ssl': ssl_library,
+      'OPENSSL': openssl.found() ? openssl.path() : '',
     },
     'tests': [
       't/001_ssltests.pl',

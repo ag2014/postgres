@@ -4,7 +4,7 @@
  *
  * Routines to handle DML permission checks
  *
- * Copyright (c) 2010-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2024, PostgreSQL Global Development Group
  *
  * -------------------------------------------------------------------------
  */
@@ -231,7 +231,8 @@ check_relation_privileges(Oid relOid,
 	updated = fixup_whole_row_references(relOid, updated);
 	columns = bms_union(selected, bms_union(inserted, updated));
 
-	while ((index = bms_first_member(columns)) >= 0)
+	index = -1;
+	while ((index = bms_next_member(columns, index)) >= 0)
 	{
 		AttrNumber	attnum;
 		uint32		column_perms = 0;

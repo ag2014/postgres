@@ -3,7 +3,7 @@
  * joininfo.c
  *	  joininfo list manipulation routines
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,9 +14,12 @@
  */
 #include "postgres.h"
 
+#include "nodes/makefuncs.h"
 #include "optimizer/joininfo.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
+#include "optimizer/planmain.h"
+#include "optimizer/restrictinfo.h"
 
 
 /*
@@ -97,6 +100,39 @@ add_join_clause_to_rels(PlannerInfo *root,
 						Relids join_relids)
 {
 	int			cur_relid;
+
+	/* Don't add the clause if it is always true */
+	if (restriction_is_always_true(root, restrictinfo))
+		return;
+
+	/*
+	 * Substitute the origin qual with constant-FALSE if it is provably always
+	 * false.
+	 *
+	 * Note that we need to keep the same rinfo_serial, since it is in
+	 * practice the same condition.  We also need to reset the
+	 * last_rinfo_serial counter, which is essential to ensure that the
+	 * RestrictInfos for the "same" qual condition get identical serial
+	 * numbers (see deconstruct_distribute_oj_quals).
+	 */
+	if (restriction_is_always_false(root, restrictinfo))
+	{
+		int			save_rinfo_serial = restrictinfo->rinfo_serial;
+		int			save_last_rinfo_serial = root->last_rinfo_serial;
+
+		restrictinfo = make_restrictinfo(root,
+										 (Expr *) makeBoolConst(false, false),
+										 restrictinfo->is_pushed_down,
+										 restrictinfo->has_clone,
+										 restrictinfo->is_clone,
+										 restrictinfo->pseudoconstant,
+										 0, /* security_level */
+										 restrictinfo->required_relids,
+										 restrictinfo->incompatible_relids,
+										 restrictinfo->outer_relids);
+		restrictinfo->rinfo_serial = save_rinfo_serial;
+		root->last_rinfo_serial = save_last_rinfo_serial;
+	}
 
 	cur_relid = -1;
 	while ((cur_relid = bms_next_member(join_relids, cur_relid)) >= 0)

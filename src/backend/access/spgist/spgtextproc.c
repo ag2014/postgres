@@ -29,7 +29,7 @@
  * No new entries ever get pushed into a -2-labeled child, either.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -41,9 +41,10 @@
 
 #include "access/spgist.h"
 #include "catalog/pg_type.h"
+#include "common/int.h"
 #include "mb/pg_wchar.h"
-#include "utils/builtins.h"
 #include "utils/datum.h"
+#include "utils/fmgrprotos.h"
 #include "utils/pg_locale.h"
 #include "utils/varlena.h"
 #include "varatt.h"
@@ -325,7 +326,7 @@ cmpNodePtr(const void *a, const void *b)
 	const spgNodePtr *aa = (const spgNodePtr *) a;
 	const spgNodePtr *bb = (const spgNodePtr *) b;
 
-	return aa->c - bb->c;
+	return pg_cmp_s16(aa->c, bb->c);
 }
 
 Datum
@@ -426,7 +427,7 @@ spg_text_inner_consistent(PG_FUNCTION_ARGS)
 {
 	spgInnerConsistentIn *in = (spgInnerConsistentIn *) PG_GETARG_POINTER(0);
 	spgInnerConsistentOut *out = (spgInnerConsistentOut *) PG_GETARG_POINTER(1);
-	bool		collate_is_c = lc_collate_is_c(PG_GET_COLLATION());
+	bool		collate_is_c = pg_newlocale_from_collation(PG_GET_COLLATION())->collate_is_c;
 	text	   *reconstructedValue;
 	text	   *reconstrText;
 	int			maxReconstrLen;

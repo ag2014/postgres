@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 ### Compute pgxs_data, used in src/meson.build to generate Makefile.global
 ### etc, that's complete enough for PGXS to work.
@@ -16,7 +16,7 @@ if strip_bin.found()
       strip_version.stdout().contains('GNU strip') or
       strip_version.stderr().contains('GNU strip'))
     working_strip = true
-    strip_static_cmd = strip_cmd + ['-x']
+    strip_static_cmd = strip_cmd + ['--strip-unneeded']
     strip_shared_cmd = strip_cmd + ['--strip-unneeded']
   elif host_system == 'darwin'
     working_strip = true
@@ -52,9 +52,9 @@ pgxs_kv = {
   'abs_top_builddir': meson.build_root(),
   'abs_top_srcdir': meson.source_root(),
 
-  'enable_thread_safety': 'yes',
   'enable_rpath': get_option('rpath') ? 'yes' : 'no',
   'enable_nls': libintl.found() ? 'yes' : 'no',
+  'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
   'enable_tap_tests': tap_tests_enabled ? 'yes' : 'no',
   'enable_debug': get_option('debug') ? 'yes' : 'no',
   'enable_coverage': 'no',
@@ -66,7 +66,7 @@ pgxs_kv = {
   'SUN_STUDIO_CC': 'no', # not supported so far
 
   # want the chosen option, rather than the library
-  'with_ssl' : get_option('ssl'),
+  'with_ssl' : ssl_library,
   'with_uuid': uuidopt,
 
   'default_port': get_option('pgport'),
@@ -98,6 +98,8 @@ pgxs_kv = {
   'CXXFLAGS_SL_MODULE': ' '.join(cxxflags_mod),
   'PERMIT_DECLARATION_AFTER_STATEMENT':
     ' '.join(cflags_no_decl_after_statement),
+  'PERMIT_MISSING_VARIABLE_DECLARATIONS':
+    ' '.join(cflags_no_missing_var_decls),
 
   'CFLAGS_CRC': ' '.join(cflags_crc),
   'CFLAGS_UNROLL_LOOPS': ' '.join(unroll_loops_cflags),
@@ -178,6 +180,7 @@ pgxs_empty = [
 
   # Not needed because we don't build the server / PLs with the generated makefile
   'LIBOBJS', 'PG_CRC32C_OBJS', 'TAS',
+  'PG_TEST_EXTRA',
   'DTRACEFLAGS', # only server has dtrace probes
 
   'perl_archlibexp', 'perl_embed_ccflags', 'perl_embed_ldflags', 'perl_includespec', 'perl_privlibexp',

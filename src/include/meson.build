@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 pg_config_ext = configure_file(
   input: 'pg_config_ext.h.meson',
@@ -44,9 +44,9 @@ config_paths_data.set_quoted('MANDIR', dir_prefix / dir_man)
 
 var_cc = ' '.join(cc.cmd_array())
 var_cpp = ' '.join(cc.cmd_array() + ['-E'])
-var_cflags = ' '.join(cflags + cflags_warn + get_option('c_args'))
+var_cflags = ' '.join(cflags + cflags_builtin + cflags_warn + get_option('c_args'))
 if llvm.found()
-  var_cxxflags = ' '.join(cxxflags + cxxflags_warn + get_option('cpp_args'))
+  var_cxxflags = ' '.join(cxxflags + cxxflags_builtin + cxxflags_warn + get_option('cpp_args'))
 else
   var_cxxflags = ''
 endif
@@ -89,11 +89,12 @@ install_headers(
   'c.h',
   'port.h',
   'postgres_fe.h',
-  install_dir: dir_include_internal
+  install_dir: dir_include_internal,
 )
 
 install_headers(
   'libpq/pqcomm.h',
+  'libpq/protocol.h',
   install_dir: dir_include_internal / 'libpq',
 )
 
@@ -129,6 +130,7 @@ subdir('utils')
 
 header_subdirs = [
   'access',
+  'archive',
   'catalog',
   'bootstrap',
   'commands',

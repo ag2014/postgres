@@ -2,7 +2,7 @@
  *
  * pg_waldump.c - decode and display WAL
  *
- * Copyright (c) 2013-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_waldump/pg_waldump.c
@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include <dirent.h>
+#include <limits.h>
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -251,10 +252,14 @@ search_directory(const char *directory, const char *fname)
 			WalSegSz = longhdr->xlp_seg_size;
 
 			if (!IsValidWalSegSize(WalSegSz))
-				pg_fatal(ngettext("WAL segment size must be a power of two between 1 MB and 1 GB, but the WAL file \"%s\" header specifies %d byte",
-								  "WAL segment size must be a power of two between 1 MB and 1 GB, but the WAL file \"%s\" header specifies %d bytes",
-								  WalSegSz),
-						 fname, WalSegSz);
+			{
+				pg_log_error(ngettext("invalid WAL segment size in WAL file \"%s\" (%d byte)",
+									  "invalid WAL segment size in WAL file \"%s\" (%d bytes)",
+									  WalSegSz),
+							 fname, WalSegSz);
+				pg_log_error_detail("The WAL segment size must be a power of two between 1 MB and 1 GB.");
+				exit(1);
+			}
 		}
 		else if (r < 0)
 			pg_fatal("could not read file \"%s\": %m",
@@ -413,11 +418,11 @@ WALDumpReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 		if (errinfo.wre_errno != 0)
 		{
 			errno = errinfo.wre_errno;
-			pg_fatal("could not read from file %s, offset %d: %m",
+			pg_fatal("could not read from file \"%s\", offset %d: %m",
 					 fname, errinfo.wre_off);
 		}
 		else
-			pg_fatal("could not read from file %s, offset %d: read %d of %d",
+			pg_fatal("could not read from file \"%s\", offset %d: read %d of %d",
 					 fname, errinfo.wre_off, errinfo.wre_read,
 					 errinfo.wre_req);
 	}
@@ -517,7 +522,8 @@ XLogRecordSaveFPWs(XLogReaderState *record, const char *savepath)
 		else
 			pg_fatal("invalid fork number: %u", fork);
 
-		snprintf(filename, MAXPGPATH, "%s/%08X-%08X.%u.%u.%u.%u%s", savepath,
+		snprintf(filename, MAXPGPATH, "%s/%08X-%08X-%08X.%u.%u.%u.%u%s", savepath,
+				 record->seg.ws_tli,
 				 LSN_FORMAT_ARGS(record->ReadRecPtr),
 				 rnode.spcOid, rnode.dbOid, rnode.relNumber, blk, forkname);
 
@@ -773,11 +779,10 @@ usage(void)
 			 "                         (default: 1 or the value used in STARTSEG)\n"));
 	printf(_("  -V, --version          output version information, then exit\n"));
 	printf(_("  -w, --fullpage         only show records with a full page write\n"));
-	printf(_("      --save-fullpage=PATH\n"
-			 "                         save full page images\n"));
 	printf(_("  -x, --xid=XID          only show records with transaction ID XID\n"));
 	printf(_("  -z, --stats[=record]   show statistics instead of records\n"
 			 "                         (optionally, show per-record statistics)\n"));
+	printf(_("  --save-fullpage=DIR    save full page images to DIR\n"));
 	printf(_("  -?, --help             show this help, then exit\n"));
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
 	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
@@ -1007,12 +1012,40 @@ main(int argc, char **argv)
 					private.startptr = (uint64) xlogid << 32 | xrecoff;
 				break;
 			case 't':
-				if (sscanf(optarg, "%u", &private.timeline) != 1)
+
+				/*
+				 * This is like option_parse_int() but needs to handle
+				 * unsigned 32-bit int.  Also, we accept both decimal and
+				 * hexadecimal specifications here.
+				 */
 				{
-					pg_log_error("invalid timeline specification: \"%s\"", optarg);
-					goto bad_argument;
+					char	   *endptr;
+					unsigned long val;
+
+					errno = 0;
+					val = strtoul(optarg, &endptr, 0);
+
+					while (*endptr != '\0' && isspace((unsigned char) *endptr))
+						endptr++;
+
+					if (*endptr != '\0')
+					{
+						pg_log_error("invalid value \"%s\" for option %s",
+									 optarg, "-t/--timeline");
+						goto bad_argument;
+					}
+
+					if (errno == ERANGE || val < 1 || val > UINT_MAX)
+					{
+						pg_log_error("%s must be in range %u..%u",
+									 "-t/--timeline", 1, UINT_MAX);
+						goto bad_argument;
+					}
+
+					private.timeline = val;
+
+					break;
 				}
-				break;
 			case 'w':
 				config.filter_by_fpw = true;
 				break;
@@ -1191,12 +1224,12 @@ main(int argc, char **argv)
 	 */
 	if (first_record != private.startptr &&
 		XLogSegmentOffset(private.startptr, WalSegSz) != 0)
-		printf(ngettext("first record is after %X/%X, at %X/%X, skipping over %u byte\n",
-						"first record is after %X/%X, at %X/%X, skipping over %u bytes\n",
-						(first_record - private.startptr)),
-			   LSN_FORMAT_ARGS(private.startptr),
-			   LSN_FORMAT_ARGS(first_record),
-			   (uint32) (first_record - private.startptr));
+		pg_log_info(ngettext("first record is after %X/%X, at %X/%X, skipping over %u byte",
+							 "first record is after %X/%X, at %X/%X, skipping over %u bytes",
+							 (first_record - private.startptr)),
+					LSN_FORMAT_ARGS(private.startptr),
+					LSN_FORMAT_ARGS(first_record),
+					(uint32) (first_record - private.startptr));
 
 	if (config.stats == true && !config.quiet)
 		stats.startptr = first_record;

@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 plpgsql_sources = files(
   'pl_comp.c',
@@ -25,11 +25,11 @@ pl_errcodes = custom_target('plerrcodes',
 generated_sources += pl_errcodes
 plpgsql_sources += pl_errcodes
 
-gen_keywordlist = files('../../../../src/tools/gen_keywordlist.pl')
 pl_reserved = custom_target('pl_reserved_kwlist',
   input: ['pl_reserved_kwlist.h'],
   output: ['pl_reserved_kwlist_d.h'],
-  command: [perl, '-I', '@SOURCE_ROOT@/src/tools', gen_keywordlist, '--output', '@OUTDIR@', '--varname', 'ReservedPLKeywords', '@INPUT@']
+  depend_files: gen_kwlist_deps,
+  command: [gen_kwlist_cmd, '--varname', 'ReservedPLKeywords'],
 )
 generated_sources += pl_reserved
 plpgsql_sources += pl_reserved
@@ -37,7 +37,8 @@ plpgsql_sources += pl_reserved
 pl_unreserved = custom_target('pl_unreserved_kwlist',
   input: ['pl_unreserved_kwlist.h'],
   output: ['pl_unreserved_kwlist_d.h'],
-  command: [perl, '-I', '@SOURCE_ROOT@/src/tools', gen_keywordlist, '--output', '@OUTDIR@', '--varname', 'UnreservedPLKeywords', '@INPUT@']
+  depend_files: gen_kwlist_deps,
+  command: [gen_kwlist_cmd, '--varname', 'UnreservedPLKeywords'],
 )
 generated_sources += pl_unreserved
 plpgsql_sources += pl_unreserved
@@ -75,12 +76,13 @@ tests += {
   'regress': {
     'sql': [
       'plpgsql_array',
+      'plpgsql_cache',
       'plpgsql_call',
       'plpgsql_control',
       'plpgsql_copy',
       'plpgsql_domain',
+      'plpgsql_misc',
       'plpgsql_record',
-      'plpgsql_cache',
       'plpgsql_simple',
       'plpgsql_transaction',
       'plpgsql_trap',

@@ -150,6 +150,13 @@ SELECT * FROM agg_csv c JOIN agg_text t ON (t.a = c.a) ORDER BY c.a;
 -- error context report tests
 SELECT * FROM agg_bad;               -- ERROR
 
+-- on_error and log_verbosity tests
+ALTER FOREIGN TABLE agg_bad OPTIONS (ADD on_error 'ignore');
+SELECT * FROM agg_bad;
+ALTER FOREIGN TABLE agg_bad OPTIONS (ADD log_verbosity 'silent');
+SELECT * FROM agg_bad;
+ANALYZE agg_bad;
+
 -- misc query tests
 \t on
 SELECT explain_filter('EXPLAIN (VERBOSE, COSTS FALSE) SELECT * FROM agg_csv');
@@ -232,6 +239,17 @@ CREATE FOREIGN TABLE gft1 (a int, b text, c text GENERATED ALWAYS AS ('foo') STO
 OPTIONS (format 'csv', filename :'filename', delimiter ',');
 SELECT a, c FROM gft1;
 DROP FOREIGN TABLE gft1;
+
+-- copy default tests
+\set filename :abs_srcdir '/data/copy_default.csv'
+CREATE FOREIGN TABLE copy_default (
+	id integer,
+	text_value text not null default 'test',
+	ts_value timestamp without time zone not null default '2022-07-05'
+) SERVER file_server
+OPTIONS (format 'csv', filename :'filename', default '\D');
+SELECT id, text_value, ts_value FROM copy_default;
+DROP FOREIGN TABLE copy_default;
 
 -- privilege tests
 SET ROLE regress_file_fdw_superuser;

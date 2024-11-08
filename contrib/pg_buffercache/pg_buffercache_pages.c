@@ -18,6 +18,7 @@
 #define NUM_BUFFERCACHE_PAGES_MIN_ELEM	8
 #define NUM_BUFFERCACHE_PAGES_ELEM	9
 #define NUM_BUFFERCACHE_SUMMARY_ELEM 5
+#define NUM_BUFFERCACHE_USAGE_COUNTS_ELEM 4
 
 PG_MODULE_MAGIC;
 
@@ -61,6 +62,8 @@ typedef struct
  */
 PG_FUNCTION_INFO_V1(pg_buffercache_pages);
 PG_FUNCTION_INFO_V1(pg_buffercache_summary);
+PG_FUNCTION_INFO_V1(pg_buffercache_usage_counts);
+PG_FUNCTION_INFO_V1(pg_buffercache_evict);
 
 Datum
 pg_buffercache_pages(PG_FUNCTION_ARGS)
@@ -303,4 +306,64 @@ pg_buffercache_summary(PG_FUNCTION_ARGS)
 	result = HeapTupleGetDatum(tuple);
 
 	PG_RETURN_DATUM(result);
+}
+
+Datum
+pg_buffercache_usage_counts(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	int			usage_counts[BM_MAX_USAGE_COUNT + 1] = {0};
+	int			dirty[BM_MAX_USAGE_COUNT + 1] = {0};
+	int			pinned[BM_MAX_USAGE_COUNT + 1] = {0};
+	Datum		values[NUM_BUFFERCACHE_USAGE_COUNTS_ELEM];
+	bool		nulls[NUM_BUFFERCACHE_USAGE_COUNTS_ELEM] = {0};
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	for (int i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *bufHdr = GetBufferDescriptor(i);
+		uint32		buf_state = pg_atomic_read_u32(&bufHdr->state);
+		int			usage_count;
+
+		usage_count = BUF_STATE_GET_USAGECOUNT(buf_state);
+		usage_counts[usage_count]++;
+
+		if (buf_state & BM_DIRTY)
+			dirty[usage_count]++;
+
+		if (BUF_STATE_GET_REFCOUNT(buf_state) > 0)
+			pinned[usage_count]++;
+	}
+
+	for (int i = 0; i < BM_MAX_USAGE_COUNT + 1; i++)
+	{
+		values[0] = Int32GetDatum(i);
+		values[1] = Int32GetDatum(usage_counts[i]);
+		values[2] = Int32GetDatum(dirty[i]);
+		values[3] = Int32GetDatum(pinned[i]);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	return (Datum) 0;
+}
+
+/*
+ * Try to evict a shared buffer.
+ */
+Datum
+pg_buffercache_evict(PG_FUNCTION_ARGS)
+{
+	Buffer		buf = PG_GETARG_INT32(0);
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to use pg_buffercache_evict function")));
+
+	if (buf < 1 || buf > NBuffers)
+		elog(ERROR, "bad buffer ID: %d", buf);
+
+	PG_RETURN_BOOL(EvictUnpinnedBuffer(buf));
 }

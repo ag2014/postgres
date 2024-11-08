@@ -3,7 +3,7 @@
  * float.c
  *	  Functions for the built-in floating-point types.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,15 +21,12 @@
 
 #include "catalog/pg_type.h"
 #include "common/int.h"
-#include "common/pg_prng.h"
 #include "common/shortest_dec.h"
 #include "libpq/pqformat.h"
-#include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/float.h"
 #include "utils/fmgrprotos.h"
 #include "utils/sortsupport.h"
-#include "utils/timestamp.h"
 
 
 /*
@@ -57,16 +54,20 @@ static float8 cot_45 = 0;
  * be referenced by other files, much less changed; but we don't want the
  * compiler to know that, else it might try to precompute expressions
  * involving them.  See comments for init_degree_constants().
+ *
+ * The additional extern declarations are to silence
+ * -Wmissing-variable-declarations.
  */
+extern float8 degree_c_thirty;
+extern float8 degree_c_forty_five;
+extern float8 degree_c_sixty;
+extern float8 degree_c_one_half;
+extern float8 degree_c_one;
 float8		degree_c_thirty = 30.0;
 float8		degree_c_forty_five = 45.0;
 float8		degree_c_sixty = 60.0;
 float8		degree_c_one_half = 0.5;
 float8		degree_c_one = 1.0;
-
-/* State for drandom() and setseed() */
-static bool drandom_seed_set = false;
-static pg_prng_state drandom_seed;
 
 /* Local function prototypes */
 static double sind_q1(double x);
@@ -189,8 +190,7 @@ float4in_internal(char *num, char **endptr_p,
 	/*
 	 * endptr points to the first character _after_ the sequence we recognized
 	 * as a valid floating point number. orig_string points to the original
-	 * input
-	 * string.
+	 * input string.
 	 */
 
 	/* skip leading whitespace */
@@ -2742,89 +2742,47 @@ datanh(PG_FUNCTION_ARGS)
 }
 
 
-/*
- * initialize_drandom_seed - initialize drandom_seed if not yet done
- */
-static void
-initialize_drandom_seed(void)
-{
-	/* Initialize random seed, if not done yet in this process */
-	if (unlikely(!drandom_seed_set))
-	{
-		/*
-		 * If possible, initialize the seed using high-quality random bits.
-		 * Should that fail for some reason, we fall back on a lower-quality
-		 * seed based on current time and PID.
-		 */
-		if (unlikely(!pg_prng_strong_seed(&drandom_seed)))
-		{
-			TimestampTz now = GetCurrentTimestamp();
-			uint64		iseed;
+/* ========== ERROR FUNCTIONS ========== */
 
-			/* Mix the PID with the most predictable bits of the timestamp */
-			iseed = (uint64) now ^ ((uint64) MyProcPid << 32);
-			pg_prng_seed(&drandom_seed, iseed);
-		}
-		drandom_seed_set = true;
-	}
-}
 
 /*
- *		drandom		- returns a random number
+ *		derf			- returns the error function: erf(arg1)
  */
 Datum
-drandom(PG_FUNCTION_ARGS)
+derf(PG_FUNCTION_ARGS)
 {
+	float8		arg1 = PG_GETARG_FLOAT8(0);
 	float8		result;
 
-	initialize_drandom_seed();
+	/*
+	 * For erf, we don't need an errno check because it never overflows.
+	 */
+	result = erf(arg1);
 
-	/* pg_prng_double produces desired result range [0.0 - 1.0) */
-	result = pg_prng_double(&drandom_seed);
-
-	PG_RETURN_FLOAT8(result);
-}
-
-/*
- *		drandom_normal	- returns a random number from a normal distribution
- */
-Datum
-drandom_normal(PG_FUNCTION_ARGS)
-{
-	float8		mean = PG_GETARG_FLOAT8(0);
-	float8		stddev = PG_GETARG_FLOAT8(1);
-	float8		result,
-				z;
-
-	initialize_drandom_seed();
-
-	/* Get random value from standard normal(mean = 0.0, stddev = 1.0) */
-	z = pg_prng_double_normal(&drandom_seed);
-	/* Transform the normal standard variable (z) */
-	/* using the target normal distribution parameters */
-	result = (stddev * z) + mean;
+	if (unlikely(isinf(result)))
+		float_overflow_error();
 
 	PG_RETURN_FLOAT8(result);
 }
 
 /*
- *		setseed		- set seed for the random number generator
+ *		derfc			- returns the complementary error function: 1 - erf(arg1)
  */
 Datum
-setseed(PG_FUNCTION_ARGS)
+derfc(PG_FUNCTION_ARGS)
 {
-	float8		seed = PG_GETARG_FLOAT8(0);
+	float8		arg1 = PG_GETARG_FLOAT8(0);
+	float8		result;
 
-	if (seed < -1 || seed > 1 || isnan(seed))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("setseed parameter %g is out of allowed range [-1,1]",
-						seed)));
+	/*
+	 * For erfc, we don't need an errno check because it never overflows.
+	 */
+	result = erfc(arg1);
 
-	pg_prng_fseed(&drandom_seed, seed);
-	drandom_seed_set = true;
+	if (unlikely(isinf(result)))
+		float_overflow_error();
 
-	PG_RETURN_VOID();
+	PG_RETURN_FLOAT8(result);
 }
 
 
@@ -2987,9 +2945,7 @@ float8_combine(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array(transdatums, 3,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3070,9 +3026,7 @@ float8_accum(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array(transdatums, 3,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3155,9 +3109,7 @@ float4_accum(PG_FUNCTION_ARGS)
 		transdatums[1] = Float8GetDatumFast(Sx);
 		transdatums[2] = Float8GetDatumFast(Sxx);
 
-		result = construct_array(transdatums, 3,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+		result = construct_array_builtin(transdatums, 3, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3400,9 +3352,7 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 		transdatums[4] = Float8GetDatumFast(Syy);
 		transdatums[5] = Float8GetDatumFast(Sxy);
 
-		result = construct_array(transdatums, 6,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+		result = construct_array_builtin(transdatums, 6, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3541,9 +3491,7 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 		transdatums[4] = Float8GetDatumFast(Syy);
 		transdatums[5] = Float8GetDatumFast(Sxy);
 
-		result = construct_array(transdatums, 6,
-								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+		result = construct_array_builtin(transdatums, 6, FLOAT8OID);
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -4043,7 +3991,7 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 	int32		count = PG_GETARG_INT32(3);
 	int32		result;
 
-	if (count <= 0.0)
+	if (count <= 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_ARGUMENT_FOR_WIDTH_BUCKET_FUNCTION),
 				 errmsg("count must be greater than zero")));
@@ -4071,7 +4019,31 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 						 errmsg("integer out of range")));
 		}
 		else
-			result = ((float8) count * (operand - bound1) / (bound2 - bound1)) + 1;
+		{
+			if (!isinf(bound2 - bound1))
+			{
+				/* The quotient is surely in [0,1], so this can't overflow */
+				result = count * ((operand - bound1) / (bound2 - bound1));
+			}
+			else
+			{
+				/*
+				 * We get here if bound2 - bound1 overflows DBL_MAX.  Since
+				 * both bounds are finite, their difference can't exceed twice
+				 * DBL_MAX; so we can perform the computation without overflow
+				 * by dividing all the inputs by 2.  That should be exact too,
+				 * except in the case where a very small operand underflows to
+				 * zero, which would have negligible impact on the result
+				 * given such large bounds.
+				 */
+				result = count * ((operand / 2 - bound1 / 2) / (bound2 / 2 - bound1 / 2));
+			}
+			/* The quotient could round to 1.0, which would be a lie */
+			if (result >= count)
+				result = count - 1;
+			/* Having done that, we can add 1 without fear of overflow */
+			result++;
+		}
 	}
 	else if (bound1 > bound2)
 	{
@@ -4085,7 +4057,15 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 						 errmsg("integer out of range")));
 		}
 		else
-			result = ((float8) count * (bound1 - operand) / (bound1 - bound2)) + 1;
+		{
+			if (!isinf(bound1 - bound2))
+				result = count * ((bound1 - operand) / (bound1 - bound2));
+			else
+				result = count * ((bound1 / 2 - operand / 2) / (bound1 / 2 - bound2 / 2));
+			if (result >= count)
+				result = count - 1;
+			result++;
+		}
 	}
 	else
 	{

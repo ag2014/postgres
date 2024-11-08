@@ -4,7 +4,7 @@
  *	  routines for managing the buffer pool's replacement strategy.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -74,7 +74,7 @@ typedef struct BufferAccessStrategyData
 	/* Overall strategy type */
 	BufferAccessStrategyType btype;
 	/* Number of elements in buffers[] array */
-	int			ring_size;
+	int			nbuffers;
 
 	/*
 	 * Index of the "current" slot in the ring, ie, the one most recently
@@ -506,7 +506,7 @@ StrategyInitialize(bool init)
 
 		/*
 		 * Grab the whole linked list of free buffers for our strategy. We
-		 * assume it was previously set up by InitBufferPool().
+		 * assume it was previously set up by BufferManagerShmemInit().
 		 */
 		StrategyControl->firstFreeBuffer = 0;
 		StrategyControl->lastFreeBuffer = NBuffers - 1;
@@ -540,8 +540,7 @@ StrategyInitialize(bool init)
 BufferAccessStrategy
 GetAccessStrategy(BufferAccessStrategyType btype)
 {
-	BufferAccessStrategy strategy;
-	int			ring_size;
+	int			ring_size_kb;
 
 	/*
 	 * Select ring size to use.  See buffer/README for rationales.
@@ -556,13 +555,13 @@ GetAccessStrategy(BufferAccessStrategyType btype)
 			return NULL;
 
 		case BAS_BULKREAD:
-			ring_size = 256 * 1024 / BLCKSZ;
+			ring_size_kb = 256;
 			break;
 		case BAS_BULKWRITE:
-			ring_size = 16 * 1024 * 1024 / BLCKSZ;
+			ring_size_kb = 16 * 1024;
 			break;
 		case BAS_VACUUM:
-			ring_size = 256 * 1024 / BLCKSZ;
+			ring_size_kb = 2048;
 			break;
 
 		default:
@@ -571,19 +570,105 @@ GetAccessStrategy(BufferAccessStrategyType btype)
 			return NULL;		/* keep compiler quiet */
 	}
 
-	/* Make sure ring isn't an undue fraction of shared buffers */
-	ring_size = Min(NBuffers / 8, ring_size);
+	return GetAccessStrategyWithSize(btype, ring_size_kb);
+}
+
+/*
+ * GetAccessStrategyWithSize -- create a BufferAccessStrategy object with a
+ *		number of buffers equivalent to the passed in size.
+ *
+ * If the given ring size is 0, no BufferAccessStrategy will be created and
+ * the function will return NULL.  ring_size_kb must not be negative.
+ */
+BufferAccessStrategy
+GetAccessStrategyWithSize(BufferAccessStrategyType btype, int ring_size_kb)
+{
+	int			ring_buffers;
+	BufferAccessStrategy strategy;
+
+	Assert(ring_size_kb >= 0);
+
+	/* Figure out how many buffers ring_size_kb is */
+	ring_buffers = ring_size_kb / (BLCKSZ / 1024);
+
+	/* 0 means unlimited, so no BufferAccessStrategy required */
+	if (ring_buffers == 0)
+		return NULL;
+
+	/* Cap to 1/8th of shared_buffers */
+	ring_buffers = Min(NBuffers / 8, ring_buffers);
+
+	/* NBuffers should never be less than 16, so this shouldn't happen */
+	Assert(ring_buffers > 0);
 
 	/* Allocate the object and initialize all elements to zeroes */
 	strategy = (BufferAccessStrategy)
 		palloc0(offsetof(BufferAccessStrategyData, buffers) +
-				ring_size * sizeof(Buffer));
+				ring_buffers * sizeof(Buffer));
 
 	/* Set fields that don't start out zero */
 	strategy->btype = btype;
-	strategy->ring_size = ring_size;
+	strategy->nbuffers = ring_buffers;
 
 	return strategy;
+}
+
+/*
+ * GetAccessStrategyBufferCount -- an accessor for the number of buffers in
+ *		the ring
+ *
+ * Returns 0 on NULL input to match behavior of GetAccessStrategyWithSize()
+ * returning NULL with 0 size.
+ */
+int
+GetAccessStrategyBufferCount(BufferAccessStrategy strategy)
+{
+	if (strategy == NULL)
+		return 0;
+
+	return strategy->nbuffers;
+}
+
+/*
+ * GetAccessStrategyPinLimit -- get cap of number of buffers that should be pinned
+ *
+ * When pinning extra buffers to look ahead, users of a ring-based strategy are
+ * in danger of pinning too much of the ring at once while performing look-ahead.
+ * For some strategies, that means "escaping" from the ring, and in others it
+ * means forcing dirty data to disk very frequently with associated WAL
+ * flushing.  Since external code has no insight into any of that, allow
+ * individual strategy types to expose a clamp that should be applied when
+ * deciding on a maximum number of buffers to pin at once.
+ *
+ * Callers should combine this number with other relevant limits and take the
+ * minimum.
+ */
+int
+GetAccessStrategyPinLimit(BufferAccessStrategy strategy)
+{
+	if (strategy == NULL)
+		return NBuffers;
+
+	switch (strategy->btype)
+	{
+		case BAS_BULKREAD:
+
+			/*
+			 * Since BAS_BULKREAD uses StrategyRejectBuffer(), dirty buffers
+			 * shouldn't be a problem and the caller is free to pin up to the
+			 * entire ring at once.
+			 */
+			return strategy->nbuffers;
+
+		default:
+
+			/*
+			 * Tell caller not to pin more than half the buffers in the ring.
+			 * This is a trade-off between look ahead distance and deferring
+			 * writeback and associated WAL traffic.
+			 */
+			return strategy->nbuffers / 2;
+	}
 }
 
 /*
@@ -615,7 +700,7 @@ GetBufferFromRing(BufferAccessStrategy strategy, uint32 *buf_state)
 
 
 	/* Advance to next ring slot */
-	if (++strategy->current >= strategy->ring_size)
+	if (++strategy->current >= strategy->nbuffers)
 		strategy->current = 0;
 
 	/*

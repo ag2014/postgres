@@ -3,7 +3,7 @@
  * blscan.c
  *		Bloom index scan functions.
  *
- * Copyright (c) 2016-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/bloom/blscan.c
@@ -15,11 +15,7 @@
 #include "access/relscan.h"
 #include "bloom.h"
 #include "miscadmin.h"
-#include "pgstat.h"
 #include "storage/bufmgr.h"
-#include "storage/lmgr.h"
-#include "utils/memutils.h"
-#include "utils/rel.h"
 
 /*
  * Begin scan of bloom index.
@@ -55,10 +51,7 @@ blrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->sign = NULL;
 
 	if (scankey && scan->numberOfKeys > 0)
-	{
-		memmove(scan->keyData, scankey,
-				scan->numberOfKeys * sizeof(ScanKeyData));
-	}
+		memcpy(scan->keyData, scankey, scan->numberOfKeys * sizeof(ScanKeyData));
 }
 
 /*
@@ -132,7 +125,6 @@ blgetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buffer);
-		TestForOldSnapshot(scan->xs_snapshot, scan->indexRelation, page);
 
 		if (!PageIsNew(page) && !BloomPageIsDeleted(page))
 		{

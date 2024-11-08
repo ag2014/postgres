@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 pg_walinspect_sources = files('pg_walinspect.c')
 
@@ -30,6 +30,7 @@ tests += {
   'regress': {
     'sql': [
       'pg_walinspect',
+      'oldextversions',
     ],
     # Disabled because these tests require "wal_level=replica", which
     # some runningcheck users do not have (e.g. buildfarm clients).

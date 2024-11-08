@@ -3,7 +3,7 @@
  * lockcmds.c
  *	  LOCK command support code
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,10 +19,8 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_inherits.h"
 #include "commands/lockcmds.h"
-#include "commands/tablecmds.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
-#include "parser/parse_clause.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
@@ -296,13 +294,6 @@ LockTableAclCheck(Oid reloid, LOCKMODE lockmode, Oid userid)
 		aclmask |= ACL_INSERT;
 
 	aclresult = pg_class_aclcheck(reloid, userid, aclmask);
-
-	/*
-	 * If this is a partition, check permissions of its ancestors if needed.
-	 */
-	if (aclresult != ACLCHECK_OK &&
-		has_partition_ancestor_privs(reloid, userid, ACL_MAINTAIN))
-		aclresult = ACLCHECK_OK;
 
 	return aclresult;
 }

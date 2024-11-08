@@ -2,27 +2,23 @@
  * brinfuncs.c
  *		Functions to investigate BRIN indexes
  *
- * Copyright (c) 2014-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		contrib/pageinspect/brinfuncs.c
  */
 #include "postgres.h"
 
-#include "access/brin.h"
 #include "access/brin_internal.h"
 #include "access/brin_page.h"
-#include "access/brin_revmap.h"
 #include "access/brin_tuple.h"
 #include "access/htup_details.h"
-#include "catalog/index.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "pageinspect.h"
-#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -201,8 +197,8 @@ brin_page_items(PG_FUNCTION_ARGS)
 	dtup = NULL;
 	for (;;)
 	{
-		Datum		values[7];
-		bool		nulls[7] = {0};
+		Datum		values[8];
+		bool		nulls[8] = {0};
 
 		/*
 		 * This loop is called once for every attribute of every tuple in the
@@ -239,6 +235,7 @@ brin_page_items(PG_FUNCTION_ARGS)
 			nulls[4] = true;
 			nulls[5] = true;
 			nulls[6] = true;
+			nulls[7] = true;
 		}
 		else
 		{
@@ -261,6 +258,7 @@ brin_page_items(PG_FUNCTION_ARGS)
 			values[3] = BoolGetDatum(dtup->bt_columns[att].bv_allnulls);
 			values[4] = BoolGetDatum(dtup->bt_columns[att].bv_hasnulls);
 			values[5] = BoolGetDatum(dtup->bt_placeholder);
+			values[6] = BoolGetDatum(dtup->bt_empty_range);
 			if (!dtup->bt_columns[att].bv_allnulls)
 			{
 				BrinValues *bvalues = &dtup->bt_columns[att];
@@ -286,12 +284,12 @@ brin_page_items(PG_FUNCTION_ARGS)
 				}
 				appendStringInfoChar(&s, '}');
 
-				values[6] = CStringGetTextDatum(s.data);
+				values[7] = CStringGetTextDatum(s.data);
 				pfree(s.data);
 			}
 			else
 			{
-				nulls[6] = true;
+				nulls[7] = true;
 			}
 		}
 

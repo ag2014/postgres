@@ -57,10 +57,72 @@ LATERAL (SELECT t2.unique1 FROM tenk1 t2
          WHERE t1.twenty = t2.unique1 OFFSET 0) t2
 WHERE t1.unique1 < 1000;
 
+-- Try with LATERAL joins
+SELECT explain_memoize('
+SELECT COUNT(*),AVG(t2.t1two) FROM tenk1 t1 LEFT JOIN
+LATERAL (
+    SELECT t1.two as t1two, * FROM tenk1 t2 WHERE t2.unique1 < 4 OFFSET 0
+) t2
+ON t1.two = t2.two
+WHERE t1.unique1 < 10;', false);
+
+-- And check we get the expected results.
+SELECT COUNT(*),AVG(t2.t1two) FROM tenk1 t1 LEFT JOIN
+LATERAL (
+    SELECT t1.two as t1two, * FROM tenk1 t2 WHERE t2.unique1 < 4 OFFSET 0
+) t2
+ON t1.two = t2.two
+WHERE t1.unique1 < 10;
+
+-- Try with LATERAL references within PlaceHolderVars
+SELECT explain_memoize('
+SELECT COUNT(*), AVG(t1.twenty) FROM tenk1 t1 LEFT JOIN
+LATERAL (SELECT t1.two+1 AS c1, t2.unique1 AS c2 FROM tenk1 t2) s ON TRUE
+WHERE s.c1 = s.c2 AND t1.unique1 < 1000;', false);
+
+-- And check we get the expected results.
+SELECT COUNT(*), AVG(t1.twenty) FROM tenk1 t1 LEFT JOIN
+LATERAL (SELECT t1.two+1 AS c1, t2.unique1 AS c2 FROM tenk1 t2) s ON TRUE
+WHERE s.c1 = s.c2 AND t1.unique1 < 1000;
+
+-- Ensure we do not omit the cache keys from PlaceHolderVars
+SELECT explain_memoize('
+SELECT COUNT(*), AVG(t1.twenty) FROM tenk1 t1 LEFT JOIN
+LATERAL (SELECT t1.twenty AS c1, t2.unique1 AS c2, t2.two FROM tenk1 t2) s
+ON t1.two = s.two
+WHERE s.c1 = s.c2 AND t1.unique1 < 1000;', false);
+
+-- And check we get the expected results.
+SELECT COUNT(*), AVG(t1.twenty) FROM tenk1 t1 LEFT JOIN
+LATERAL (SELECT t1.twenty AS c1, t2.unique1 AS c2, t2.two FROM tenk1 t2) s
+ON t1.two = s.two
+WHERE s.c1 = s.c2 AND t1.unique1 < 1000;
+
+SET enable_mergejoin TO off;
+
+-- Test for varlena datatype with expr evaluation
+CREATE TABLE expr_key (x numeric, t text);
+INSERT INTO expr_key (x, t)
+SELECT d1::numeric, d1::text FROM (
+    SELECT round((d / pi())::numeric, 7) AS d1 FROM generate_series(1, 20) AS d
+) t;
+
+-- duplicate rows so we get some cache hits
+INSERT INTO expr_key SELECT * FROM expr_key;
+
+CREATE INDEX expr_key_idx_x_t ON expr_key (x, t);
+VACUUM ANALYZE expr_key;
+
+-- Ensure we get we get a cache miss and hit for each of the 20 distinct values
+SELECT explain_memoize('
+SELECT * FROM expr_key t1 INNER JOIN expr_key t2
+ON t1.x = t2.t::numeric AND t1.t::numeric = t2.x;', false);
+
+DROP TABLE expr_key;
+
 -- Reduce work_mem and hash_mem_multiplier so that we see some cache evictions
 SET work_mem TO '64kB';
 SET hash_mem_multiplier TO 1.0;
-SET enable_mergejoin TO off;
 -- Ensure we get some evictions.  We're unable to validate the hits and misses
 -- here as the number of entries that fit in the cache at once will vary
 -- between different machines.
@@ -91,7 +153,7 @@ DROP TABLE flt;
 CREATE TABLE strtest (n name, t text);
 CREATE INDEX strtest_n_idx ON strtest (n);
 CREATE INDEX strtest_t_idx ON strtest (t);
-INSERT INTO strtest VALUES('one','one'),('two','two'),('three',repeat(md5('three'),100));
+INSERT INTO strtest VALUES('one','one'),('two','two'),('three',repeat(fipshash('three'),100));
 -- duplicate rows so we get some cache hits
 INSERT INTO strtest SELECT * FROM strtest;
 ANALYZE strtest;
@@ -120,6 +182,14 @@ ANALYZE prt;
 
 SELECT explain_memoize('
 SELECT * FROM prt t1 INNER JOIN prt t2 ON t1.a = t2.a;', false);
+
+-- Ensure memoize works with parameterized union-all Append path
+SET enable_partitionwise_join TO off;
+
+SELECT explain_memoize('
+SELECT * FROM prt_p1 t1 INNER JOIN
+(SELECT * FROM prt_p1 UNION ALL SELECT * FROM prt_p2) t2
+ON t1.a = t2.a;', false);
 
 DROP TABLE prt;
 

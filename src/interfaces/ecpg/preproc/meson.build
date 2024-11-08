@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 ecpg_sources = files(
   '../ecpglib/typename.c',
@@ -10,6 +10,7 @@ ecpg_sources = files(
   'output.c',
   'parser.c',
   'type.c',
+  'util.c',
   'variable.c',
 )
 
@@ -44,20 +45,6 @@ preproc_y = custom_target('preproc.y',
 )
 generated_sources += preproc_y
 
-check_rules = custom_target('preproc.y.check_rules',
-  input: [
-    '../../../backend/parser/gram.y',
-    ecpg_files,
-  ],
-  output: 'preproc.y.check_rules',
-  command: [
-    perl, files('check_rules.pl'),
-    '--srcdir', '@CURRENT_SOURCE_DIR@',
-    '--parser', '@INPUT0@',
-    '--stamp', '@OUTPUT0@',
-  ],
-)
-
 preproc = custom_target('preproc.c',
   input: preproc_y,
   kwargs: bison_kw,
@@ -68,15 +55,8 @@ ecpg_sources += preproc
 c_kwlist = custom_target('c_kwlist_d.h',
   input: ['c_kwlist.h'],
   output: ['c_kwlist_d.h'],
-  depends: check_rules,
-  command: [
-    perl,
-    '-I', '@SOURCE_ROOT@/src/tools',
-    '@SOURCE_ROOT@/src/tools/gen_keywordlist.pl',
-    '--output', '@OUTDIR@',
-    '--varname', 'ScanCKeywords',
-    '--no-case-fold', '@INPUT0@',
-  ],
+  depend_files: gen_kwlist_deps,
+  command: [gen_kwlist_cmd, '--varname', 'ScanCKeywords', '--no-case-fold'],
 )
 generated_sources += c_kwlist
 ecpg_sources += c_kwlist
@@ -84,13 +64,8 @@ ecpg_sources += c_kwlist
 ecpg_kwlist = custom_target('ecpg_kwlist_d.h',
   input: ['ecpg_kwlist.h'],
   output: ['ecpg_kwlist_d.h'],
-  command: [
-    perl, '-I',
-    '@SOURCE_ROOT@/src/tools',
-    '@SOURCE_ROOT@/src/tools/gen_keywordlist.pl',
-    '--output', '@OUTDIR@',
-    '--varname', 'ScanECPGKeywords', '@INPUT0@',
-  ]
+  depend_files: gen_kwlist_deps,
+  command: [gen_kwlist_cmd, '--varname', 'ScanECPGKeywords'],
 )
 generated_sources += ecpg_kwlist
 ecpg_sources += ecpg_kwlist

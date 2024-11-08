@@ -1,10 +1,10 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Checks that snapshots on standbys behave in a minimally reasonable
 # way.
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -168,7 +168,6 @@ $node_standby->stop;
 sub send_query_and_wait
 {
 	my ($psql, $query, $untl) = @_;
-	my $ret;
 
 	# send query
 	$$psql{stdin} .= $query;

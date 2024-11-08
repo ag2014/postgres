@@ -177,7 +177,8 @@
     statements separated by semicolons.  A semicolon after the last
     statement is optional.  Unless the function is declared to return
     <type>void</type>, the last statement must be a <command>SELECT</command>,
-    or an <command>INSERT</command>, <command>UPDATE</command>, or <command>DELETE</command>
+    or an <command>INSERT</command>, <command>UPDATE</command>,
+    <command>DELETE</command>, or <command>MERGE</command>
     that has a <literal>RETURNING</literal> clause.
    </para>
 
@@ -1236,8 +1237,9 @@ SELECT x, CASE WHEN x &gt; 0 THEN generate_series(1, 5) ELSE 0 END FROM tab;
 
     <note>
      <para>
-      If a function's last command is <command>INSERT</command>, <command>UPDATE</command>,
-      or <command>DELETE</command> with <literal>RETURNING</literal>, that command will
+      If a function's last command is <command>INSERT</command>,
+      <command>UPDATE</command>, <command>DELETE</command>, or
+      <command>MERGE</command> with <literal>RETURNING</literal>, that command will
       always be executed to completion, even if the function is not declared
       with <literal>SETOF</literal> or the calling query does not fetch all the
       result rows.  Any extra rows produced by the <literal>RETURNING</literal>
@@ -2702,6 +2704,142 @@ CREATE FUNCTION concat_text(text, text) RETURNS text
 
 &dfunc;
 
+   <sect2 id="xfunc-api-abi-stability-guidance">
+    <title>Server API and ABI Stability Guidance</title>
+
+    <para>
+     This section contains guidance to authors of extensions and other server
+     plugins about API and ABI stability in the
+     <productname>PostgreSQL</productname> server.
+    </para>
+
+    <sect3 id="xfunc-guidance-general">
+     <title>General</title>
+
+     <para>
+      The <productname>PostgreSQL</productname> server contains several
+      well-demarcated APIs for server plugins, such as the function manager
+      (<acronym>fmgr</acronym>, described in this chapter),
+      <acronym>SPI</acronym> (<xref linkend="spi"/>), and various hooks
+      specifically designed for extensions. These interfaces are carefully
+      managed for long-term stability and compatibility. However, the entire
+      set of global functions and variables in the server effectively
+      constitutes the publicly usable API, and most of it was not designed
+      with extensibility and long-term stability in mind.
+     </para>
+
+     <para>
+      Therefore, while taking advantage of these interfaces is valid, the
+      further one strays from the well-trodden path, the likelier it will be
+      that one might encounter API or ABI compatibility issues at some point.
+      Extension authors are encouraged to provide feedback about their
+      requirements, so that over time, as new use patterns arise, certain
+      interfaces can be considered more stabilized or new, better-designed
+      interfaces can be added.
+     </para>
+    </sect3>
+
+    <sect3 id="xfunc-guidance-api-compatibility">
+     <title>API Compatibility</title>
+     <para>
+      The <acronym>API</acronym>, or application programming interface, is the
+      interface used at compile time.
+     </para>
+
+     <sect4 id="xfunc-guidance-api-major-versions">
+      <title>Major Versions</title>
+      <para>
+       There is <emphasis>no</emphasis> promise of API compatibility between
+       <productname>PostgreSQL</productname> major versions. Extension code
+       therefore might require source code changes to work with multiple major
+       versions. These can usually be managed with preprocessor conditions
+       such as <literal>#if PG_VERSION_NUM &gt;= 160000</literal>.
+       Sophisticated extensions that use interfaces beyond the well-demarcated
+       ones usually require a few such changes for each major server version.
+      </para>
+     </sect4>
+
+     <sect4 id="xfunc-guidance-api-mninor-versions">
+      <title>Minor Versions</title>
+      <para>
+       <productname>PostgreSQL</productname> makes an effort to avoid server
+       API breaks in minor releases. In general, extension code that compiles
+       and works with a minor release should also compile and work with any
+       other minor release of the same major version, past or future.
+      </para>
+
+      <para>
+       When a change <emphasis>is</emphasis> required, it will be carefully
+       managed, taking the requirements of extensions into account. Such
+       changes will be communicated in the release notes (<xref
+       linkend="release"/>).
+      </para>
+     </sect4>
+    </sect3>
+
+    <sect3 id="xfunc-guidance-abi-compatibility">
+     <title>ABI Compatibility</title>
+      <para>
+       The <acronym>ABI</acronym>, or application binary interface, is the
+       interface used at run time.
+      </para>
+
+     <sect4 id="xfunc-guidance-abi-major-versions">
+      <title>Major Versions</title>
+      <para>
+       Servers of different major versions have intentionally incompatible
+       ABIs. Extensions that use server APIs must therefore be re-compiled for
+       each major release. The inclusion of <literal>PG_MODULE_MAGIC</literal>
+       (see <xref linkend="xfunc-c-dynload"/>) ensures that code compiled for
+       one major version will be rejected by other major versions.
+      </para>
+     </sect4>
+
+     <sect4 id="xfunc-guidance-abi-mninor-versions">
+      <title>Minor Versions</title>
+      <para>
+       <productname>PostgreSQL</productname> makes an effort to avoid server
+       ABI breaks in minor releases. In general, an extension compiled against
+       any minor release should work with any other minor release of the same
+       major version, past or future.
+      </para>
+
+      <para>
+       When a change <emphasis>is</emphasis> required,
+       <productname>PostgreSQL</productname> will choose the least invasive
+       change possible, for example by squeezing a new field into padding
+       space or appending it to the end of a struct. These sorts of changes
+       should not impact extensions unless they use very unusual code
+       patterns.
+      </para>
+
+      <para>
+       In rare cases, however, even such non-invasive changes may be
+       impractical or impossible. In such an event, the change will be
+       carefully managed, taking the requirements of extensions into account.
+       Such changes will also be documented in the release notes (<xref
+       linkend="release"/>).
+      </para>
+
+      <para>
+       Note, however, that many parts of the server are not designed or
+       maintained as publicly-consumable APIs (and that, in most cases, the
+       actual boundary is also not well-defined). If urgent needs arise,
+       changes in those parts will naturally be made with less consideration
+       for extension code than changes in well-defined and widely used
+       interfaces.
+      </para>
+
+      <para>
+       Also, in the absence of automated detection of such changes, this is
+       not a guarantee, but historically such breaking changes have been
+       extremely rare.
+      </para>
+
+     </sect4>
+    </sect3>
+  </sect2>
+
    <sect2 id="xfunc-c-composite-type-args">
     <title>Composite-Type Arguments</title>
 
@@ -3397,59 +3535,394 @@ CREATE FUNCTION make_array(anyelement) RETURNS anyarray
    </sect2>
 
    <sect2 id="xfunc-shared-addin">
-    <title>Shared Memory and LWLocks</title>
+    <title>Shared Memory</title>
 
-    <para>
-     Add-ins can reserve LWLocks and an allocation of shared memory on server
-     startup.  The add-in's shared library must be preloaded by specifying
-     it in
-     <xref linkend="guc-shared-preload-libraries"/><indexterm><primary>shared_preload_libraries</primary></indexterm>.
-     The shared library should register a <literal>shmem_request_hook</literal>
-     in its <function>_PG_init</function> function.  This
-     <literal>shmem_request_hook</literal> can reserve LWLocks or shared memory.
-     Shared memory is reserved by calling:
+    <sect3 id="xfunc-shared-addin-at-startup">
+     <title>Requesting Shared Memory at Startup</title>
+
+     <para>
+      Add-ins can reserve shared memory on server startup.  To do so, the
+      add-in's shared library must be preloaded by specifying it in
+      <xref linkend="guc-shared-preload-libraries"/><indexterm><primary>shared_preload_libraries</primary></indexterm>.
+      The shared library should also register a
+      <literal>shmem_request_hook</literal> in its
+      <function>_PG_init</function> function.  This
+      <literal>shmem_request_hook</literal> can reserve shared memory by
+      calling:
 <programlisting>
-void RequestAddinShmemSpace(int size)
+void RequestAddinShmemSpace(Size size)
 </programlisting>
-     from your <literal>shmem_request_hook</literal>.
-    </para>
-    <para>
-     LWLocks are reserved by calling:
+      Each backend should obtain a pointer to the reserved shared memory by
+      calling:
+<programlisting>
+void *ShmemInitStruct(const char *name, Size size, bool *foundPtr)
+</programlisting>
+      If this function sets <literal>foundPtr</literal> to
+      <literal>false</literal>, the caller should proceed to initialize the
+      contents of the reserved shared memory.  If <literal>foundPtr</literal>
+      is set to <literal>true</literal>, the shared memory was already
+      initialized by another backend, and the caller need not initialize
+      further.
+     </para>
+
+     <para>
+      To avoid race conditions, each backend should use the LWLock
+      <function>AddinShmemInitLock</function> when initializing its allocation
+      of shared memory, as shown here:
+<programlisting>
+static mystruct *ptr = NULL;
+bool        found;
+
+LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+ptr = ShmemInitStruct("my struct name", size, &amp;found);
+if (!found)
+{
+    ... initialize contents of shared memory ...
+    ptr->locks = GetNamedLWLockTranche("my tranche name");
+}
+LWLockRelease(AddinShmemInitLock);
+</programlisting>
+      <literal>shmem_startup_hook</literal> provides a convenient place for the
+      initialization code, but it is not strictly required that all such code
+      be placed in this hook.  Each backend will execute the registered
+      <literal>shmem_startup_hook</literal> shortly after it attaches to shared
+      memory.  Note that add-ins should still acquire
+      <function>AddinShmemInitLock</function> within this hook, as shown in the
+      example above.
+     </para>
+
+     <para>
+      An example of a <literal>shmem_request_hook</literal> and
+      <literal>shmem_startup_hook</literal> can be found in
+      <filename>contrib/pg_stat_statements/pg_stat_statements.c</filename> in
+      the <productname>PostgreSQL</productname> source tree.
+     </para>
+    </sect3>
+
+    <sect3 id="xfunc-shared-addin-after-startup">
+     <title>Requesting Shared Memory After Startup</title>
+
+     <para>
+      There is another, more flexible method of reserving shared memory that
+      can be done after server startup and outside a
+      <literal>shmem_request_hook</literal>.  To do so, each backend that will
+      use the shared memory should obtain a pointer to it by calling:
+<programlisting>
+void *GetNamedDSMSegment(const char *name, size_t size,
+                         void (*init_callback) (void *ptr),
+                         bool *found)
+</programlisting>
+      If a dynamic shared memory segment with the given name does not yet
+      exist, this function will allocate it and initialize it with the provided
+      <function>init_callback</function> callback function.  If the segment has
+      already been allocated and initialized by another backend, this function
+      simply attaches the existing dynamic shared memory segment to the current
+      backend.
+     </para>
+
+     <para>
+      Unlike shared memory reserved at server startup, there is no need to
+      acquire <function>AddinShmemInitLock</function> or otherwise take action
+      to avoid race conditions when reserving shared memory with
+      <function>GetNamedDSMSegment</function>.  This function ensures that only
+      one backend allocates and initializes the segment and that all other
+      backends receive a pointer to the fully allocated and initialized
+      segment.
+     </para>
+
+     <para>
+      A complete usage example of <function>GetNamedDSMSegment</function> can
+      be found in
+      <filename>src/test/modules/test_dsm_registry/test_dsm_registry.c</filename>
+      in the <productname>PostgreSQL</productname> source tree.
+     </para>
+    </sect3>
+   </sect2>
+
+   <sect2 id="xfunc-addin-lwlocks">
+    <title>LWLocks</title>
+
+    <sect3 id="xfunc-addin-lwlocks-at-startup">
+     <title>Requesting LWLocks at Startup</title>
+
+     <para>
+      Add-ins can reserve LWLocks on server startup.  As with shared memory
+      reserved at server startup, the add-in's shared library must be preloaded
+      by specifying it in
+      <xref linkend="guc-shared-preload-libraries"/><indexterm><primary>shared_preload_libraries</primary></indexterm>,
+      and the shared library should register a
+      <literal>shmem_request_hook</literal> in its
+      <function>_PG_init</function> function.  This
+      <literal>shmem_request_hook</literal> can reserve LWLocks by calling:
 <programlisting>
 void RequestNamedLWLockTranche(const char *tranche_name, int num_lwlocks)
 </programlisting>
-     from your <literal>shmem_request_hook</literal>.  This will ensure that an array of
-     <literal>num_lwlocks</literal> LWLocks is available under the name
-     <literal>tranche_name</literal>.  Use <function>GetNamedLWLockTranche</function>
-     to get a pointer to this array.
-    </para>
-    <para>
-     An example of a <literal>shmem_request_hook</literal> can be found in
-     <filename>contrib/pg_stat_statements/pg_stat_statements.c</filename> in the
-     <productname>PostgreSQL</productname> source tree.
-    </para>
-    <para>
-     To avoid possible race-conditions, each backend should use the LWLock
-     <function>AddinShmemInitLock</function> when connecting to and initializing
-     its allocation of shared memory, as shown here:
+      This ensures that an array of <literal>num_lwlocks</literal> LWLocks is
+      available under the name <literal>tranche_name</literal>.  A pointer to
+      this array can be obtained by calling:
 <programlisting>
-static mystruct *ptr = NULL;
+LWLockPadded *GetNamedLWLockTranche(const char *tranche_name)
+</programlisting>
+     </para>
+    </sect3>
 
-if (!ptr)
+    <sect3 id="xfunc-addin-lwlocks-after-startup">
+     <title>Requesting LWLocks After Startup</title>
+
+     <para>
+      There is another, more flexible method of obtaining LWLocks that can be
+      done after server startup and outside a
+      <literal>shmem_request_hook</literal>.  To do so, first allocate a
+      <literal>tranche_id</literal> by calling:
+<programlisting>
+int LWLockNewTrancheId(void)
+</programlisting>
+      Next, initialize each LWLock, passing the new
+      <literal>tranche_id</literal> as an argument:
+<programlisting>
+void LWLockInitialize(LWLock *lock, int tranche_id)
+</programlisting>
+      Similar to shared memory, each backend should ensure that only one
+      process allocates a new <literal>tranche_id</literal> and initializes
+      each new LWLock.  One way to do this is to only call these functions in
+      your shared memory initialization code with the
+      <function>AddinShmemInitLock</function> held exclusively.  If using
+      <function>GetNamedDSMSegment</function>, calling these functions in the
+      <function>init_callback</function> callback function is sufficient to
+      avoid race conditions.
+     </para>
+
+     <para>
+      Finally, each backend using the <literal>tranche_id</literal> should
+      associate it with a <literal>tranche_name</literal> by calling:
+<programlisting>
+void LWLockRegisterTranche(int tranche_id, const char *tranche_name)
+</programlisting>
+     </para>
+
+     <para>
+      A complete usage example of <function>LWLockNewTrancheId</function>,
+      <function>LWLockInitialize</function>, and
+      <function>LWLockRegisterTranche</function> can be found in
+      <filename>contrib/pg_prewarm/autoprewarm.c</filename> in the
+      <productname>PostgreSQL</productname> source tree.
+     </para>
+    </sect3>
+   </sect2>
+
+   <sect2 id="xfunc-addin-wait-events">
+    <title>Custom Wait Events</title>
+
+    <para>
+     Add-ins can define custom wait events under the wait event type
+     <literal>Extension</literal> by calling:
+<programlisting>
+uint32 WaitEventExtensionNew(const char *wait_event_name)
+</programlisting>
+     The wait event is associated to a user-facing custom string.
+     An example can be found in <filename>src/test/modules/worker_spi</filename>
+     in the PostgreSQL source tree.
+    </para>
+    <para>
+     Custom wait events can be viewed in
+     <link linkend="monitoring-pg-stat-activity-view"><structname>pg_stat_activity</structname></link>:
+<screen>
+=# SELECT wait_event_type, wait_event FROM pg_stat_activity
+     WHERE backend_type ~ 'worker_spi';
+ wait_event_type |  wait_event
+-----------------+---------------
+ Extension       | WorkerSpiMain
+(1 row)
+</screen>
+    </para>
+   </sect2>
+
+   <sect2 id="xfunc-addin-injection-points">
+    <title>Injection Points</title>
+
+    <para>
+     An injection point with a given <literal>name</literal> is declared using
+     macro:
+<programlisting>
+INJECTION_POINT(name);
+</programlisting>
+
+     There are a few injection points already declared at strategic points
+     within the server code. After adding a new injection point the code needs
+     to be compiled in order for that injection point to be available in the
+     binary. Add-ins written in C-language can declare injection points in
+     their own code using the same macro.
+    </para>
+
+    <para>
+     Executing an injection point can require allocating a small amount of
+     memory, which can fail. If you need to have an injection point in a
+     critical section where dynamic allocations are not allowed, you can use
+     a two-step approach with the following macros:
+<programlisting>
+INJECTION_POINT_LOAD(name);
+INJECTION_POINT_CACHED(name);
+</programlisting>
+
+     Before entering the critical section,
+     call <function>INJECTION_POINT_LOAD</function>. It checks the shared
+     memory state, and loads the callback into backend-private memory if it is
+     active. Inside the critical section, use
+     <function>INJECTION_POINT_CACHED</function> to execute the callback.
+    </para>
+
+    <para>
+     Add-ins can attach callbacks to an already-declared injection point by
+     calling:
+<programlisting>
+extern void InjectionPointAttach(const char *name,
+                                 const char *library,
+                                 const char *function,
+                                 const void *private_data,
+                                 int private_data_size);
+</programlisting>
+
+     <literal>name</literal> is the name of the injection point, which when
+     reached during execution will execute the <literal>function</literal>
+     loaded from <literal>library</literal>. <literal>private_data</literal>
+     is a private area of data of size <literal>private_data_size</literal>
+     given as argument to the callback when executed.
+    </para>
+
+    <para>
+     Here is an example of callback for
+     <literal>InjectionPointCallback</literal>:
+<programlisting>
+static void
+custom_injection_callback(const char *name, const void *private_data)
 {
-        bool    found;
+    uint32 wait_event_info = WaitEventInjectionPointNew(name);
 
-        LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
-        ptr = ShmemInitStruct("my struct name", size, &amp;found);
-        if (!found)
-        {
-                initialize contents of shmem area;
-                acquire any requested LWLocks using:
-                ptr->locks = GetNamedLWLockTranche("my tranche name");
-        }
-        LWLockRelease(AddinShmemInitLock);
+    pgstat_report_wait_start(wait_event_info);
+    elog(NOTICE, "%s: executed custom callback", name);
+    pgstat_report_wait_end();
 }
 </programlisting>
+     This callback prints a message to server error log with severity
+     <literal>NOTICE</literal>, but callbacks may implement more complex
+     logic.
+    </para>
+
+    <para>
+     An alternative way to define the action to take when an injection point
+     is reached is to add the testing code alongside the normal source
+     code. This can be useful if the action e.g. depends on local variables
+     that are not accessible to loaded modules. The
+     <function>IS_INJECTION_POINT_ATTACHED</function> macro can then be used
+     to check if an injection point is attached, for example:
+<programlisting>
+#ifdef USE_INJECTION_POINTS
+if (IS_INJECTION_POINT_ATTACHED("before-foobar"))
+{
+    /* change a local variable if injection point is attached */
+    local_var = 123;
+
+    /* also execute the callback */
+    INJECTION_POINT_CACHED("before-foobar");
+}
+#endif
+</programlisting>
+     Note that the callback attached to the injection point will not be
+     executed by the <function>IS_INJECTION_POINT_ATTACHED</function>
+     macro. If you want to execute the callback, you must also call
+     <function>INJECTION_POINT_CACHED</function> like in the above example.
+    </para>
+
+    <para>
+     Optionally, it is possible to detach an injection point by calling:
+<programlisting>
+extern bool InjectionPointDetach(const char *name);
+</programlisting>
+     On success, <literal>true</literal> is returned, <literal>false</literal>
+     otherwise.
+    </para>
+
+    <para>
+     A callback attached to an injection point is available across all the
+     backends including the backends started after
+     <literal>InjectionPointAttach</literal> is called. It remains attached
+     while the server is running or until the injection point is detached
+     using <literal>InjectionPointDetach</literal>.
+    </para>
+
+    <para>
+     An example can be found in
+     <filename>src/test/modules/injection_points</filename> in the PostgreSQL
+     source tree.
+    </para>
+
+    <para>
+     Enabling injections points requires
+     <option>--enable-injection-points</option> with
+     <command>configure</command> or <option>-Dinjection_points=true</option>
+     with <application>Meson</application>.
+    </para>
+   </sect2>
+
+   <sect2 id="xfunc-addin-custom-cumulative-statistics">
+    <title>Custom Cumulative Statistics</title>
+
+    <para>
+     It is possible for add-ins written in C-language to use custom types
+     of cumulative statistics registered in the
+     <link linkend="monitoring-stats-setup">Cumulative Statistics System</link>.
+    </para>
+
+    <para>
+     First, define a <literal>PgStat_KindInfo</literal> that includes all
+     the information related to the custom type registered. For example:
+<programlisting>
+static const PgStat_KindInfo custom_stats = {
+    .name = "custom_stats",
+    .fixed_amount = false,
+    .shared_size = sizeof(PgStatShared_Custom),
+    .shared_data_off = offsetof(PgStatShared_Custom, stats),
+    .shared_data_len = sizeof(((PgStatShared_Custom *) 0)->stats),
+    .pending_size = sizeof(PgStat_StatCustomEntry),
+}
+</programlisting>
+
+     Then, each backend that needs to use this custom type needs to register
+     it with <literal>pgstat_register_kind</literal> and a unique ID used to
+     store the entries related to this type of statistics:
+<programlisting>
+extern PgStat_Kind pgstat_register_kind(PgStat_Kind kind,
+                                        const PgStat_KindInfo *kind_info);
+</programlisting>
+     While developing a new extension, use
+     <literal>PGSTAT_KIND_EXPERIMENTAL</literal> for
+     <parameter>kind</parameter>. When you are ready to release the extension
+     to users, reserve a kind ID at the
+     <ulink url="https://wiki.postgresql.org/wiki/CustomCumulativeStats">
+     Custom Cumulative Statistics</ulink> page.
+    </para>
+
+    <para>
+     The details of the API for <literal>PgStat_KindInfo</literal> can
+     be found in <filename>src/include/utils/pgstat_internal.h</filename>.
+    </para>
+
+    <para>
+     The type of statistics registered is associated with a name and a unique
+     ID shared across the server in shared memory. Each backend using a
+     custom type of statistics maintains a local cache storing the information
+     of each custom <literal>PgStat_KindInfo</literal>.
+    </para>
+
+    <para>
+     Place the extension module implementing the custom cumulative statistics
+     type in <xref linkend="guc-shared-preload-libraries"/> so that it will
+     be loaded early during <productname>PostgreSQL</productname> startup.
+    </para>
+
+    <para>
+     An example describing how to register and use custom statistics can be
+     found in <filename>src/test/modules/injection_points</filename>.
     </para>
    </sect2>
 

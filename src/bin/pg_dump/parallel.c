@@ -4,7 +4,7 @@
  *
  *	Parallel support for pg_dump and pg_restore
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -63,7 +63,9 @@
 #include "fe_utils/string_utils.h"
 #include "parallel.h"
 #include "pg_backup_utils.h"
+#ifdef WIN32
 #include "port/pg_bswap.h"
+#endif
 
 /* Mnemonic macros for indexing the fd array returned by pipe(2) */
 #define PIPE_READ							0
@@ -77,7 +79,7 @@ typedef enum
 	WRKR_NOT_STARTED = 0,
 	WRKR_IDLE,
 	WRKR_WORKING,
-	WRKR_TERMINATED
+	WRKR_TERMINATED,
 } T_WorkerStatus;
 
 #define WORKER_IS_RUNNING(workerStatus) \
@@ -204,7 +206,7 @@ static ParallelSlot *GetMyPSlot(ParallelState *pstate);
 static void archive_close_connection(int code, void *arg);
 static void ShutdownWorkersHard(ParallelState *pstate);
 static void WaitForTerminatingWorkers(ParallelState *pstate);
-static void setup_cancel_handler(void);
+static void set_cancel_handler(void);
 static void set_cancel_pstate(ParallelState *pstate);
 static void set_cancel_slot_archive(ParallelSlot *slot, ArchiveHandle *AH);
 static void RunWorker(ArchiveHandle *AH, ParallelSlot *slot);
@@ -550,7 +552,7 @@ sigTermHandler(SIGNAL_ARGS)
 	/*
 	 * Some platforms allow delivery of new signals to interrupt an active
 	 * signal handler.  That could muck up our attempt to send PQcancel, so
-	 * disable the signals that setup_cancel_handler enabled.
+	 * disable the signals that set_cancel_handler enabled.
 	 */
 	pqsignal(SIGINT, SIG_IGN);
 	pqsignal(SIGTERM, SIG_IGN);
@@ -605,7 +607,7 @@ sigTermHandler(SIGNAL_ARGS)
  * Enable cancel interrupt handler, if not already done.
  */
 static void
-setup_cancel_handler(void)
+set_cancel_handler(void)
 {
 	/*
 	 * When forking, signal_info.handler_set will propagate into the new
@@ -705,7 +707,7 @@ consoleHandler(DWORD dwCtrlType)
  * Enable cancel interrupt handler, if not already done.
  */
 static void
-setup_cancel_handler(void)
+set_cancel_handler(void)
 {
 	if (!signal_info.handler_set)
 	{
@@ -737,7 +739,7 @@ set_archive_cancel_info(ArchiveHandle *AH, PGconn *conn)
 	 * important that this happen at least once before we fork off any
 	 * threads.
 	 */
-	setup_cancel_handler();
+	set_cancel_handler();
 
 	/*
 	 * On Unix, we assume that storing a pointer value is atomic with respect

@@ -3,7 +3,7 @@
  * nodeAppend.c
  *	  routines to handle append nodes.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -58,8 +58,8 @@
 #include "postgres.h"
 
 #include "executor/execAsync.h"
-#include "executor/execdebug.h"
 #include "executor/execPartition.h"
+#include "executor/executor.h"
 #include "executor/nodeAppend.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -134,7 +134,7 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 	appendstate->as_begun = false;
 
 	/* If run-time partition pruning is enabled, then set that up now */
-	if (node->part_prune_index >= 0)
+	if (node->part_prune_info != NULL)
 	{
 		PartitionPruneState *prunestate;
 
@@ -145,8 +145,7 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 		 */
 		prunestate = ExecInitPartitionPruning(&appendstate->ps,
 											  list_length(node->appendplans),
-											  node->part_prune_index,
-											  node->apprelids,
+											  node->part_prune_info,
 											  &validsubplans);
 		appendstate->as_prune_state = prunestate;
 		nplans = bms_num_members(validsubplans);
@@ -157,7 +156,10 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 		 * later calls to ExecFindMatchingSubPlans.
 		 */
 		if (!prunestate->do_exec_prune && nplans > 0)
+		{
 			appendstate->as_valid_subplans = bms_add_range(NULL, 0, nplans - 1);
+			appendstate->as_valid_subplans_identified = true;
+		}
 	}
 	else
 	{
@@ -170,6 +172,7 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 		Assert(nplans > 0);
 		appendstate->as_valid_subplans = validsubplans =
 			bms_add_range(NULL, 0, nplans - 1);
+		appendstate->as_valid_subplans_identified = true;
 		appendstate->as_prune_state = NULL;
 	}
 
@@ -259,7 +262,7 @@ ExecInitAppend(Append *node, EState *estate, int eflags)
 		appendstate->as_asyncresults = (TupleTableSlot **)
 			palloc0(nasyncplans * sizeof(TupleTableSlot *));
 
-		if (appendstate->as_valid_subplans != NULL)
+		if (appendstate->as_valid_subplans_identified)
 			classify_matching_subplans(appendstate);
 	}
 
@@ -414,13 +417,11 @@ ExecReScanAppend(AppendState *node)
 		bms_overlap(node->ps.chgParam,
 					node->as_prune_state->execparamids))
 	{
+		node->as_valid_subplans_identified = false;
 		bms_free(node->as_valid_subplans);
 		node->as_valid_subplans = NULL;
-		if (nasyncplans > 0)
-		{
-			bms_free(node->as_valid_asyncplans);
-			node->as_valid_asyncplans = NULL;
-		}
+		bms_free(node->as_valid_asyncplans);
+		node->as_valid_asyncplans = NULL;
 	}
 
 	for (i = 0; i < node->as_nplans; i++)
@@ -574,11 +575,14 @@ choose_next_subplan_locally(AppendState *node)
 		if (node->as_nasyncplans > 0)
 		{
 			/* We'd have filled as_valid_subplans already */
-			Assert(node->as_valid_subplans);
+			Assert(node->as_valid_subplans_identified);
 		}
-		else if (node->as_valid_subplans == NULL)
+		else if (!node->as_valid_subplans_identified)
+		{
 			node->as_valid_subplans =
 				ExecFindMatchingSubPlans(node->as_prune_state, false);
+			node->as_valid_subplans_identified = true;
+		}
 
 		whichplan = -1;
 	}
@@ -640,10 +644,11 @@ choose_next_subplan_for_leader(AppendState *node)
 		 * run-time pruning is disabled then the valid subplans will always be
 		 * set to all subplans.
 		 */
-		if (node->as_valid_subplans == NULL)
+		if (!node->as_valid_subplans_identified)
 		{
 			node->as_valid_subplans =
 				ExecFindMatchingSubPlans(node->as_prune_state, false);
+			node->as_valid_subplans_identified = true;
 
 			/*
 			 * Mark each invalid plan as finished to allow the loop below to
@@ -715,10 +720,12 @@ choose_next_subplan_for_worker(AppendState *node)
 	 * run-time pruning is disabled then the valid subplans will always be set
 	 * to all subplans.
 	 */
-	else if (node->as_valid_subplans == NULL)
+	else if (!node->as_valid_subplans_identified)
 	{
 		node->as_valid_subplans =
 			ExecFindMatchingSubPlans(node->as_prune_state, false);
+		node->as_valid_subplans_identified = true;
+
 		mark_invalid_subplans_as_finished(node);
 	}
 
@@ -866,10 +873,11 @@ ExecAppendAsyncBegin(AppendState *node)
 	Assert(node->as_nasyncplans > 0);
 
 	/* If we've yet to determine the valid subplans then do so now. */
-	if (node->as_valid_subplans == NULL)
+	if (!node->as_valid_subplans_identified)
 	{
 		node->as_valid_subplans =
 			ExecFindMatchingSubPlans(node->as_prune_state, false);
+		node->as_valid_subplans_identified = true;
 
 		classify_matching_subplans(node);
 	}
@@ -1017,7 +1025,8 @@ ExecAppendAsyncEventWait(AppendState *node)
 	/* We should never be called when there are no valid async subplans. */
 	Assert(node->as_nasyncremain > 0);
 
-	node->as_eventset = CreateWaitEventSet(CurrentMemoryContext, nevents);
+	Assert(node->as_eventset == NULL);
+	node->as_eventset = CreateWaitEventSet(CurrentResourceOwner, nevents);
 	AddWaitEventToSet(node->as_eventset, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
 					  NULL, NULL);
 
@@ -1042,7 +1051,7 @@ ExecAppendAsyncEventWait(AppendState *node)
 		return;
 	}
 
-	/* We wait on at most EVENT_BUFFER_SIZE events. */
+	/* Return at most EVENT_BUFFER_SIZE events in one call. */
 	if (nevents > EVENT_BUFFER_SIZE)
 		nevents = EVENT_BUFFER_SIZE;
 
@@ -1143,6 +1152,7 @@ classify_matching_subplans(AppendState *node)
 {
 	Bitmapset  *valid_asyncplans;
 
+	Assert(node->as_valid_subplans_identified);
 	Assert(node->as_valid_asyncplans == NULL);
 
 	/* Nothing to do if there are no valid subplans. */
@@ -1161,9 +1171,8 @@ classify_matching_subplans(AppendState *node)
 	}
 
 	/* Get valid async subplans. */
-	valid_asyncplans = bms_copy(node->as_asyncplans);
-	valid_asyncplans = bms_int_members(valid_asyncplans,
-									   node->as_valid_subplans);
+	valid_asyncplans = bms_intersect(node->as_asyncplans,
+									 node->as_valid_subplans);
 
 	/* Adjust the valid subplans to contain sync subplans only. */
 	node->as_valid_subplans = bms_del_members(node->as_valid_subplans,

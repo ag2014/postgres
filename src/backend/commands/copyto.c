@@ -3,7 +3,7 @@
  * copyto.c
  *		COPY <table> TO file/program/client
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,11 +18,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#include "access/heapam.h"
-#include "access/htup_details.h"
 #include "access/tableam.h"
-#include "access/xact.h"
-#include "access/xlog.h"
 #include "commands/copy.h"
 #include "commands/progress.h"
 #include "executor/execdesc.h"
@@ -32,14 +28,11 @@
 #include "libpq/pqformat.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "optimizer/optimizer.h"
 #include "pgstat.h"
-#include "rewrite/rewriteHandler.h"
 #include "storage/fd.h"
 #include "tcop/tcopprot.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
-#include "utils/partcache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -51,7 +44,7 @@ typedef enum CopyDest
 {
 	COPY_FILE,					/* to file (or a piped program) */
 	COPY_FRONTEND,				/* to frontend */
-	COPY_CALLBACK				/* to callback function */
+	COPY_CALLBACK,				/* to callback function */
 } CopyDest;
 
 /*
@@ -119,7 +112,7 @@ static void ClosePipeToProgram(CopyToState cstate);
 static void CopyOneRowTo(CopyToState cstate, TupleTableSlot *slot);
 static void CopyAttributeOutText(CopyToState cstate, const char *string);
 static void CopyAttributeOutCSV(CopyToState cstate, const char *string,
-								bool use_quote, bool single_attr);
+								bool use_quote);
 
 /* Low-level communications functions */
 static void SendCopyBegin(CopyToState cstate);
@@ -144,7 +137,7 @@ SendCopyBegin(CopyToState cstate)
 	int16		format = (cstate->opts.binary ? 1 : 0);
 	int			i;
 
-	pq_beginmessage(&buf, 'H');
+	pq_beginmessage(&buf, PqMsg_CopyOutResponse);
 	pq_sendbyte(&buf, format);	/* overall format */
 	pq_sendint16(&buf, natts);
 	for (i = 0; i < natts; i++)
@@ -159,7 +152,7 @@ SendCopyEnd(CopyToState cstate)
 	/* Shouldn't have any unsent data */
 	Assert(cstate->fe_msgbuf->len == 0);
 	/* Send Copy Done message */
-	pq_putemptymessage('c');
+	pq_putemptymessage(PqMsg_CopyDone);
 }
 
 /*----------
@@ -247,7 +240,7 @@ CopySendEndOfRow(CopyToState cstate)
 				CopySendChar(cstate, '\n');
 
 			/* Dump the accumulated row as one CopyData message */
-			(void) pq_putmessage('d', fe_msgbuf->data, fe_msgbuf->len);
+			(void) pq_putmessage(PqMsg_CopyData, fe_msgbuf->data, fe_msgbuf->len);
 			break;
 		case COPY_CALLBACK:
 			cstate->data_dest_cb(fe_msgbuf->data, fe_msgbuf->len);
@@ -482,7 +475,7 @@ BeginCopyTo(ParseState *pstate,
 				if (q->querySource == QSRC_NON_INSTEAD_RULE)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("DO ALSO rules are not supported for the COPY")));
+							 errmsg("DO ALSO rules are not supported for COPY")));
 			}
 
 			ereport(ERROR,
@@ -499,7 +492,11 @@ BeginCopyTo(ParseState *pstate,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("COPY (SELECT INTO) is not supported")));
 
-		Assert(query->utilityStmt == NULL);
+		/* The only other utility command we could see is NOTIFY */
+		if (query->utilityStmt != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("COPY query must not be a utility command")));
 
 		/*
 		 * Similarly the grammar doesn't enforce the presence of a RETURNING
@@ -510,7 +507,8 @@ BeginCopyTo(ParseState *pstate,
 		{
 			Assert(query->commandType == CMD_INSERT ||
 				   query->commandType == CMD_UPDATE ||
-				   query->commandType == CMD_DELETE);
+				   query->commandType == CMD_DELETE ||
+				   query->commandType == CMD_MERGE);
 
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -524,8 +522,8 @@ BeginCopyTo(ParseState *pstate,
 		/*
 		 * With row-level security and a user using "COPY relation TO", we
 		 * have to convert the "COPY relation TO" to a query-based COPY (eg:
-		 * "COPY (SELECT * FROM relation) TO"), to allow the rewriter to add
-		 * in any RLS clauses.
+		 * "COPY (SELECT * FROM ONLY relation) TO"), to allow the rewriter to
+		 * add in any RLS clauses.
 		 *
 		 * When this happens, we are passed in the relid of the originally
 		 * found relation (which we have locked).  As the planner will look up
@@ -582,10 +580,7 @@ BeginCopyTo(ParseState *pstate,
 	cstate->opts.force_quote_flags = (bool *) palloc0(num_phys_attrs * sizeof(bool));
 	if (cstate->opts.force_quote_all)
 	{
-		int			i;
-
-		for (i = 0; i < num_phys_attrs; i++)
-			cstate->opts.force_quote_flags[i] = true;
+		MemSet(cstate->opts.force_quote_flags, true, num_phys_attrs * sizeof(bool));
 	}
 	else if (cstate->opts.force_quote)
 	{
@@ -602,8 +597,9 @@ BeginCopyTo(ParseState *pstate,
 			if (!list_member_int(cstate->attnumlist, attnum))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-						 errmsg("FORCE_QUOTE column \"%s\" not referenced by COPY",
-								NameStr(attr->attname))));
+				/*- translator: %s is the name of a COPY option, e.g. FORCE_NOT_NULL */
+						 errmsg("%s column \"%s\" not referenced by COPY",
+								"FORCE_QUOTE", NameStr(attr->attname))));
 			cstate->opts.force_quote_flags[attnum - 1] = true;
 		}
 	}
@@ -615,13 +611,15 @@ BeginCopyTo(ParseState *pstate,
 		cstate->file_encoding = cstate->opts.file_encoding;
 
 	/*
-	 * Set up encoding conversion info.  Even if the file and server encodings
-	 * are the same, we must apply pg_any_to_server() to validate data in
-	 * multibyte encodings.
+	 * Set up encoding conversion info if the file and server encodings differ
+	 * (see also pg_server_to_any).
 	 */
-	cstate->need_transcoding =
-		(cstate->file_encoding != GetDatabaseEncoding() ||
-		 pg_database_encoding_max_length() > 1);
+	if (cstate->file_encoding == GetDatabaseEncoding() ||
+		cstate->file_encoding == PG_SQL_ASCII)
+		cstate->need_transcoding = false;
+	else
+		cstate->need_transcoding = true;
+
 	/* See Multibyte encoding comment above */
 	cstate->encoding_embeds_ascii = PG_ENCODING_IS_CLIENT_ONLY(cstate->file_encoding);
 
@@ -840,8 +838,7 @@ DoCopyTo(CopyToState cstate)
 				colname = NameStr(TupleDescAttr(tupDesc, attnum - 1)->attname);
 
 				if (cstate->opts.csv_mode)
-					CopyAttributeOutCSV(cstate, colname, false,
-										list_length(cstate->attnumlist) == 1);
+					CopyAttributeOutCSV(cstate, colname, false);
 				else
 					CopyAttributeOutText(cstate, colname);
 			}
@@ -883,7 +880,7 @@ DoCopyTo(CopyToState cstate)
 	else
 	{
 		/* run the plan --- the dest receiver will send tuples */
-		ExecutorRun(cstate->queryDesc, ForwardScanDirection, 0L, true);
+		ExecutorRun(cstate->queryDesc, ForwardScanDirection, 0, true);
 		processed = ((DR_copy *) cstate->queryDesc->dest)->processed;
 	}
 
@@ -909,11 +906,8 @@ DoCopyTo(CopyToState cstate)
 static void
 CopyOneRowTo(CopyToState cstate, TupleTableSlot *slot)
 {
-	bool		need_delim = false;
 	FmgrInfo   *out_functions = cstate->out_functions;
 	MemoryContext oldcontext;
-	ListCell   *cur;
-	char	   *string;
 
 	MemoryContextReset(cstate->rowcontext);
 	oldcontext = MemoryContextSwitchTo(cstate->rowcontext);
@@ -927,43 +921,46 @@ CopyOneRowTo(CopyToState cstate, TupleTableSlot *slot)
 	/* Make sure the tuple is fully deconstructed */
 	slot_getallattrs(slot);
 
-	foreach(cur, cstate->attnumlist)
+	if (!cstate->opts.binary)
 	{
-		int			attnum = lfirst_int(cur);
-		Datum		value = slot->tts_values[attnum - 1];
-		bool		isnull = slot->tts_isnull[attnum - 1];
+		bool		need_delim = false;
 
-		if (!cstate->opts.binary)
+		foreach_int(attnum, cstate->attnumlist)
 		{
+			Datum		value = slot->tts_values[attnum - 1];
+			bool		isnull = slot->tts_isnull[attnum - 1];
+			char	   *string;
+
 			if (need_delim)
 				CopySendChar(cstate, cstate->opts.delim[0]);
 			need_delim = true;
-		}
 
-		if (isnull)
-		{
-			if (!cstate->opts.binary)
+			if (isnull)
 				CopySendString(cstate, cstate->opts.null_print_client);
 			else
-				CopySendInt32(cstate, -1);
-		}
-		else
-		{
-			if (!cstate->opts.binary)
 			{
 				string = OutputFunctionCall(&out_functions[attnum - 1],
 											value);
 				if (cstate->opts.csv_mode)
 					CopyAttributeOutCSV(cstate, string,
-										cstate->opts.force_quote_flags[attnum - 1],
-										list_length(cstate->attnumlist) == 1);
+										cstate->opts.force_quote_flags[attnum - 1]);
 				else
 					CopyAttributeOutText(cstate, string);
 			}
+		}
+	}
+	else
+	{
+		foreach_int(attnum, cstate->attnumlist)
+		{
+			Datum		value = slot->tts_values[attnum - 1];
+			bool		isnull = slot->tts_isnull[attnum - 1];
+			bytea	   *outputbytes;
+
+			if (isnull)
+				CopySendInt32(cstate, -1);
 			else
 			{
-				bytea	   *outputbytes;
-
 				outputbytes = SendFunctionCall(&out_functions[attnum - 1],
 											   value);
 				CopySendInt32(cstate, VARSIZE(outputbytes) - VARHDRSZ);
@@ -1142,7 +1139,7 @@ CopyAttributeOutText(CopyToState cstate, const char *string)
  */
 static void
 CopyAttributeOutCSV(CopyToState cstate, const char *string,
-					bool use_quote, bool single_attr)
+					bool use_quote)
 {
 	const char *ptr;
 	const char *start;
@@ -1150,6 +1147,7 @@ CopyAttributeOutCSV(CopyToState cstate, const char *string,
 	char		delimc = cstate->opts.delim[0];
 	char		quotec = cstate->opts.quote[0];
 	char		escapec = cstate->opts.escape[0];
+	bool		single_attr = (list_length(cstate->attnumlist) == 1);
 
 	/* force quoting if it matches null_print (before conversion!) */
 	if (!use_quote && strcmp(string, cstate->opts.null_print) == 0)
@@ -1166,8 +1164,11 @@ CopyAttributeOutCSV(CopyToState cstate, const char *string,
 	if (!use_quote)
 	{
 		/*
-		 * Because '\.' can be a data value, quote it if it appears alone on a
-		 * line so it is not interpreted as the end-of-data marker.
+		 * Quote '\.' if it appears alone on a line, so that it will not be
+		 * interpreted as an end-of-data marker.  (PG 18 and up will not
+		 * interpret '\.' in CSV that way, except in embedded-in-SQL data; but
+		 * we want the data to be loadable by older versions too.  Also, this
+		 * avoids breaking clients that are still using PQgetline().)
 		 */
 		if (single_attr && strcmp(ptr, "\\.") == 0)
 			use_quote = true;

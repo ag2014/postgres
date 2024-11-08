@@ -117,7 +117,7 @@ PostgreSQL documentation
       <term><option>--fork=<replaceable>fork</replaceable></option></term>
       <listitem>
        <para>
-        If provided, only display records that modify blocks in the given fork.
+        Only display records that modify blocks in the given fork.
         The valid values are <literal>main</literal> for the main fork,
         <literal>fsm</literal> for the free space map,
         <literal>vm</literal> for the visibility map,
@@ -174,12 +174,13 @@ PostgreSQL documentation
         names, and exit.
        </para>
        <para>
-        Extensions may define custom resource managers, but pg_waldump does
+        Extensions may define custom resource managers, but
+        <application>pg_waldump</application> does
         not load the extension module and therefore does not recognize custom
         resource managers by name. Instead, you can specify the custom
         resource managers as <literal>custom###</literal> where
-        "<literal>###</literal>" is the three-digit resource manager ID. Names
-        of this form will always be considered valid.
+        <replaceable>###</replaceable> is the three-digit resource manager ID.
+        Names of this form will always be considered valid.
        </para>
       </listitem>
      </varlistentry>
@@ -215,7 +216,8 @@ PostgreSQL documentation
        <para>
         Timeline from which to read WAL records. The default is to use the
         value in <replaceable>startseg</replaceable>, if that is specified; otherwise, the
-        default is 1.
+        default is 1.  The value can be specified in decimal or hexadecimal,
+        for example <literal>17</literal> or <literal>0x11</literal>.
        </para>
       </listitem>
      </varlistentry>
@@ -236,72 +238,6 @@ PostgreSQL documentation
        <listitem>
        <para>
         Only display records that include full page images.
-       </para>
-       </listitem>
-     </varlistentry>
-
-     <varlistentry>
-       <term><option>--save-fullpage=<replaceable>save_path</replaceable></option></term>
-       <listitem>
-       <para>
-        Save full page images found in the WAL records to the
-        <replaceable>save_path</replaceable> directory. The images saved
-        are subject to the same filtering and limiting criteria as the
-        records displayed.
-       </para>
-       <para>
-        The full page images are saved with the following file name format:
-        <literal><replaceable>LSN</replaceable>.<replaceable>RELTABLESPACE</replaceable>.<replaceable>DATOID</replaceable>.<replaceable>RELNODE</replaceable>.<replaceable>BLKNO</replaceable><replaceable>FORK</replaceable></literal>
-
-        The file names are composed of the following parts:
-        <informaltable>
-         <tgroup cols="2">
-          <thead>
-           <row>
-            <entry>Component</entry>
-            <entry>Description</entry>
-           </row>
-          </thead>
-
-          <tbody>
-           <row>
-            <entry>LSN</entry>
-            <entry>The <acronym>LSN</acronym> of the record with this image,
-             formatted as two 8-character hexadecimal numbers
-             <literal>%08X-%08X</literal></entry>
-           </row>
-
-           <row>
-            <entry>RELTABLESPACE</entry>
-            <entry>tablespace OID of the block</entry>
-           </row>
-
-           <row>
-            <entry>DATOID</entry>
-            <entry>database OID of the block</entry>
-           </row>
-
-           <row>
-            <entry>RELNODE</entry>
-            <entry>filenode of the block</entry>
-           </row>
-
-           <row>
-            <entry>BLKNO</entry>
-            <entry>block number of the block</entry>
-           </row>
-
-           <row>
-            <entry>FORK</entry>
-            <entry>
-             The name of the fork the full page image came from, as of
-             <literal>_main</literal>, <literal>_fsm</literal>,
-             <literal>_vm</literal>, or <literal>_init</literal>.
-            </entry>
-           </row>
-          </tbody>
-         </tgroup>
-        </informaltable>
        </para>
        </listitem>
      </varlistentry>
@@ -335,6 +271,79 @@ PostgreSQL documentation
         <productname>Windows</productname>.
        </para>
       </listitem>
+     </varlistentry>
+
+     <varlistentry>
+       <term><option>--save-fullpage=<replaceable>save_path</replaceable></option></term>
+       <listitem>
+       <para>
+        Save full page images found in the WAL records to the
+        <replaceable>save_path</replaceable> directory. The images saved
+        are subject to the same filtering and limiting criteria as the
+        records displayed.
+       </para>
+       <para>
+        The full page images are saved with the following file name format:
+        <literal><replaceable>TIMELINE</replaceable>-<replaceable>LSN</replaceable>.<replaceable>RELTABLESPACE</replaceable>.<replaceable>DATOID</replaceable>.<replaceable>RELNODE</replaceable>.<replaceable>BLKNO</replaceable>_<replaceable>FORK</replaceable></literal>
+
+        The file names are composed of the following parts:
+        <informaltable>
+         <tgroup cols="2">
+          <thead>
+           <row>
+            <entry>Component</entry>
+            <entry>Description</entry>
+           </row>
+          </thead>
+
+          <tbody>
+           <row>
+            <entry>TIMELINE</entry>
+            <entry>The timeline of the WAL segment file where the record
+             is located formatted as one 8-character hexadecimal number
+             <literal>%08X</literal></entry>
+           </row>
+
+           <row>
+            <entry>LSN</entry>
+            <entry>The <acronym>LSN</acronym> of the record with this image,
+             formatted as two 8-character hexadecimal numbers
+             <literal>%08X-%08X</literal></entry>
+           </row>
+
+           <row>
+            <entry>RELTABLESPACE</entry>
+            <entry>tablespace OID of the block</entry>
+           </row>
+
+           <row>
+            <entry>DATOID</entry>
+            <entry>database OID of the block</entry>
+           </row>
+
+           <row>
+            <entry>RELNODE</entry>
+            <entry>filenode of the block</entry>
+           </row>
+
+           <row>
+            <entry>BLKNO</entry>
+            <entry>block number of the block</entry>
+           </row>
+
+           <row>
+            <entry>FORK</entry>
+            <entry>
+             The name of the fork the full page image came from, such as
+             <literal>main</literal>, <literal>fsm</literal>,
+             <literal>vm</literal>, or <literal>init</literal>.
+            </entry>
+           </row>
+          </tbody>
+         </tgroup>
+        </informaltable>
+       </para>
+       </listitem>
      </varlistentry>
 
      <varlistentry>

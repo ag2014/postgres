@@ -1,7 +1,7 @@
 /*
  * PostgreSQL System Views
  *
- * Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * src/backend/catalog/system_views.sql
  *
@@ -176,11 +176,7 @@ CREATE VIEW pg_sequences AS
         S.seqincrement AS increment_by,
         S.seqcycle AS cycle,
         S.seqcache AS cache_size,
-        CASE
-            WHEN has_sequence_privilege(C.oid, 'SELECT,USAGE'::text)
-                THEN pg_sequence_last_value(C.oid)
-            ELSE NULL
-        END AS last_value
+        pg_sequence_last_value(C.oid) AS last_value
     FROM pg_sequence S JOIN pg_class C ON (C.oid = S.seqrelid)
          LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
     WHERE NOT pg_is_other_temp_schema(N.oid)
@@ -243,7 +239,28 @@ CREATE VIEW pg_stats WITH (security_barrier) AS
             WHEN stakind3 = 5 THEN stanumbers3
             WHEN stakind4 = 5 THEN stanumbers4
             WHEN stakind5 = 5 THEN stanumbers5
-        END AS elem_count_histogram
+        END AS elem_count_histogram,
+        CASE
+            WHEN stakind1 = 6 THEN stavalues1
+            WHEN stakind2 = 6 THEN stavalues2
+            WHEN stakind3 = 6 THEN stavalues3
+            WHEN stakind4 = 6 THEN stavalues4
+            WHEN stakind5 = 6 THEN stavalues5
+        END AS range_length_histogram,
+        CASE
+            WHEN stakind1 = 6 THEN stanumbers1[1]
+            WHEN stakind2 = 6 THEN stanumbers2[1]
+            WHEN stakind3 = 6 THEN stanumbers3[1]
+            WHEN stakind4 = 6 THEN stanumbers4[1]
+            WHEN stakind5 = 6 THEN stanumbers5[1]
+        END AS range_empty_frac,
+        CASE
+            WHEN stakind1 = 7 THEN stavalues1
+            WHEN stakind2 = 7 THEN stavalues2
+            WHEN stakind3 = 7 THEN stavalues3
+            WHEN stakind4 = 7 THEN stavalues4
+            WHEN stakind5 = 7 THEN stavalues5
+            END AS range_bounds_histogram
     FROM pg_statistic s JOIN pg_class c ON (c.oid = s.starelid)
          JOIN pg_attribute a ON (c.oid = attrelid AND attnum = s.staattnum)
          LEFT JOIN pg_namespace n ON (n.oid = c.relnamespace)
@@ -284,12 +301,7 @@ CREATE VIEW pg_stats_ext WITH (security_barrier) AS
                             array_agg(base_frequency) AS most_common_base_freqs
                      FROM pg_mcv_list_items(sd.stxdmcv)
                    ) m ON sd.stxdmcv IS NOT NULL
-    WHERE NOT EXISTS
-              ( SELECT 1
-                FROM unnest(stxkeys) k
-                     JOIN pg_attribute a
-                          ON (a.attrelid = s.stxrelid AND a.attnum = k)
-                WHERE NOT has_column_privilege(c.oid, a.attnum, 'select') )
+    WHERE pg_has_role(c.relowner, 'USAGE')
     AND (c.relrowsecurity = false OR NOT row_security_active(c.oid));
 
 CREATE VIEW pg_stats_ext_exprs WITH (security_barrier) AS
@@ -359,7 +371,9 @@ CREATE VIEW pg_stats_ext_exprs WITH (security_barrier) AS
          JOIN LATERAL (
              SELECT unnest(pg_get_statisticsobjdef_expressions(s.oid)) AS expr,
                     unnest(sd.stxdexpr)::pg_statistic AS a
-         ) stat ON (stat.expr IS NOT NULL);
+         ) stat ON (stat.expr IS NOT NULL)
+    WHERE pg_has_role(c.relowner, 'USAGE')
+    AND (c.relrowsecurity = false OR NOT row_security_active(c.oid));
 
 -- unprivileged users may read pg_statistic_ext but not pg_statistic_ext_data
 REVOKE ALL ON pg_statistic_ext_data FROM public;
@@ -665,6 +679,7 @@ CREATE VIEW pg_stat_all_tables AS
             pg_stat_get_tuples_updated(C.oid) AS n_tup_upd,
             pg_stat_get_tuples_deleted(C.oid) AS n_tup_del,
             pg_stat_get_tuples_hot_updated(C.oid) AS n_tup_hot_upd,
+            pg_stat_get_tuples_newpage_updated(C.oid) AS n_tup_newpage_upd,
             pg_stat_get_live_tuples(C.oid) AS n_live_tup,
             pg_stat_get_dead_tuples(C.oid) AS n_dead_tup,
             pg_stat_get_mod_since_analyze(C.oid) AS n_mod_since_analyze,
@@ -696,7 +711,8 @@ CREATE VIEW pg_stat_xact_all_tables AS
             pg_stat_get_xact_tuples_inserted(C.oid) AS n_tup_ins,
             pg_stat_get_xact_tuples_updated(C.oid) AS n_tup_upd,
             pg_stat_get_xact_tuples_deleted(C.oid) AS n_tup_del,
-            pg_stat_get_xact_tuples_hot_updated(C.oid) AS n_tup_hot_upd
+            pg_stat_get_xact_tuples_hot_updated(C.oid) AS n_tup_hot_upd,
+            pg_stat_get_xact_tuples_newpage_updated(C.oid) AS n_tup_newpage_upd
     FROM pg_class C LEFT JOIN
          pg_index I ON C.oid = I.indrelid
          LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
@@ -947,6 +963,7 @@ CREATE VIEW pg_stat_subscription AS
     SELECT
             su.oid AS subid,
             su.subname,
+            st.worker_type,
             st.pid,
             st.leader_pid,
             st.relid,
@@ -977,7 +994,8 @@ CREATE VIEW pg_stat_gssapi AS
             S.pid,
             S.gss_auth AS gss_authenticated,
             S.gss_princ AS principal,
-            S.gss_enc AS encrypted
+            S.gss_enc AS encrypted,
+            S.gss_delegation AS credentials_delegated
     FROM pg_stat_get_activity(NULL) AS S
     WHERE S.client_port IS NOT NULL;
 
@@ -997,7 +1015,12 @@ CREATE VIEW pg_replication_slots AS
             L.confirmed_flush_lsn,
             L.wal_status,
             L.safe_wal_size,
-            L.two_phase
+            L.two_phase,
+            L.inactive_since,
+            L.conflicting,
+            L.invalidation_reason,
+            L.failover,
+            L.synced
     FROM pg_get_replication_slots() AS L
             LEFT JOIN pg_database D ON (L.datoid = D.oid);
 
@@ -1065,7 +1088,8 @@ CREATE VIEW pg_stat_database_conflicts AS
             pg_stat_get_db_conflict_lock(D.oid) AS confl_lock,
             pg_stat_get_db_conflict_snapshot(D.oid) AS confl_snapshot,
             pg_stat_get_db_conflict_bufferpin(D.oid) AS confl_bufferpin,
-            pg_stat_get_db_conflict_startup_deadlock(D.oid) AS confl_deadlock
+            pg_stat_get_db_conflict_startup_deadlock(D.oid) AS confl_deadlock,
+            pg_stat_get_db_conflict_logicalslot(D.oid) AS confl_active_logicalslot
     FROM pg_database D;
 
 CREATE VIEW pg_stat_user_functions AS
@@ -1105,30 +1129,44 @@ CREATE VIEW pg_stat_archiver AS
 
 CREATE VIEW pg_stat_bgwriter AS
     SELECT
-        pg_stat_get_bgwriter_timed_checkpoints() AS checkpoints_timed,
-        pg_stat_get_bgwriter_requested_checkpoints() AS checkpoints_req,
-        pg_stat_get_checkpoint_write_time() AS checkpoint_write_time,
-        pg_stat_get_checkpoint_sync_time() AS checkpoint_sync_time,
-        pg_stat_get_bgwriter_buf_written_checkpoints() AS buffers_checkpoint,
         pg_stat_get_bgwriter_buf_written_clean() AS buffers_clean,
         pg_stat_get_bgwriter_maxwritten_clean() AS maxwritten_clean,
-        pg_stat_get_buf_written_backend() AS buffers_backend,
-        pg_stat_get_buf_fsync_backend() AS buffers_backend_fsync,
         pg_stat_get_buf_alloc() AS buffers_alloc,
         pg_stat_get_bgwriter_stat_reset_time() AS stats_reset;
+
+CREATE VIEW pg_stat_checkpointer AS
+    SELECT
+        pg_stat_get_checkpointer_num_timed() AS num_timed,
+        pg_stat_get_checkpointer_num_requested() AS num_requested,
+        pg_stat_get_checkpointer_num_performed() AS num_done,
+        pg_stat_get_checkpointer_restartpoints_timed() AS restartpoints_timed,
+        pg_stat_get_checkpointer_restartpoints_requested() AS restartpoints_req,
+        pg_stat_get_checkpointer_restartpoints_performed() AS restartpoints_done,
+        pg_stat_get_checkpointer_write_time() AS write_time,
+        pg_stat_get_checkpointer_sync_time() AS sync_time,
+        pg_stat_get_checkpointer_buffers_written() AS buffers_written,
+        pg_stat_get_checkpointer_slru_written() AS slru_written,
+        pg_stat_get_checkpointer_stat_reset_time() AS stats_reset;
 
 CREATE VIEW pg_stat_io AS
 SELECT
        b.backend_type,
-       b.io_object,
-       b.io_context,
+       b.object,
+       b.context,
        b.reads,
+       b.read_time,
        b.writes,
+       b.write_time,
+       b.writebacks,
+       b.writeback_time,
        b.extends,
+       b.extend_time,
        b.op_bytes,
+       b.hits,
        b.evictions,
        b.reuses,
        b.fsyncs,
+       b.fsync_time,
        b.stats_reset
 FROM pg_stat_get_io() b;
 
@@ -1180,7 +1218,9 @@ CREATE VIEW pg_stat_progress_vacuum AS
                       END AS phase,
         S.param2 AS heap_blks_total, S.param3 AS heap_blks_scanned,
         S.param4 AS heap_blks_vacuumed, S.param5 AS index_vacuum_count,
-        S.param6 AS max_dead_tuples, S.param7 AS num_dead_tuples
+        S.param6 AS max_dead_tuple_bytes, S.param7 AS dead_tuple_bytes,
+        S.param8 AS num_dead_item_ids, S.param9 AS indexes_total,
+        S.param10 AS indexes_processed
     FROM pg_stat_get_progress_info('VACUUM') AS S
         LEFT JOIN pg_database D ON S.datid = D.oid;
 
@@ -1278,7 +1318,8 @@ CREATE VIEW pg_stat_progress_copy AS
         S.param1 AS bytes_processed,
         S.param2 AS bytes_total,
         S.param3 AS tuples_processed,
-        S.param4 AS tuples_excluded
+        S.param4 AS tuples_excluded,
+        S.param7 AS tuples_skipped
     FROM pg_stat_get_progress_info('COPY') AS S
         LEFT JOIN pg_database D ON S.datid = D.oid;
 
@@ -1316,6 +1357,7 @@ REVOKE ALL ON pg_replication_origin_status FROM public;
 REVOKE ALL ON pg_subscription FROM public;
 GRANT SELECT (oid, subdbid, subskiplsn, subname, subowner, subenabled,
               subbinary, substream, subtwophasestate, subdisableonerr,
+			  subpasswordrequired, subrunasowner, subfailover,
               subslotname, subsynccommit, subpublications, suborigin)
     ON pg_subscription TO public;
 
@@ -1325,6 +1367,15 @@ CREATE VIEW pg_stat_subscription_stats AS
         s.subname,
         ss.apply_error_count,
         ss.sync_error_count,
+        ss.confl_insert_exists,
+        ss.confl_update_origin_differs,
+        ss.confl_update_exists,
+        ss.confl_update_missing,
+        ss.confl_delete_origin_differs,
+        ss.confl_delete_missing,
         ss.stats_reset
     FROM pg_subscription as s,
          pg_stat_get_subscription_stats(s.oid) as ss;
+
+CREATE VIEW pg_wait_events AS
+    SELECT * FROM pg_get_wait_events();

@@ -4,7 +4,7 @@
 
 -- These tests require track_planning to be enabled.
 SET pg_stat_statements.track_planning = TRUE;
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;
 
 --
 -- [re]plan counting
@@ -20,12 +20,12 @@ SELECT 42;
 SELECT 42;
 SELECT 42;
 SELECT plans, calls, rows, query FROM pg_stat_statements
-  WHERE query NOT LIKE 'PREPARE%' ORDER BY query COLLATE "C";
+  WHERE query NOT LIKE 'SELECT COUNT%' ORDER BY query COLLATE "C";
 -- for the prepared statement we expect at least one replan, but cache
 -- invalidations could force more
 SELECT plans >= 2 AND plans <= calls AS plans_ok, calls, rows, query FROM pg_stat_statements
-  WHERE query LIKE 'PREPARE%' ORDER BY query COLLATE "C";
+  WHERE query LIKE 'SELECT COUNT%' ORDER BY query COLLATE "C";
 
 -- Cleanup
 DROP TABLE stats_plan_test;
-SELECT pg_stat_statements_reset();
+SELECT pg_stat_statements_reset() IS NOT NULL AS t;

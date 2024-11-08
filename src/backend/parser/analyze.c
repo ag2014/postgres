@@ -14,7 +14,7 @@
  * contain optimizable statements, which we should transform.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	src/backend/parser/analyze.c
@@ -27,6 +27,7 @@
 #include "access/sysattr.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -47,7 +48,6 @@
 #include "parser/parse_target.h"
 #include "parser/parse_type.h"
 #include "parser/parsetree.h"
-#include "rewrite/rewriteManip.h"
 #include "utils/backend_status.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -73,7 +73,6 @@ static void determineRecursiveColTypes(ParseState *pstate,
 									   Node *larg, List *nrtargetlist);
 static Query *transformReturnStmt(ParseState *pstate, ReturnStmt *stmt);
 static Query *transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt);
-static List *transformReturningList(ParseState *pstate, List *returningList);
 static Query *transformPLAssignStmt(ParseState *pstate,
 									PLAssignStmt *stmt);
 static Query *transformDeclareCursorStmt(ParseState *pstate,
@@ -86,7 +85,7 @@ static Query *transformCallStmt(ParseState *pstate,
 								CallStmt *stmt);
 static void transformLockingClause(ParseState *pstate, Query *qry,
 								   LockingClause *lc, bool pushedDown);
-#ifdef RAW_EXPRESSION_COVERAGE_TEST
+#ifdef DEBUG_NODE_TESTS_ENABLED
 static bool test_raw_expression_coverage(Node *node, void *context);
 #endif
 
@@ -123,7 +122,7 @@ parse_analyze_fixedparams(RawStmt *parseTree, const char *sourceText,
 	query = transformTopLevelStmt(pstate, parseTree);
 
 	if (IsQueryIdEnabled())
-		jstate = JumbleQuery(query, sourceText);
+		jstate = JumbleQuery(query);
 
 	if (post_parse_analyze_hook)
 		(*post_parse_analyze_hook) (pstate, query, jstate);
@@ -165,7 +164,7 @@ parse_analyze_varparams(RawStmt *parseTree, const char *sourceText,
 	check_variable_parameters(pstate, query);
 
 	if (IsQueryIdEnabled())
-		jstate = JumbleQuery(query, sourceText);
+		jstate = JumbleQuery(query);
 
 	if (post_parse_analyze_hook)
 		(*post_parse_analyze_hook) (pstate, query, jstate);
@@ -202,7 +201,7 @@ parse_analyze_withcb(RawStmt *parseTree, const char *sourceText,
 	query = transformTopLevelStmt(pstate, parseTree);
 
 	if (IsQueryIdEnabled())
-		jstate = JumbleQuery(query, sourceText);
+		jstate = JumbleQuery(query);
 
 	if (post_parse_analyze_hook)
 		(*post_parse_analyze_hook) (pstate, query, jstate);
@@ -240,22 +239,106 @@ parse_sub_analyze(Node *parseTree, ParseState *parentParseState,
 }
 
 /*
+ * setQueryLocationAndLength
+ * 		Set query's location and length from statement and ParseState
+ *
+ * Some statements, like PreparableStmt, can be located within parentheses.
+ * For example "(SELECT 1)" or "COPY (UPDATE ...) to x;".  For those, we
+ * cannot use the whole string from the statement's location or the SQL
+ * string would yield incorrectly.  The parser will set stmt_len, reflecting
+ * the size of the statement within the parentheses.  Thus, when stmt_len is
+ * available, we need to use it for the Query's stmt_len.
+ *
+ * For other cases, the parser can't provide the length of individual
+ * statements.  However, we have the statement's location plus the length
+ * (p_stmt_len) and location (p_stmt_location) of the top level RawStmt,
+ * stored in pstate.  Thus, the statement's length is the RawStmt's length
+ * minus how much we've advanced in the RawStmt's string.
+ */
+static void
+setQueryLocationAndLength(ParseState *pstate, Query *qry, Node *parseTree)
+{
+	ParseLoc	stmt_len = 0;
+
+	/*
+	 * If there is no information about the top RawStmt's length, leave it at
+	 * 0 to use the whole string.
+	 */
+	if (pstate->p_stmt_len == 0)
+		return;
+
+	switch (nodeTag(parseTree))
+	{
+		case T_InsertStmt:
+			qry->stmt_location = ((InsertStmt *) parseTree)->stmt_location;
+			stmt_len = ((InsertStmt *) parseTree)->stmt_len;
+			break;
+
+		case T_DeleteStmt:
+			qry->stmt_location = ((DeleteStmt *) parseTree)->stmt_location;
+			stmt_len = ((DeleteStmt *) parseTree)->stmt_len;
+			break;
+
+		case T_UpdateStmt:
+			qry->stmt_location = ((UpdateStmt *) parseTree)->stmt_location;
+			stmt_len = ((UpdateStmt *) parseTree)->stmt_len;
+			break;
+
+		case T_MergeStmt:
+			qry->stmt_location = ((MergeStmt *) parseTree)->stmt_location;
+			stmt_len = ((MergeStmt *) parseTree)->stmt_len;
+			break;
+
+		case T_SelectStmt:
+			qry->stmt_location = ((SelectStmt *) parseTree)->stmt_location;
+			stmt_len = ((SelectStmt *) parseTree)->stmt_len;
+			break;
+
+		case T_PLAssignStmt:
+			qry->stmt_location = ((PLAssignStmt *) parseTree)->location;
+			break;
+
+		default:
+			qry->stmt_location = pstate->p_stmt_location;
+			break;
+	}
+
+	if (stmt_len > 0)
+	{
+		/* Statement's length is known, use it */
+		qry->stmt_len = stmt_len;
+	}
+	else
+	{
+		/*
+		 * Compute the statement's length from the statement's location and
+		 * the RawStmt's length and location.
+		 */
+		qry->stmt_len = pstate->p_stmt_len - (qry->stmt_location - pstate->p_stmt_location);
+	}
+
+	/* The calculated statement length should be calculated as positive. */
+	Assert(qry->stmt_len >= 0);
+}
+
+/*
  * transformTopLevelStmt -
  *	  transform a Parse tree into a Query tree.
  *
- * This function is just responsible for transferring statement location data
- * from the RawStmt into the finished Query.
+ * This function is just responsible for storing location data
+ * from the RawStmt into the ParseState.
  */
 Query *
 transformTopLevelStmt(ParseState *pstate, RawStmt *parseTree)
 {
 	Query	   *result;
 
+	/* Store RawStmt's length and location in pstate */
+	pstate->p_stmt_len = parseTree->stmt_len;
+	pstate->p_stmt_location = parseTree->stmt_location;
+
 	/* We're at top level, so allow SELECT INTO */
 	result = transformOptionalSelectInto(pstate, parseTree->stmt);
-
-	result->stmt_location = parseTree->stmt_location;
-	result->stmt_len = parseTree->stmt_len;
 
 	return result;
 }
@@ -314,26 +397,36 @@ transformStmt(ParseState *pstate, Node *parseTree)
 {
 	Query	   *result;
 
-	/*
-	 * We apply RAW_EXPRESSION_COVERAGE_TEST testing to basic DML statements;
-	 * we can't just run it on everything because raw_expression_tree_walker()
-	 * doesn't claim to handle utility statements.
-	 */
-#ifdef RAW_EXPRESSION_COVERAGE_TEST
-	switch (nodeTag(parseTree))
-	{
-		case T_SelectStmt:
-		case T_InsertStmt:
-		case T_UpdateStmt:
-		case T_DeleteStmt:
-		case T_MergeStmt:
-			(void) test_raw_expression_coverage(parseTree, NULL);
-			break;
-		default:
-			break;
-	}
-#endif							/* RAW_EXPRESSION_COVERAGE_TEST */
+#ifdef DEBUG_NODE_TESTS_ENABLED
 
+	/*
+	 * We apply debug_raw_expression_coverage_test testing to basic DML
+	 * statements; we can't just run it on everything because
+	 * raw_expression_tree_walker() doesn't claim to handle utility
+	 * statements.
+	 */
+	if (Debug_raw_expression_coverage_test)
+	{
+		switch (nodeTag(parseTree))
+		{
+			case T_SelectStmt:
+			case T_InsertStmt:
+			case T_UpdateStmt:
+			case T_DeleteStmt:
+			case T_MergeStmt:
+				(void) test_raw_expression_coverage(parseTree, NULL);
+				break;
+			default:
+				break;
+		}
+	}
+#endif							/* DEBUG_NODE_TESTS_ENABLED */
+
+	/*
+	 * Caution: when changing the set of statement types that have non-default
+	 * processing here, see also stmt_requires_parse_analysis() and
+	 * analyze_requires_snapshot().
+	 */
 	switch (nodeTag(parseTree))
 	{
 			/*
@@ -415,19 +508,28 @@ transformStmt(ParseState *pstate, Node *parseTree)
 	/* Mark as original query until we learn differently */
 	result->querySource = QSRC_ORIGINAL;
 	result->canSetTag = true;
+	setQueryLocationAndLength(pstate, result, parseTree);
 
 	return result;
 }
 
 /*
- * analyze_requires_snapshot
- *		Returns true if a snapshot must be set before doing parse analysis
- *		on the given raw parse tree.
+ * stmt_requires_parse_analysis
+ *		Returns true if parse analysis will do anything non-trivial
+ *		with the given raw parse tree.
  *
- * Classification here should match transformStmt().
+ * Generally, this should return true for any statement type for which
+ * transformStmt() does more than wrap a CMD_UTILITY Query around it.
+ * When it returns false, the caller can assume that there is no situation
+ * in which parse analysis of the raw statement could need to be re-done.
+ *
+ * Currently, since the rewriter and planner do nothing for CMD_UTILITY
+ * Queries, a false result means that the entire parse analysis/rewrite/plan
+ * pipeline will never need to be re-done.  If that ever changes, callers
+ * will likely need adjustment.
  */
 bool
-analyze_requires_snapshot(RawStmt *parseTree)
+stmt_requires_parse_analysis(RawStmt *parseTree)
 {
 	bool		result;
 
@@ -441,6 +543,7 @@ analyze_requires_snapshot(RawStmt *parseTree)
 		case T_UpdateStmt:
 		case T_MergeStmt:
 		case T_SelectStmt:
+		case T_ReturnStmt:
 		case T_PLAssignStmt:
 			result = true;
 			break;
@@ -451,17 +554,41 @@ analyze_requires_snapshot(RawStmt *parseTree)
 		case T_DeclareCursorStmt:
 		case T_ExplainStmt:
 		case T_CreateTableAsStmt:
-			/* yes, because we must analyze the contained statement */
+		case T_CallStmt:
 			result = true;
 			break;
 
 		default:
-			/* other utility statements don't have any real parse analysis */
+			/* all other statements just get wrapped in a CMD_UTILITY Query */
 			result = false;
 			break;
 	}
 
 	return result;
+}
+
+/*
+ * analyze_requires_snapshot
+ *		Returns true if a snapshot must be set before doing parse analysis
+ *		on the given raw parse tree.
+ */
+bool
+analyze_requires_snapshot(RawStmt *parseTree)
+{
+	/*
+	 * Currently, this should return true in exactly the same cases that
+	 * stmt_requires_parse_analysis() does, so we just invoke that function
+	 * rather than duplicating it.  We keep the two entry points separate for
+	 * clarity of callers, since from the callers' standpoint these are
+	 * different conditions.
+	 *
+	 * While there may someday be a statement type for which transformStmt()
+	 * does something nontrivial and yet no snapshot is needed for that
+	 * processing, it seems likely that making such a choice would be fragile.
+	 * If you want to install an exception, document the reasoning for it in a
+	 * comment.
+	 */
+	return stmt_requires_parse_analysis(parseTree);
 }
 
 /*
@@ -514,7 +641,8 @@ transformDeleteStmt(ParseState *pstate, DeleteStmt *stmt)
 	qual = transformWhereClause(pstate, stmt->whereClause,
 								EXPR_KIND_WHERE, "WHERE");
 
-	qry->returningList = transformReturningList(pstate, stmt->returningList);
+	qry->returningList = transformReturningList(pstate, stmt->returningList,
+												EXPR_KIND_RETURNING);
 
 	/* done building the range table and jointree */
 	qry->rtable = pstate->p_rtable;
@@ -941,7 +1069,8 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 	/* Process RETURNING, if any. */
 	if (stmt->returningList)
 		qry->returningList = transformReturningList(pstate,
-													stmt->returningList);
+													stmt->returningList,
+													EXPR_KIND_RETURNING);
 
 	/* done building the range table and jointree */
 	qry->rtable = pstate->p_rtable;
@@ -1033,17 +1162,28 @@ transformInsertRow(ParseState *pstate, List *exprlist,
 
 		if (strip_indirection)
 		{
+			/*
+			 * We need to remove top-level FieldStores and SubscriptingRefs,
+			 * as well as any CoerceToDomain appearing above one of those ---
+			 * but not a CoerceToDomain that isn't above one of those.
+			 */
 			while (expr)
 			{
-				if (IsA(expr, FieldStore))
+				Expr	   *subexpr = expr;
+
+				while (IsA(subexpr, CoerceToDomain))
 				{
-					FieldStore *fstore = (FieldStore *) expr;
+					subexpr = ((CoerceToDomain *) subexpr)->arg;
+				}
+				if (IsA(subexpr, FieldStore))
+				{
+					FieldStore *fstore = (FieldStore *) subexpr;
 
 					expr = (Expr *) linitial(fstore->newvals);
 				}
-				else if (IsA(expr, SubscriptingRef))
+				else if (IsA(subexpr, SubscriptingRef))
 				{
-					SubscriptingRef *sbsref = (SubscriptingRef *) expr;
+					SubscriptingRef *sbsref = (SubscriptingRef *) subexpr;
 
 					if (sbsref->refassgnexpr == NULL)
 						break;
@@ -1841,7 +1981,8 @@ transformSetOperationStmt(ParseState *pstate, SelectStmt *stmt)
 	 * For now, we don't support resjunk sort clauses on the output of a
 	 * setOperation tree --- you can only use the SQL92-spec options of
 	 * selecting an output column by name or number.  Enforce by checking that
-	 * transformSortClause doesn't add any items to tlist.
+	 * transformSortClause doesn't add any items to tlist.  Note, if changing
+	 * this, add_setop_child_rel_equivalences() will need to be updated.
 	 */
 	tllen = list_length(qry->targetList);
 
@@ -1929,6 +2070,7 @@ makeSortGroupClauseForSetOp(Oid rescoltype, bool require_hash)
 	grpcl->tleSortGroupRef = 0;
 	grpcl->eqop = eqop;
 	grpcl->sortop = sortop;
+	grpcl->reverse_sort = false;	/* Sort-op is "less than", or InvalidOid */
 	grpcl->nulls_first = false; /* OK with or without sortop */
 	grpcl->hashable = hashable;
 
@@ -2406,7 +2548,8 @@ transformUpdateStmt(ParseState *pstate, UpdateStmt *stmt)
 	qual = transformWhereClause(pstate, stmt->whereClause,
 								EXPR_KIND_WHERE, "WHERE");
 
-	qry->returningList = transformReturningList(pstate, stmt->returningList);
+	qry->returningList = transformReturningList(pstate, stmt->returningList,
+												EXPR_KIND_RETURNING);
 
 	/*
 	 * Now we are done with SELECT-like processing, and can get on with
@@ -2479,6 +2622,9 @@ transformUpdateTargetList(ParseState *pstate, List *origTlist)
 					 errmsg("column \"%s\" of relation \"%s\" does not exist",
 							origTarget->name,
 							RelationGetRelationName(pstate->p_target_relation)),
+					 (origTarget->indirection != NIL &&
+					  strcmp(origTarget->name, pstate->p_target_nsitem->p_names->aliasname) == 0) ?
+					 errhint("SET target columns cannot be qualified with the relation name.") : 0,
 					 parser_errposition(pstate, origTarget->location)));
 
 		updateTargetListEntry(pstate, tle, origTarget->name,
@@ -2500,10 +2646,11 @@ transformUpdateTargetList(ParseState *pstate, List *origTlist)
 
 /*
  * transformReturningList -
- *	handle a RETURNING clause in INSERT/UPDATE/DELETE
+ *	handle a RETURNING clause in INSERT/UPDATE/DELETE/MERGE
  */
-static List *
-transformReturningList(ParseState *pstate, List *returningList)
+List *
+transformReturningList(ParseState *pstate, List *returningList,
+					   ParseExprKind exprKind)
 {
 	List	   *rlist;
 	int			save_next_resno;
@@ -2520,7 +2667,7 @@ transformReturningList(ParseState *pstate, List *returningList)
 	pstate->p_next_resno = 1;
 
 	/* transform RETURNING identically to a SELECT targetlist */
-	rlist = transformTargetList(pstate, returningList, EXPR_KIND_RETURNING);
+	rlist = transformTargetList(pstate, returningList, exprKind);
 
 	/*
 	 * Complain if the nonempty tlist expanded to nothing (which is possible
@@ -2906,9 +3053,37 @@ static Query *
 transformExplainStmt(ParseState *pstate, ExplainStmt *stmt)
 {
 	Query	   *result;
+	bool		generic_plan = false;
+	Oid		   *paramTypes = NULL;
+	int			numParams = 0;
+
+	/*
+	 * If we have no external source of parameter definitions, and the
+	 * GENERIC_PLAN option is specified, then accept variable parameter
+	 * definitions (similarly to PREPARE, for example).
+	 */
+	if (pstate->p_paramref_hook == NULL)
+	{
+		ListCell   *lc;
+
+		foreach(lc, stmt->options)
+		{
+			DefElem    *opt = (DefElem *) lfirst(lc);
+
+			if (strcmp(opt->defname, "generic_plan") == 0)
+				generic_plan = defGetBoolean(opt);
+			/* don't "break", as we want the last value */
+		}
+		if (generic_plan)
+			setup_parse_variable_parameters(pstate, &paramTypes, &numParams);
+	}
 
 	/* transform contained query, allowing SELECT INTO */
 	stmt->query = (Node *) transformOptionalSelectInto(pstate, stmt->query);
+
+	/* make sure all is well with parameter types */
+	if (generic_plan)
+		check_variable_parameters(pstate, (Query *) stmt->query);
 
 	/* represent the command as a utility Query */
 	result = makeNode(Query);
@@ -2987,7 +3162,7 @@ transformCreateTableAsStmt(ParseState *pstate, CreateTableAsStmt *stmt)
 		 * in the IntoClause because that's where intorel_startup() can
 		 * conveniently get it from.
 		 */
-		stmt->into->viewQuery = (Node *) copyObject(query);
+		stmt->into->viewQuery = copyObject(query);
 	}
 
 	/* represent the command as a utility Query */
@@ -3492,6 +3667,7 @@ applyLockingClause(Query *qry, Index rtindex,
 	qry->rowMarks = lappend(qry->rowMarks, rc);
 }
 
+#ifdef DEBUG_NODE_TESTS_ENABLED
 /*
  * Coverage testing for raw_expression_tree_walker().
  *
@@ -3500,8 +3676,6 @@ applyLockingClause(Query *qry, Index rtindex,
  * applied in limited cases involving CTEs, and we don't really want to have
  * to test everything inside as well as outside a CTE.
  */
-#ifdef RAW_EXPRESSION_COVERAGE_TEST
-
 static bool
 test_raw_expression_coverage(Node *node, void *context)
 {
@@ -3511,5 +3685,4 @@ test_raw_expression_coverage(Node *node, void *context)
 									  test_raw_expression_coverage,
 									  context);
 }
-
-#endif							/* RAW_EXPRESSION_COVERAGE_TEST */
+#endif							/* DEBUG_NODE_TESTS_ENABLED */

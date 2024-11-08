@@ -55,6 +55,54 @@ SELECT ('"'||repeat('.', 12)||'abc\n"')::json; -- OK, legal escapes
  "............abc\n"
 (1 row)
 
+-- Test various lengths of strings to validate SIMD processing to escape
+-- special chars in the JSON.
+SELECT row_to_json(j)::jsonb FROM (
+  SELECT left(E'abcdefghijklmnopqrstuv"\twxyz012345678', a) AS a
+  FROM generate_series(0,37) a
+) j;
+                   row_to_json                    
+--------------------------------------------------
+ {"a": ""}
+ {"a": "a"}
+ {"a": "ab"}
+ {"a": "abc"}
+ {"a": "abcd"}
+ {"a": "abcde"}
+ {"a": "abcdef"}
+ {"a": "abcdefg"}
+ {"a": "abcdefgh"}
+ {"a": "abcdefghi"}
+ {"a": "abcdefghij"}
+ {"a": "abcdefghijk"}
+ {"a": "abcdefghijkl"}
+ {"a": "abcdefghijklm"}
+ {"a": "abcdefghijklmn"}
+ {"a": "abcdefghijklmno"}
+ {"a": "abcdefghijklmnop"}
+ {"a": "abcdefghijklmnopq"}
+ {"a": "abcdefghijklmnopqr"}
+ {"a": "abcdefghijklmnopqrs"}
+ {"a": "abcdefghijklmnopqrst"}
+ {"a": "abcdefghijklmnopqrstu"}
+ {"a": "abcdefghijklmnopqrstuv"}
+ {"a": "abcdefghijklmnopqrstuv\""}
+ {"a": "abcdefghijklmnopqrstuv\"\t"}
+ {"a": "abcdefghijklmnopqrstuv\"\tw"}
+ {"a": "abcdefghijklmnopqrstuv\"\twx"}
+ {"a": "abcdefghijklmnopqrstuv\"\twxy"}
+ {"a": "abcdefghijklmnopqrstuv\"\twxyz"}
+ {"a": "abcdefghijklmnopqrstuv\"\twxyz0"}
+ {"a": "abcdefghijklmnopqrstuv\"\twxyz01"}
+ {"a": "abcdefghijklmnopqrstuv\"\twxyz012"}
+ {"a": "abcdefghijklmnopqrstuv\"\twxyz0123"}
+ {"a": "abcdefghijklmnopqrstuv\"\twxyz01234"}
+ {"a": "abcdefghijklmnopqrstuv\"\twxyz012345"}
+ {"a": "abcdefghijklmnopqrstuv\"\twxyz0123456"}
+ {"a": "abcdefghijklmnopqrstuv\"\twxyz01234567"}
+ {"a": "abcdefghijklmnopqrstuv\"\twxyz012345678"}
+(38 rows)
+
 -- see json_encoding test for input with unicode escapes
 -- Numbers.
 SELECT '1'::json;				-- OK
@@ -2119,8 +2167,7 @@ SELECT json_build_object('a', 'b', 'c'); -- error
 ERROR:  argument list must have even number of elements
 HINT:  The arguments of json_build_object() must consist of alternating keys and values.
 SELECT json_build_object(NULL, 'a'); -- error, key cannot be NULL
-ERROR:  argument 1 cannot be null
-HINT:  Object keys should be text.
+ERROR:  null value not allowed for object key
 SELECT json_build_object('a', NULL); -- ok
  json_build_object 
 -------------------
@@ -2149,8 +2196,7 @@ SELECT json_build_object(VARIADIC ARRAY['a', NULL]::text[]); -- ok
 (1 row)
 
 SELECT json_build_object(VARIADIC ARRAY[NULL, 'a']::text[]); -- error, key cannot be NULL
-ERROR:  argument 1 cannot be null
-HINT:  Object keys should be text.
+ERROR:  null value not allowed for object key
 SELECT json_build_object(VARIADIC '{1,2,3,4}'::text[]); -- ok
    json_build_object    
 ------------------------
@@ -2191,8 +2237,7 @@ SELECT json_build_object(1,2);
 
 -- keys must be scalar and not null
 SELECT json_build_object(null,2);
-ERROR:  argument 1 cannot be null
-HINT:  Object keys should be text.
+ERROR:  null value not allowed for object key
 SELECT json_build_object(r,2) FROM (SELECT 1 AS a, 2 AS b) r;
 ERROR:  key value must be scalar, not array, composite, or json
 SELECT json_build_object(json '{"a":1,"b":2}', 3);
@@ -2218,7 +2263,7 @@ SELECT json_object_agg(name, type) FROM foo;
 
 INSERT INTO foo VALUES (999999, NULL, 'bar');
 SELECT json_object_agg(name, type) FROM foo;
-ERROR:  field name must not be null
+ERROR:  null value not allowed for object key
 -- json_object
 -- empty object, one dimension
 SELECT json_object('{}');
@@ -2285,6 +2330,9 @@ select json_object('{a,b,"","d e f"}','{1,2,3,"a b c"}');
  {"a" : "1", "b" : "2", "" : "3", "d e f" : "a b c"}
 (1 row)
 
+-- json_object_agg_unique requires unique keys
+select json_object_agg_unique(mod(i,100), i) from generate_series(0, 199) i;
+ERROR:  duplicate JSON object key value: "0"
 -- json_to_record and json_to_recordset
 select * from json_to_record('{"a":1,"b":"foo","c":"bar"}')
     as x(a int, b text, d text);

@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -26,7 +26,6 @@ $node->safe_psql('postgres', "CREATE SERVER s1 FOREIGN DATA WRAPPER dummy");
 $node->safe_psql('postgres', "CREATE SERVER s2 FOREIGN DATA WRAPPER dummy");
 $node->safe_psql('postgres', "CREATE FOREIGN TABLE t0 (a int) SERVER s0");
 $node->safe_psql('postgres', "CREATE FOREIGN TABLE t1 (a int) SERVER s1");
-my ($cmd, $stdout, $stderr, $result);
 
 command_fails_like(
 	[ "pg_dump", '-p', $port, '--include-foreign-data=s0', 'postgres' ],

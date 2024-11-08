@@ -16,7 +16,7 @@
  *		contents of records in here except turning them into a more usable
  *		format.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -26,22 +26,19 @@
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
 #include "access/heapam_xlog.h"
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
-#include "access/xlogutils.h"
 #include "catalog/pg_control.h"
 #include "replication/decode.h"
 #include "replication/logical.h"
 #include "replication/message.h"
-#include "replication/origin.h"
 #include "replication/reorderbuffer.h"
 #include "replication/snapbuild.h"
-#include "storage/standby.h"
+#include "storage/standbydefs.h"
 
 /* individual record(group)'s handlers */
 static void DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf);
@@ -62,7 +59,7 @@ static void DecodePrepare(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 
 
 /* common function to decode tuples */
-static void DecodeXLogTuple(char *data, Size len, ReorderBufferTupleBuf *tuple);
+static void DecodeXLogTuple(char *data, Size len, HeapTuple tuple);
 
 /* helper functions for decoding transactions */
 static inline bool FilterPrepare(LogicalDecodingContext *ctx,
@@ -152,16 +149,45 @@ xlog_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			 * can restart from there.
 			 */
 			break;
+		case XLOG_PARAMETER_CHANGE:
+			{
+				xl_parameter_change *xlrec =
+					(xl_parameter_change *) XLogRecGetData(buf->record);
+
+				/*
+				 * If wal_level on the primary is reduced to less than
+				 * logical, we want to prevent existing logical slots from
+				 * being used.  Existing logical slots on the standby get
+				 * invalidated when this WAL record is replayed; and further,
+				 * slot creation fails when wal_level is not sufficient; but
+				 * all these operations are not synchronized, so a logical
+				 * slot may creep in while the wal_level is being reduced.
+				 * Hence this extra check.
+				 */
+				if (xlrec->wal_level < WAL_LEVEL_LOGICAL)
+				{
+					/*
+					 * This can occur only on a standby, as a primary would
+					 * not allow to restart after changing wal_level < logical
+					 * if there is pre-existing logical slot.
+					 */
+					Assert(RecoveryInProgress());
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("logical decoding on standby requires \"wal_level\" >= \"logical\" on the primary")));
+				}
+				break;
+			}
 		case XLOG_NOOP:
 		case XLOG_NEXTOID:
 		case XLOG_SWITCH:
 		case XLOG_BACKUP_END:
-		case XLOG_PARAMETER_CHANGE:
 		case XLOG_RESTORE_POINT:
 		case XLOG_FPW_CHANGE:
 		case XLOG_FPI_FOR_HINT:
 		case XLOG_FPI:
 		case XLOG_OVERWRITE_CONTRECORD:
+		case XLOG_CHECKPOINT_REDO:
 			break;
 		default:
 			elog(ERROR, "unexpected RM_XLOG_ID record type: %u", info);
@@ -275,12 +301,13 @@ xact_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 					ReorderBufferXidSetCatalogChanges(ctx->reorder, xid,
 													  buf->origptr);
 				}
-				else if ((!ctx->fast_forward))
+				else if (!ctx->fast_forward)
 					ReorderBufferImmediateInvalidation(ctx->reorder,
 													   invals->nmsgs,
 													   invals->msgs);
+
+				break;
 			}
-			break;
 		case XLOG_XACT_PREPARE:
 			{
 				xl_xact_parsed_prepare parsed;
@@ -394,8 +421,7 @@ heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 	switch (info)
 	{
 		case XLOG_HEAP2_MULTI_INSERT:
-			if (!ctx->fast_forward &&
-				SnapBuildProcessChange(builder, xid, buf->origptr))
+			if (SnapBuildProcessChange(builder, xid, buf->origptr))
 				DecodeMultiInsert(ctx, buf);
 			break;
 		case XLOG_HEAP2_NEW_CID:
@@ -420,9 +446,9 @@ heap2_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			 * Everything else here is just low level physical stuff we're not
 			 * interested in.
 			 */
-		case XLOG_HEAP2_FREEZE_PAGE:
-		case XLOG_HEAP2_PRUNE:
-		case XLOG_HEAP2_VACUUM:
+		case XLOG_HEAP2_PRUNE_ON_ACCESS:
+		case XLOG_HEAP2_PRUNE_VACUUM_SCAN:
+		case XLOG_HEAP2_PRUNE_VACUUM_CLEANUP:
 		case XLOG_HEAP2_VISIBLE:
 		case XLOG_HEAP2_LOCK_UPDATED:
 			break;
@@ -483,23 +509,19 @@ heap_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 			/*
 			 * Inplace updates are only ever performed on catalog tuples and
-			 * can, per definition, not change tuple visibility.  Since we
-			 * don't decode catalog tuples, we're not interested in the
-			 * record's contents.
+			 * can, per definition, not change tuple visibility.  Inplace
+			 * updates don't affect storage or interpretation of table rows,
+			 * so they don't affect logicalrep_write_tuple() outcomes.  Hence,
+			 * we don't process invalidations from the original operation.  If
+			 * inplace updates did affect those things, invalidations wouldn't
+			 * make it work, since there are no snapshot-specific versions of
+			 * inplace-updated values.  Since we also don't decode catalog
+			 * tuples, we're not interested in the record's contents.
 			 *
-			 * In-place updates can be used either by XID-bearing transactions
-			 * (e.g.  in CREATE INDEX CONCURRENTLY) or by XID-less
-			 * transactions (e.g.  VACUUM).  In the former case, the commit
-			 * record will include cache invalidations, so we mark the
-			 * transaction as catalog modifying here. Currently that's
-			 * redundant because the commit will do that as well, but once we
-			 * support decoding in-progress relations, this will be important.
+			 * WAL contains likely-unnecessary commit-time invals from the
+			 * CacheInvalidateHeapTuple() call in heap_inplace_update().
+			 * Excess invalidation is safe.
 			 */
-			if (!TransactionIdIsValid(xid))
-				break;
-
-			(void) SnapBuildProcessChange(builder, xid, buf->origptr);
-			ReorderBufferXidSetCatalogChanges(ctx->reorder, xid, buf->origptr);
 			break;
 
 		case XLOG_HEAP_CONFIRM:
@@ -572,12 +594,8 @@ logicalmsg_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 	ReorderBufferProcessXid(ctx->reorder, XLogRecGetXid(r), buf->origptr);
 
-	/*
-	 * If we don't have snapshot or we are just fast-forwarding, there is no
-	 * point in decoding messages.
-	 */
-	if (SnapBuildCurrentState(builder) < SNAPBUILD_FULL_SNAPSHOT ||
-		ctx->fast_forward)
+	/* If we don't have snapshot, there is no point in decoding messages */
+	if (SnapBuildCurrentState(builder) < SNAPBUILD_FULL_SNAPSHOT)
 		return;
 
 	message = (xl_logical_message *) XLogRecGetData(r);
@@ -593,6 +611,26 @@ logicalmsg_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			 (SnapBuildCurrentState(builder) != SNAPBUILD_CONSISTENT ||
 			  SnapBuildXactNeedsSkip(builder, buf->origptr)))
 		return;
+
+	/*
+	 * We also skip decoding in fast_forward mode. This check must be last
+	 * because we don't want to set the processing_required flag unless we
+	 * have a decodable message.
+	 */
+	if (ctx->fast_forward)
+	{
+		/*
+		 * We need to set processing_required flag to notify the message's
+		 * existence to the caller. Usually, the flag is set when either the
+		 * COMMIT or ABORT records are decoded, but this must be turned on
+		 * here because the non-transactional logical message is decoded
+		 * without waiting for these records.
+		 */
+		if (!message->transactional)
+			ctx->processing_required = true;
+
+		return;
+	}
 
 	/*
 	 * If this is a non-transactional change, get the snapshot we're expected
@@ -724,7 +762,7 @@ DecodePrepare(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 	SnapBuild  *builder = ctx->snapshot_builder;
 	XLogRecPtr	origin_lsn = parsed->origin_lsn;
 	TimestampTz prepare_time = parsed->xact_time;
-	RepOriginId	origin_id = XLogRecGetOrigin(buf->record);
+	RepOriginId origin_id = XLogRecGetOrigin(buf->record);
 	int			i;
 	TransactionId xid = parsed->twophase_xid;
 
@@ -800,7 +838,7 @@ DecodeAbort(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 	int			i;
 	XLogRecPtr	origin_lsn = InvalidXLogRecPtr;
 	TimestampTz abort_time = parsed->xact_time;
-	RepOriginId	origin_id = XLogRecGetOrigin(buf->record);
+	RepOriginId origin_id = XLogRecGetOrigin(buf->record);
 	bool		skip_xact;
 
 	if (parsed->xinfo & XACT_XINFO_HAS_ORIGIN)
@@ -846,7 +884,7 @@ DecodeAbort(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 /*
  * Parse XLOG_HEAP_INSERT (not MULTI_INSERT!) records into tuplebufs.
  *
- * Deletes can contain the new tuple.
+ * Inserts can contain the new tuple.
  */
 static void
 DecodeInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
@@ -1062,7 +1100,7 @@ DecodeTruncate(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 }
 
 /*
- * Decode XLOG_HEAP2_MULTI_INSERT_insert record into multiple tuplebufs.
+ * Decode XLOG_HEAP2_MULTI_INSERT record into multiple tuplebufs.
  *
  * Currently MULTI_INSERT will always contain the full tuples.
  */
@@ -1108,7 +1146,7 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 		ReorderBufferChange *change;
 		xl_multi_insert_tuple *xlhdr;
 		int			datalen;
-		ReorderBufferTupleBuf *tuple;
+		HeapTuple	tuple;
 		HeapTupleHeader header;
 
 		change = ReorderBufferGetChange(ctx->reorder);
@@ -1125,21 +1163,21 @@ DecodeMultiInsert(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 			ReorderBufferGetTupleBuf(ctx->reorder, datalen);
 
 		tuple = change->data.tp.newtuple;
-		header = tuple->tuple.t_data;
+		header = tuple->t_data;
 
 		/* not a disk based tuple */
-		ItemPointerSetInvalid(&tuple->tuple.t_self);
+		ItemPointerSetInvalid(&tuple->t_self);
 
 		/*
 		 * We can only figure this out after reassembling the transactions.
 		 */
-		tuple->tuple.t_tableOid = InvalidOid;
+		tuple->t_tableOid = InvalidOid;
 
-		tuple->tuple.t_len = datalen + SizeofHeapTupleHeader;
+		tuple->t_len = datalen + SizeofHeapTupleHeader;
 
 		memset(header, 0, SizeofHeapTupleHeader);
 
-		memcpy((char *) tuple->tuple.t_data + SizeofHeapTupleHeader,
+		memcpy((char *) tuple->t_data + SizeofHeapTupleHeader,
 			   (char *) data,
 			   datalen);
 		header->t_infomask = xlhdr->t_infomask;
@@ -1209,7 +1247,7 @@ DecodeSpecConfirm(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
  * computed outside as they are record specific.
  */
 static void
-DecodeXLogTuple(char *data, Size len, ReorderBufferTupleBuf *tuple)
+DecodeXLogTuple(char *data, Size len, HeapTuple tuple)
 {
 	xl_heap_header xlhdr;
 	int			datalen = len - SizeOfHeapHeader;
@@ -1217,14 +1255,14 @@ DecodeXLogTuple(char *data, Size len, ReorderBufferTupleBuf *tuple)
 
 	Assert(datalen >= 0);
 
-	tuple->tuple.t_len = datalen + SizeofHeapTupleHeader;
-	header = tuple->tuple.t_data;
+	tuple->t_len = datalen + SizeofHeapTupleHeader;
+	header = tuple->t_data;
 
 	/* not a disk based tuple */
-	ItemPointerSetInvalid(&tuple->tuple.t_self);
+	ItemPointerSetInvalid(&tuple->t_self);
 
 	/* we can only figure this out after reassembling the transactions */
-	tuple->tuple.t_tableOid = InvalidOid;
+	tuple->t_tableOid = InvalidOid;
 
 	/* data is not stored aligned, copy to aligned storage */
 	memcpy((char *) &xlhdr,
@@ -1233,7 +1271,7 @@ DecodeXLogTuple(char *data, Size len, ReorderBufferTupleBuf *tuple)
 
 	memset(header, 0, SizeofHeapTupleHeader);
 
-	memcpy(((char *) tuple->tuple.t_data) + SizeofHeapTupleHeader,
+	memcpy(((char *) tuple->t_data) + SizeofHeapTupleHeader,
 		   data + SizeOfHeapHeader,
 		   datalen);
 
@@ -1258,7 +1296,21 @@ static bool
 DecodeTXNNeedSkip(LogicalDecodingContext *ctx, XLogRecordBuffer *buf,
 				  Oid txn_dbid, RepOriginId origin_id)
 {
-	return (SnapBuildXactNeedsSkip(ctx->snapshot_builder, buf->origptr) ||
-			(txn_dbid != InvalidOid && txn_dbid != ctx->slot->data.database) ||
-			ctx->fast_forward || FilterByOrigin(ctx, origin_id));
+	if (SnapBuildXactNeedsSkip(ctx->snapshot_builder, buf->origptr) ||
+		(txn_dbid != InvalidOid && txn_dbid != ctx->slot->data.database) ||
+		FilterByOrigin(ctx, origin_id))
+		return true;
+
+	/*
+	 * We also skip decoding in fast_forward mode. In passing set the
+	 * processing_required flag to indicate that if it were not for
+	 * fast_forward mode, processing would have been required.
+	 */
+	if (ctx->fast_forward)
+	{
+		ctx->processing_required = true;
+		return true;
+	}
+
+	return false;
 }

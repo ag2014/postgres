@@ -4,7 +4,7 @@
  *	  Checks, enables or disables page level checksums for an offline
  *	  cluster
  *
- * Copyright (c) 2010-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/pg_checksums/pg_checksums.c
@@ -16,15 +16,14 @@
 
 #include <dirent.h>
 #include <limits.h>
-#include <time.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
-#include "access/xlog_internal.h"
 #include "common/controldata_utils.h"
-#include "common/file_perm.h"
 #include "common/file_utils.h"
 #include "common/logging.h"
+#include "common/relpath.h"
 #include "fe_utils/option_utils.h"
 #include "getopt_long.h"
 #include "pg_getopt.h"
@@ -44,23 +43,14 @@ static char *only_filenode = NULL;
 static bool do_sync = true;
 static bool verbose = false;
 static bool showprogress = false;
+static DataDirSyncMethod sync_method = DATA_DIR_SYNC_METHOD_FSYNC;
 
 typedef enum
 {
 	PG_MODE_CHECK,
 	PG_MODE_DISABLE,
-	PG_MODE_ENABLE
+	PG_MODE_ENABLE,
 } PgChecksumMode;
-
-/*
- * Filename components.
- *
- * XXX: fd.h is not declared here as frontend side code is not able to
- * interact with the backend-side definitions for the various fsync
- * wrappers.
- */
-#define PG_TEMP_FILES_DIR "pgsql_tmp"
-#define PG_TEMP_FILE_PREFIX "pgsql_tmp"
 
 static PgChecksumMode mode = PG_MODE_CHECK;
 
@@ -69,8 +59,8 @@ static const char *progname;
 /*
  * Progress status information.
  */
-int64		total_size = 0;
-int64		current_size = 0;
+static int64 total_size = 0;
+static int64 current_size = 0;
 static pg_time_t last_progress_report = 0;
 
 static void
@@ -87,6 +77,7 @@ usage(void)
 	printf(_("  -f, --filenode=FILENODE  check only relation with specified filenode\n"));
 	printf(_("  -N, --no-sync            do not wait for changes to be written safely to disk\n"));
 	printf(_("  -P, --progress           show progress information\n"));
+	printf(_("      --sync-method=METHOD set method for syncing files to disk\n"));
 	printf(_("  -v, --verbose            output verbose messages\n"));
 	printf(_("  -V, --version            output version information, then exit\n"));
 	printf(_("  -?, --help               show this help, then exit\n"));
@@ -183,7 +174,7 @@ skipfile(const char *fn)
 static void
 scan_file(const char *fn, int segmentno)
 {
-	PGAlignedBlock buf;
+	PGIOAlignedBlock buf;
 	PageHeader	header = (PageHeader) buf.data;
 	int			f;
 	BlockNumber blockno;
@@ -337,6 +328,10 @@ scan_directory(const char *basedir, const char *subdir, bool sizeonly)
 					strlen(PG_TEMP_FILES_DIR)) == 0)
 			continue;
 
+		/* Skip macOS system files */
+		if (strcmp(de->d_name, ".DS_Store") == 0)
+			continue;
+
 		snprintf(fn, sizeof(fn), "%s/%s", path, de->d_name);
 		if (lstat(fn, &st) < 0)
 			pg_fatal("could not stat file \"%s\": %m", fn);
@@ -392,7 +387,7 @@ scan_directory(const char *basedir, const char *subdir, bool sizeonly)
 			 * is valid, resolving the linked locations and dive into them
 			 * directly.
 			 */
-			if (strncmp("pg_tblspc", subdir, strlen("pg_tblspc")) == 0)
+			if (strncmp(PG_TBLSPC_DIR, subdir, strlen(PG_TBLSPC_DIR)) == 0)
 			{
 				char		tblspc_path[MAXPGPATH];
 				struct stat tblspc_st;
@@ -445,6 +440,7 @@ main(int argc, char *argv[])
 		{"no-sync", no_argument, NULL, 'N'},
 		{"progress", no_argument, NULL, 'P'},
 		{"verbose", no_argument, NULL, 'v'},
+		{"sync-method", required_argument, NULL, 1},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -502,6 +498,10 @@ main(int argc, char *argv[])
 				break;
 			case 'v':
 				verbose = true;
+				break;
+			case 1:
+				if (!parse_sync_method(optarg, &sync_method))
+					exit(1);
 				break;
 			default:
 				/* getopt_long already emitted a complaint */
@@ -592,12 +592,12 @@ main(int argc, char *argv[])
 		{
 			total_size = scan_directory(DataDir, "global", true);
 			total_size += scan_directory(DataDir, "base", true);
-			total_size += scan_directory(DataDir, "pg_tblspc", true);
+			total_size += scan_directory(DataDir, PG_TBLSPC_DIR, true);
 		}
 
 		(void) scan_directory(DataDir, "global", false);
 		(void) scan_directory(DataDir, "base", false);
-		(void) scan_directory(DataDir, "pg_tblspc", false);
+		(void) scan_directory(DataDir, PG_TBLSPC_DIR, false);
 
 		if (showprogress)
 			progress_report(true);
@@ -633,7 +633,7 @@ main(int argc, char *argv[])
 		if (do_sync)
 		{
 			pg_log_info("syncing data directory");
-			fsync_pgdata(DataDir, PG_VERSION_NUM);
+			sync_pgdata(DataDir, PG_VERSION_NUM, sync_method);
 		}
 
 		pg_log_info("updating control file");

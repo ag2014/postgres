@@ -438,6 +438,27 @@ insert into arr_pk_tbl(pk, f1[1:2]) values (1, '{6,7,8}') on conflict (pk)
 reset enable_seqscan;
 reset enable_bitmapscan;
 
+-- test subscript overflow detection
+
+-- The normal error message includes a platform-dependent limit,
+-- so suppress it to avoid needing multiple expected-files.
+\set VERBOSITY sqlstate
+
+insert into arr_pk_tbl values(10, '[-2147483648:-2147483647]={1,2}');
+update arr_pk_tbl set f1[2147483647] = 42 where pk = 10;
+update arr_pk_tbl set f1[2147483646:2147483647] = array[4,2] where pk = 10;
+insert into arr_pk_tbl(pk, f1[0:2147483647]) values (2, '{}');
+insert into arr_pk_tbl(pk, f1[-2147483648:2147483647]) values (2, '{}');
+
+-- also exercise the expanded-array case
+do $$ declare a int[];
+begin
+  a := '[-2147483648:-2147483647]={1,2}'::int[];
+  a[2147483647] := 42;
+end $$;
+
+\set VERBOSITY default
+
 -- test [not] (like|ilike) (any|all) (...)
 select 'foo' like any (array['%a', '%o']); -- t
 select 'foo' like any (array['%a', '%b']); -- f
@@ -454,17 +475,45 @@ select 'foo' ilike all (array['F%', '%O']); -- t
 
 -- none of the following should be accepted
 select '{{1,{2}},{2,3}}'::text[];
-select '{{},{}}'::text[];
 select E'{{1,2},\\{2,3}}'::text[];
+select '{"a"b}'::text[];
+select '{a"b"}'::text[];
+select '{"a""b"}'::text[];
 select '{{"1 2" x},{3}}'::text[];
+select '{{"1 2"} x,{3}}'::text[];
 select '{}}'::text[];
 select '{ }}'::text[];
+select '}{'::text[];
+select '{foo{}}'::text[];
+select '{"foo"{}}'::text[];
+select '{foo,,bar}'::text[];
+select '{{1},{{2}}}'::text[];
+select '{{{1}},{2}}'::text[];
+select '{{},{{}}}'::text[];
+select '{{{}},{}}'::text[];
+select '{{1},{}}'::text[];
+select '{{},{1}}'::text[];
+select '[1:0]={}'::int[];
+select '[2147483646:2147483647]={1,2}'::int[];
+select '[1:-1]={}'::int[];
+select '[2]={1}'::int[];
+select '[1:]={1}'::int[];
+select '[:1]={1}'::int[];
 select array[];
+select '{{1,},{1},}'::text[];
+select '{{1,},{1}}'::text[];
+select '{{1,}}'::text[];
+select '{1,}'::text[];
+select '[21474836488:21474836489]={1,2}'::int[];
+select '[-2147483649:-2147483648]={1,2}'::int[];
 -- none of the above should be accepted
 
 -- all of the following should be accepted
 select '{}'::text[];
+select '{{},{}}'::text[];
 select '{{{1,2,3,4},{2,3,4,5}},{{3,4,5,6},{4,5,6,7}}}'::text[];
+select '{null,n\ull,"null"}'::text[];
+select '{ ab\c , "ab\"c" }'::text[];
 select '{0 second  ,0 second}'::interval[];
 select '{ { "," } , { 3 } }'::text[];
 select '  {   {  "  0 second  "   ,  0 second  }   }'::text[];
@@ -473,7 +522,10 @@ select '{
            @ 1 hour @ 42 minutes @ 20 seconds
          }'::interval[];
 select array[]::text[];
+select '[2]={1,7}'::int[];
 select '[0:1]={1.1,2.2}'::float8[];
+select '[2147483646:2147483646]={1}'::int[];
+select '[-2147483648:-2147483647]={1,2}'::int[];
 -- all of the above should be accepted
 
 -- tests for array aggregates
@@ -677,12 +729,12 @@ insert into src
 create type textandtext as (c1 text, c2 text);
 create temp table dest (f1 textandtext[]);
 insert into dest select array[row(f1,f1)::textandtext] from src;
-select length(md5((f1[1]).c2)) from dest;
+select length(fipshash((f1[1]).c2)) from dest;
 delete from src;
-select length(md5((f1[1]).c2)) from dest;
+select length(fipshash((f1[1]).c2)) from dest;
 truncate table src;
 drop table src;
-select length(md5((f1[1]).c2)) from dest;
+select length(fipshash((f1[1]).c2)) from dest;
 drop table dest;
 drop type textandtext;
 
@@ -761,3 +813,24 @@ FROM
 SELECT trim_array(ARRAY[1, 2, 3], -1); -- fail
 SELECT trim_array(ARRAY[1, 2, 3], 10); -- fail
 SELECT trim_array(ARRAY[]::int[], 1); -- fail
+
+-- array_shuffle
+SELECT array_shuffle('{1,2,3,4,5,6}'::int[]) <@ '{1,2,3,4,5,6}';
+SELECT array_shuffle('{1,2,3,4,5,6}'::int[]) @> '{1,2,3,4,5,6}';
+SELECT array_dims(array_shuffle('[-1:2][2:3]={{1,2},{3,NULL},{5,6},{7,8}}'::int[]));
+SELECT array_dims(array_shuffle('{{{1,2},{3,NULL}},{{5,6},{7,8}},{{9,10},{11,12}}}'::int[]));
+
+-- array_sample
+SELECT array_sample('{1,2,3,4,5,6}'::int[], 3) <@ '{1,2,3,4,5,6}';
+SELECT array_length(array_sample('{1,2,3,4,5,6}'::int[], 3), 1);
+SELECT array_dims(array_sample('[-1:2][2:3]={{1,2},{3,NULL},{5,6},{7,8}}'::int[], 3));
+SELECT array_dims(array_sample('{{{1,2},{3,NULL}},{{5,6},{7,8}},{{9,10},{11,12}}}'::int[], 2));
+SELECT array_sample('{1,2,3,4,5,6}'::int[], -1); -- fail
+SELECT array_sample('{1,2,3,4,5,6}'::int[], 7); --fail
+
+-- array_reverse
+SELECT array_reverse('{}'::int[]);
+SELECT array_reverse('{1}'::int[]);
+SELECT array_reverse('{1,2}'::int[]);
+SELECT array_reverse('{1,2,3,NULL,4,5,6}'::int[]);
+SELECT array_reverse('{{1,2},{3,4},{5,6},{7,8}}'::int[]);

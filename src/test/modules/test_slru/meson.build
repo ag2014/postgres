@@ -1,9 +1,8 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
-
-# FIXME: prevent install during main install, but not during test :/
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 test_slru_sources = files(
   'test_slru.c',
+  'test_multixact.c',
 )
 
 if host_system == 'windows'
@@ -14,14 +13,13 @@ endif
 
 test_slru = shared_module('test_slru',
   test_slru_sources,
-  kwargs: pg_mod_args,
+  kwargs: pg_test_mod_args,
 )
-testprep_targets += test_slru
+test_install_libs += test_slru
 
-install_data(
+test_install_data += files(
   'test_slru.control',
   'test_slru--1.0.sql',
-  kwargs: contrib_data_args,
 )
 
 tests += {
@@ -34,5 +32,13 @@ tests += {
     ],
     'regress_args': ['--temp-config', files('test_slru.conf')],
     'runningcheck': false,
+  },
+  'tap': {
+    'env': {
+       'enable_injection_points': get_option('injection_points') ? 'yes' : 'no',
+    },
+    'tests': [
+      't/001_multixact.pl'
+    ],
   },
 }

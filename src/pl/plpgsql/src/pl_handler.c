@@ -3,7 +3,7 @@
  * pl_handler.c		- Handler for the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -47,8 +47,8 @@ bool		plpgsql_print_strict_params = false;
 
 bool		plpgsql_check_asserts = true;
 
-char	   *plpgsql_extra_warnings_string = NULL;
-char	   *plpgsql_extra_errors_string = NULL;
+static char *plpgsql_extra_warnings_string = NULL;
+static char *plpgsql_extra_errors_string = NULL;
 int			plpgsql_extra_warnings;
 int			plpgsql_extra_errors;
 
@@ -235,8 +235,7 @@ plpgsql_call_handler(PG_FUNCTION_ARGS)
 	/*
 	 * Connect to SPI manager
 	 */
-	if ((rc = SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0)) != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(rc));
+	SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0);
 
 	/* Find or compile the function */
 	func = plpgsql_compile(fcinfo, false);
@@ -288,7 +287,7 @@ plpgsql_call_handler(PG_FUNCTION_ARGS)
 		/* Be sure to release the procedure resowner if any */
 		if (procedure_resowner)
 		{
-			ResourceOwnerReleaseAllPlanCacheRefs(procedure_resowner);
+			ReleaseAllPlanCacheRefsInOwner(procedure_resowner);
 			ResourceOwnerDelete(procedure_resowner);
 		}
 	}
@@ -326,8 +325,7 @@ plpgsql_inline_handler(PG_FUNCTION_ARGS)
 	/*
 	 * Connect to SPI manager
 	 */
-	if ((rc = SPI_connect_ext(codeblock->atomic ? 0 : SPI_OPT_NONATOMIC)) != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(rc));
+	SPI_connect_ext(codeblock->atomic ? 0 : SPI_OPT_NONATOMIC);
 
 	/* Compile the anonymous code block */
 	func = plpgsql_compile_inline(codeblock->source_text);
@@ -393,7 +391,7 @@ plpgsql_inline_handler(PG_FUNCTION_ARGS)
 
 		/* Clean up the private EState and resowner */
 		FreeExecutorState(simple_eval_estate);
-		ResourceOwnerReleaseAllPlanCacheRefs(simple_eval_resowner);
+		ReleaseAllPlanCacheRefsInOwner(simple_eval_resowner);
 		ResourceOwnerDelete(simple_eval_resowner);
 
 		/* Function should now have no remaining use-counts ... */
@@ -410,7 +408,7 @@ plpgsql_inline_handler(PG_FUNCTION_ARGS)
 
 	/* Clean up the private EState and resowner */
 	FreeExecutorState(simple_eval_estate);
-	ResourceOwnerReleaseAllPlanCacheRefs(simple_eval_resowner);
+	ReleaseAllPlanCacheRefsInOwner(simple_eval_resowner);
 	ResourceOwnerDelete(simple_eval_resowner);
 
 	/* Function should now have no remaining use-counts ... */
@@ -510,8 +508,7 @@ plpgsql_validator(PG_FUNCTION_ARGS)
 		/*
 		 * Connect to SPI manager (is this needed for compilation?)
 		 */
-		if ((rc = SPI_connect()) != SPI_OK_CONNECT)
-			elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(rc));
+		SPI_connect();
 
 		/*
 		 * Set up a fake fcinfo with just enough info to satisfy

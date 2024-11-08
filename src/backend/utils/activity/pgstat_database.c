@@ -8,7 +8,7 @@
  * storage implementation and the details about individual types of
  * statistics.
  *
- * Copyright (c) 2001-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/activity/pgstat_database.c
@@ -17,9 +17,9 @@
 
 #include "postgres.h"
 
+#include "storage/procsignal.h"
 #include "utils/pgstat_internal.h"
 #include "utils/timestamp.h"
-#include "storage/procsignal.h"
 
 
 static bool pgstat_should_report_connstat(void);
@@ -108,6 +108,9 @@ pgstat_report_recovery_conflict(int reason)
 			break;
 		case PROCSIG_RECOVERY_CONFLICT_BUFFERPIN:
 			dbentry->conflict_bufferpin++;
+			break;
+		case PROCSIG_RECOVERY_CONFLICT_LOGICALSLOT:
+			dbentry->conflict_logicalslot++;
 			break;
 		case PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK:
 			dbentry->conflict_startup_deadlock++;
@@ -268,6 +271,13 @@ pgstat_update_dbstats(TimestampTz ts)
 {
 	PgStat_StatDBEntry *dbentry;
 
+	/*
+	 * If not connected to a database yet, don't attribute time to "shared
+	 * state" (InvalidOid is used to track stats for shared relations, etc.).
+	 */
+	if (!OidIsValid(MyDatabaseId))
+		return;
+
 	dbentry = pgstat_prep_database_pending(MyDatabaseId);
 
 	/*
@@ -323,6 +333,12 @@ PgStat_StatDBEntry *
 pgstat_prep_database_pending(Oid dboid)
 {
 	PgStat_EntryRef *entry_ref;
+
+	/*
+	 * This should not report stats on database objects before having
+	 * connected to a database.
+	 */
+	Assert(!OidIsValid(dboid) || OidIsValid(MyDatabaseId));
 
 	entry_ref = pgstat_prep_pending_entry(PGSTAT_KIND_DATABASE, dboid, InvalidOid,
 										  NULL);
@@ -387,6 +403,7 @@ pgstat_database_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 	PGSTAT_ACCUM_DBCOUNT(conflict_tablespace);
 	PGSTAT_ACCUM_DBCOUNT(conflict_lock);
 	PGSTAT_ACCUM_DBCOUNT(conflict_snapshot);
+	PGSTAT_ACCUM_DBCOUNT(conflict_logicalslot);
 	PGSTAT_ACCUM_DBCOUNT(conflict_bufferpin);
 	PGSTAT_ACCUM_DBCOUNT(conflict_startup_deadlock);
 

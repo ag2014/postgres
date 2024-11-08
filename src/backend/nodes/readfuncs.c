@@ -3,7 +3,7 @@
  * readfuncs.c
  *	  Reader functions for Postgres tree nodes.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,7 +19,7 @@
  *
  *	  However, if restore_location_fields is true, we do restore location
  *	  fields from the string.  This is currently intended only for use by the
- *	  WRITE_READ_PARSE_PLAN_TREES test code, which doesn't want to cause
+ *	  debug_write_read_parse_plan_trees test code, which doesn't want to cause
  *	  any change in the node contents.
  *
  *-------------------------------------------------------------------------
@@ -118,7 +118,7 @@
 	local_node->fldname = nullable_string(token, length)
 
 /* Read a parse location field (and possibly throw away the value) */
-#ifdef WRITE_READ_PARSE_PLAN_TREES
+#ifdef DEBUG_NODE_TESTS_ENABLED
 #define READ_LOCATION_FIELD(fldname) \
 	token = pg_strtok(&length);		/* skip :fldname */ \
 	token = pg_strtok(&length);		/* get field value */ \
@@ -305,6 +305,7 @@ _readA_Const(void)
 {
 	READ_LOCALS(A_Const);
 
+	/* We expect either NULL or :val here */
 	token = pg_strtok(&length);
 	if (length == 4 && strncmp(token, "NULL", 4) == 0)
 		local_node->isnull = true;
@@ -312,146 +313,32 @@ _readA_Const(void)
 	{
 		union ValUnion *tmp = nodeRead(NULL, 0);
 
-		memcpy(&local_node->val, tmp, sizeof(*tmp));
+		/* To forestall valgrind complaints, copy only the valid data */
+		switch (nodeTag(tmp))
+		{
+			case T_Integer:
+				memcpy(&local_node->val, tmp, sizeof(Integer));
+				break;
+			case T_Float:
+				memcpy(&local_node->val, tmp, sizeof(Float));
+				break;
+			case T_Boolean:
+				memcpy(&local_node->val, tmp, sizeof(Boolean));
+				break;
+			case T_String:
+				memcpy(&local_node->val, tmp, sizeof(String));
+				break;
+			case T_BitString:
+				memcpy(&local_node->val, tmp, sizeof(BitString));
+				break;
+			default:
+				elog(ERROR, "unrecognized node type: %d",
+					 (int) nodeTag(tmp));
+				break;
+		}
 	}
 
 	READ_LOCATION_FIELD(location);
-
-	READ_DONE();
-}
-
-/*
- * _readConstraint
- */
-static Constraint *
-_readConstraint(void)
-{
-	READ_LOCALS(Constraint);
-
-	READ_STRING_FIELD(conname);
-	READ_BOOL_FIELD(deferrable);
-	READ_BOOL_FIELD(initdeferred);
-	READ_LOCATION_FIELD(location);
-
-	token = pg_strtok(&length); /* skip :contype */
-	token = pg_strtok(&length); /* get field value */
-	if (length == 4 && strncmp(token, "NULL", 4) == 0)
-		local_node->contype = CONSTR_NULL;
-	else if (length == 8 && strncmp(token, "NOT_NULL", 8) == 0)
-		local_node->contype = CONSTR_NOTNULL;
-	else if (length == 7 && strncmp(token, "DEFAULT", 7) == 0)
-		local_node->contype = CONSTR_DEFAULT;
-	else if (length == 8 && strncmp(token, "IDENTITY", 8) == 0)
-		local_node->contype = CONSTR_IDENTITY;
-	else if (length == 9 && strncmp(token, "GENERATED", 9) == 0)
-		local_node->contype = CONSTR_GENERATED;
-	else if (length == 5 && strncmp(token, "CHECK", 5) == 0)
-		local_node->contype = CONSTR_CHECK;
-	else if (length == 11 && strncmp(token, "PRIMARY_KEY", 11) == 0)
-		local_node->contype = CONSTR_PRIMARY;
-	else if (length == 6 && strncmp(token, "UNIQUE", 6) == 0)
-		local_node->contype = CONSTR_UNIQUE;
-	else if (length == 9 && strncmp(token, "EXCLUSION", 9) == 0)
-		local_node->contype = CONSTR_EXCLUSION;
-	else if (length == 11 && strncmp(token, "FOREIGN_KEY", 11) == 0)
-		local_node->contype = CONSTR_FOREIGN;
-	else if (length == 15 && strncmp(token, "ATTR_DEFERRABLE", 15) == 0)
-		local_node->contype = CONSTR_ATTR_DEFERRABLE;
-	else if (length == 19 && strncmp(token, "ATTR_NOT_DEFERRABLE", 19) == 0)
-		local_node->contype = CONSTR_ATTR_NOT_DEFERRABLE;
-	else if (length == 13 && strncmp(token, "ATTR_DEFERRED", 13) == 0)
-		local_node->contype = CONSTR_ATTR_DEFERRED;
-	else if (length == 14 && strncmp(token, "ATTR_IMMEDIATE", 14) == 0)
-		local_node->contype = CONSTR_ATTR_IMMEDIATE;
-
-	switch (local_node->contype)
-	{
-		case CONSTR_NULL:
-		case CONSTR_NOTNULL:
-			/* no extra fields */
-			break;
-
-		case CONSTR_DEFAULT:
-			READ_NODE_FIELD(raw_expr);
-			READ_STRING_FIELD(cooked_expr);
-			break;
-
-		case CONSTR_IDENTITY:
-			READ_NODE_FIELD(options);
-			READ_CHAR_FIELD(generated_when);
-			break;
-
-		case CONSTR_GENERATED:
-			READ_NODE_FIELD(raw_expr);
-			READ_STRING_FIELD(cooked_expr);
-			READ_CHAR_FIELD(generated_when);
-			break;
-
-		case CONSTR_CHECK:
-			READ_BOOL_FIELD(is_no_inherit);
-			READ_NODE_FIELD(raw_expr);
-			READ_STRING_FIELD(cooked_expr);
-			READ_BOOL_FIELD(skip_validation);
-			READ_BOOL_FIELD(initially_valid);
-			break;
-
-		case CONSTR_PRIMARY:
-			READ_NODE_FIELD(keys);
-			READ_NODE_FIELD(including);
-			READ_NODE_FIELD(options);
-			READ_STRING_FIELD(indexname);
-			READ_STRING_FIELD(indexspace);
-			READ_BOOL_FIELD(reset_default_tblspc);
-			/* access_method and where_clause not currently used */
-			break;
-
-		case CONSTR_UNIQUE:
-			READ_BOOL_FIELD(nulls_not_distinct);
-			READ_NODE_FIELD(keys);
-			READ_NODE_FIELD(including);
-			READ_NODE_FIELD(options);
-			READ_STRING_FIELD(indexname);
-			READ_STRING_FIELD(indexspace);
-			READ_BOOL_FIELD(reset_default_tblspc);
-			/* access_method and where_clause not currently used */
-			break;
-
-		case CONSTR_EXCLUSION:
-			READ_NODE_FIELD(exclusions);
-			READ_NODE_FIELD(including);
-			READ_NODE_FIELD(options);
-			READ_STRING_FIELD(indexname);
-			READ_STRING_FIELD(indexspace);
-			READ_BOOL_FIELD(reset_default_tblspc);
-			READ_STRING_FIELD(access_method);
-			READ_NODE_FIELD(where_clause);
-			break;
-
-		case CONSTR_FOREIGN:
-			READ_NODE_FIELD(pktable);
-			READ_NODE_FIELD(fk_attrs);
-			READ_NODE_FIELD(pk_attrs);
-			READ_CHAR_FIELD(fk_matchtype);
-			READ_CHAR_FIELD(fk_upd_action);
-			READ_CHAR_FIELD(fk_del_action);
-			READ_NODE_FIELD(fk_del_set_cols);
-			READ_NODE_FIELD(old_conpfeqop);
-			READ_OID_FIELD(old_pktable_oid);
-			READ_BOOL_FIELD(skip_validation);
-			READ_BOOL_FIELD(initially_valid);
-			break;
-
-		case CONSTR_ATTR_DEFERRABLE:
-		case CONSTR_ATTR_NOT_DEFERRABLE:
-		case CONSTR_ATTR_DEFERRED:
-		case CONSTR_ATTR_IMMEDIATE:
-			/* no extra fields */
-			break;
-
-		default:
-			elog(ERROR, "unrecognized ConstrType: %d", (int) local_node->contype);
-			break;
-	}
 
 	READ_DONE();
 }
@@ -461,7 +348,6 @@ _readRangeTblEntry(void)
 {
 	READ_LOCALS(RangeTblEntry);
 
-	/* put alias + eref first to make dump more legible */
 	READ_NODE_FIELD(alias);
 	READ_NODE_FIELD(eref);
 	READ_ENUM_FIELD(rtekind, RTEKind);
@@ -470,16 +356,19 @@ _readRangeTblEntry(void)
 	{
 		case RTE_RELATION:
 			READ_OID_FIELD(relid);
+			READ_BOOL_FIELD(inh);
 			READ_CHAR_FIELD(relkind);
 			READ_INT_FIELD(rellockmode);
-			READ_NODE_FIELD(tablesample);
 			READ_UINT_FIELD(perminfoindex);
+			READ_NODE_FIELD(tablesample);
 			break;
 		case RTE_SUBQUERY:
 			READ_NODE_FIELD(subquery);
 			READ_BOOL_FIELD(security_barrier);
 			/* we re-use these RELATION fields, too: */
 			READ_OID_FIELD(relid);
+			READ_BOOL_FIELD(inh);
+			READ_CHAR_FIELD(relkind);
 			READ_INT_FIELD(rellockmode);
 			READ_UINT_FIELD(perminfoindex);
 			break;
@@ -533,6 +422,9 @@ _readRangeTblEntry(void)
 		case RTE_RESULT:
 			/* no extra fields */
 			break;
+		case RTE_GROUP:
+			READ_NODE_FIELD(groupexprs);
+			break;
 		default:
 			elog(ERROR, "unrecognized RTE kind: %d",
 				 (int) local_node->rtekind);
@@ -540,7 +432,6 @@ _readRangeTblEntry(void)
 	}
 
 	READ_BOOL_FIELD(lateral);
-	READ_BOOL_FIELD(inh);
 	READ_BOOL_FIELD(inFromCl);
 	READ_NODE_FIELD(securityQuals);
 
@@ -673,8 +564,6 @@ _readExtensibleNode(void)
 Node *
 parseNodeString(void)
 {
-	void	   *return_value;
-
 	READ_TEMP_LOCALS();
 
 	/* Guard against stack overflow due to overly complex expressions */
@@ -685,16 +574,10 @@ parseNodeString(void)
 #define MATCH(tokname, namelen) \
 	(length == namelen && memcmp(token, tokname, namelen) == 0)
 
-	if (false)
-		;
 #include "readfuncs.switch.c"
-	else
-	{
-		elog(ERROR, "badly formatted node string \"%.32s\"...", token);
-		return_value = NULL;	/* keep compiler quiet */
-	}
 
-	return (Node *) return_value;
+	elog(ERROR, "badly formatted node string \"%.32s\"...", token);
+	return NULL;				/* keep compiler quiet */
 }
 
 

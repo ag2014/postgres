@@ -6,7 +6,7 @@
  *
  * This code is released under the terms of the PostgreSQL License.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/test/regress/regress.c
@@ -21,8 +21,6 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
-#include "access/transam.h"
-#include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
@@ -39,10 +37,8 @@
 #include "parser/parse_coerce.h"
 #include "port/atomics.h"
 #include "storage/spin.h"
-#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/geo_decls.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/typcache.h"
@@ -380,8 +376,7 @@ ttdummy(PG_FUNCTION_ARGS)
 	newoff = Int32GetDatum((int32) DatumGetInt64(newoff));
 
 	/* Connect to SPI manager */
-	if ((ret = SPI_connect()) < 0)
-		elog(ERROR, "ttdummy (%s): SPI_connect returned %d", relname, ret);
+	SPI_connect();
 
 	/* Fetch tuple values and nulls */
 	cvals = (Datum *) palloc(natts * sizeof(Datum));
@@ -596,7 +591,8 @@ make_tuple_indirect(PG_FUNCTION_ARGS)
 		/* only work on existing, not-null varlenas */
 		if (TupleDescAttr(tupdesc, i)->attisdropped ||
 			nulls[i] ||
-			TupleDescAttr(tupdesc, i)->attlen != -1)
+			TupleDescAttr(tupdesc, i)->attlen != -1 ||
+			TupleDescAttr(tupdesc, i)->attstorage == TYPSTORAGE_PLAIN)
 			continue;
 
 		attr = (struct varlena *) DatumGetPointer(values[i]);
@@ -887,91 +883,7 @@ test_spinlock(void)
 		if (memcmp(struct_w_lock.data_after, "ef12", 4) != 0)
 			elog(ERROR, "padding after spinlock modified");
 	}
-
-	/*
-	 * Ensure that allocating more than INT32_MAX emulated spinlocks works.
-	 * That's interesting because the spinlock emulation uses a 32bit integer
-	 * to map spinlocks onto semaphores. There've been bugs...
-	 */
-#ifndef HAVE_SPINLOCKS
-	{
-		/*
-		 * Initialize enough spinlocks to advance counter close to wraparound.
-		 * It's too expensive to perform acquire/release for each, as those
-		 * may be syscalls when the spinlock emulation is used (and even just
-		 * atomic TAS would be expensive).
-		 */
-		for (uint32 i = 0; i < INT32_MAX - 100000; i++)
-		{
-			slock_t		lock;
-
-			SpinLockInit(&lock);
-		}
-
-		for (uint32 i = 0; i < 200000; i++)
-		{
-			slock_t		lock;
-
-			SpinLockInit(&lock);
-
-			SpinLockAcquire(&lock);
-			SpinLockRelease(&lock);
-			SpinLockAcquire(&lock);
-			SpinLockRelease(&lock);
-		}
-	}
-#endif
 }
-
-/*
- * Verify that performing atomic ops inside a spinlock isn't a
- * problem. Realistically that's only going to be a problem when both
- * --disable-spinlocks and --disable-atomics are used, but it's cheap enough
- * to just always test.
- *
- * The test works by initializing enough atomics that we'd conflict if there
- * were an overlap between a spinlock and an atomic by holding a spinlock
- * while manipulating more than NUM_SPINLOCK_SEMAPHORES atomics.
- *
- * NUM_TEST_ATOMICS doesn't really need to be more than
- * NUM_SPINLOCK_SEMAPHORES, but it seems better to test a bit more
- * extensively.
- */
-static void
-test_atomic_spin_nest(void)
-{
-	slock_t		lock;
-#define NUM_TEST_ATOMICS (NUM_SPINLOCK_SEMAPHORES + NUM_ATOMICS_SEMAPHORES + 27)
-	pg_atomic_uint32 atomics32[NUM_TEST_ATOMICS];
-	pg_atomic_uint64 atomics64[NUM_TEST_ATOMICS];
-
-	SpinLockInit(&lock);
-
-	for (int i = 0; i < NUM_TEST_ATOMICS; i++)
-	{
-		pg_atomic_init_u32(&atomics32[i], 0);
-		pg_atomic_init_u64(&atomics64[i], 0);
-	}
-
-	/* just so it's not all zeroes */
-	for (int i = 0; i < NUM_TEST_ATOMICS; i++)
-	{
-		EXPECT_EQ_U32(pg_atomic_fetch_add_u32(&atomics32[i], i), 0);
-		EXPECT_EQ_U64(pg_atomic_fetch_add_u64(&atomics64[i], i), 0);
-	}
-
-	/* test whether we can do atomic op with lock held */
-	SpinLockAcquire(&lock);
-	for (int i = 0; i < NUM_TEST_ATOMICS; i++)
-	{
-		EXPECT_EQ_U32(pg_atomic_fetch_sub_u32(&atomics32[i], i), i);
-		EXPECT_EQ_U32(pg_atomic_read_u32(&atomics32[i]), 0);
-		EXPECT_EQ_U64(pg_atomic_fetch_sub_u64(&atomics64[i], i), i);
-		EXPECT_EQ_U64(pg_atomic_read_u64(&atomics64[i]), 0);
-	}
-	SpinLockRelease(&lock);
-}
-#undef NUM_TEST_ATOMICS
 
 PG_FUNCTION_INFO_V1(test_atomic_ops);
 Datum
@@ -988,8 +900,6 @@ test_atomic_ops(PG_FUNCTION_ARGS)
 	 * closely enough related that that seems ok for now.
 	 */
 	test_spinlock();
-
-	test_atomic_spin_nest();
 
 	PG_RETURN_BOOL(true);
 }
@@ -1221,44 +1131,4 @@ binary_coercible(PG_FUNCTION_ARGS)
 	Oid			targettype = PG_GETARG_OID(1);
 
 	PG_RETURN_BOOL(IsBinaryCoercible(srctype, targettype));
-}
-
-/*
- * Return the length of the portion of a tuple consisting of the given array
- * of data types.  The input data types must be fixed-length data types.
- */
-PG_FUNCTION_INFO_V1(get_columns_length);
-Datum
-get_columns_length(PG_FUNCTION_ARGS)
-{
-	ArrayType  *ta = PG_GETARG_ARRAYTYPE_P(0);
-	Oid		   *type_oids;
-	int			ntypes;
-	int			column_offset = 0;
-
-	if (ARR_HASNULL(ta) && array_contains_nulls(ta))
-		elog(ERROR, "argument must not contain nulls");
-
-	if (ARR_NDIM(ta) > 1)
-		elog(ERROR, "argument must be empty or one-dimensional array");
-
-	type_oids = (Oid *) ARR_DATA_PTR(ta);
-	ntypes = ArrayGetNItems(ARR_NDIM(ta), ARR_DIMS(ta));
-	for (int i = 0; i < ntypes; i++)
-	{
-		Oid			typeoid = type_oids[i];
-		int16		typlen;
-		bool		typbyval;
-		char		typalign;
-
-		get_typlenbyvalalign(typeoid, &typlen, &typbyval, &typalign);
-
-		/* the data type must be fixed-length */
-		if (typlen < 0)
-			elog(ERROR, "type %u is not fixed-length data type", typeoid);
-
-		column_offset = att_align_nominal(column_offset + typlen, typalign);
-	}
-
-	PG_RETURN_INT32(column_offset);
 }

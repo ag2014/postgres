@@ -276,3 +276,25 @@ from tenk1, lateral (select tenk1.unique1 from generate_series(1, 1000)) as sub;
 explain (costs off) select sub.unique1, stringu1 || random()::text
 from tenk1, lateral (select tenk1.unique1 from generate_series(1, 1000)) as sub
 order by 1, 2;
+
+reset enable_hashagg;
+reset enable_seqscan;
+reset enable_incremental_sort;
+reset parallel_tuple_cost;
+reset parallel_setup_cost;
+reset min_parallel_table_scan_size;
+reset min_parallel_index_scan_size;
+
+-- Ensure incremental sorts work for amcanorderbyop type indexes
+create table point_table (a point, b int);
+create index point_table_a_idx on point_table using gist(a);
+
+-- Ensure we get an incremental sort plan for both of the following queries
+explain (costs off) select a, b, a <-> point(5, 5) dist from point_table order by dist, b limit 1;
+explain (costs off) select a, b, a <-> point(5, 5) dist from point_table order by dist, b desc limit 1;
+
+-- Ensure we get an incremental sort on the outer side of the mergejoin
+explain (costs off)
+select * from
+  (select * from tenk1 order by four) t1 join tenk1 t2 on t1.four = t2.four and t1.two = t2.two
+order by t1.four, t1.two limit 1;

@@ -4,7 +4,7 @@
  *	  prototypes for pathnode.c, relnode.c.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/pathnode.h
@@ -27,11 +27,12 @@ extern int	compare_fractional_path_costs(Path *path1, Path *path2,
 										  double fraction);
 extern void set_cheapest(RelOptInfo *parent_rel);
 extern void add_path(RelOptInfo *parent_rel, Path *new_path);
-extern bool add_path_precheck(RelOptInfo *parent_rel,
+extern bool add_path_precheck(RelOptInfo *parent_rel, int disabled_nodes,
 							  Cost startup_cost, Cost total_cost,
 							  List *pathkeys, Relids required_outer);
 extern void add_partial_path(RelOptInfo *parent_rel, Path *new_path);
 extern bool add_partial_path_precheck(RelOptInfo *parent_rel,
+									  int disabled_nodes,
 									  Cost total_cost, List *pathkeys);
 
 extern Path *create_seqscan_path(PlannerInfo *root, RelOptInfo *rel,
@@ -115,7 +116,7 @@ extern Path *create_valuesscan_path(PlannerInfo *root, RelOptInfo *rel,
 extern Path *create_tablefuncscan_path(PlannerInfo *root, RelOptInfo *rel,
 									   Relids required_outer);
 extern Path *create_ctescan_path(PlannerInfo *root, RelOptInfo *rel,
-								 Relids required_outer);
+								 List *pathkeys, Relids required_outer);
 extern Path *create_namedtuplestorescan_path(PlannerInfo *root, RelOptInfo *rel,
 											 Relids required_outer);
 extern Path *create_resultscan_path(PlannerInfo *root, RelOptInfo *rel,
@@ -124,23 +125,29 @@ extern Path *create_worktablescan_path(PlannerInfo *root, RelOptInfo *rel,
 									   Relids required_outer);
 extern ForeignPath *create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 											PathTarget *target,
-											double rows, Cost startup_cost, Cost total_cost,
+											double rows, int disabled_nodes,
+											Cost startup_cost, Cost total_cost,
 											List *pathkeys,
 											Relids required_outer,
 											Path *fdw_outerpath,
+											List *fdw_restrictinfo,
 											List *fdw_private);
 extern ForeignPath *create_foreign_join_path(PlannerInfo *root, RelOptInfo *rel,
 											 PathTarget *target,
-											 double rows, Cost startup_cost, Cost total_cost,
+											 double rows, int disabled_nodes,
+											 Cost startup_cost, Cost total_cost,
 											 List *pathkeys,
 											 Relids required_outer,
 											 Path *fdw_outerpath,
+											 List *fdw_restrictinfo,
 											 List *fdw_private);
 extern ForeignPath *create_foreign_upper_path(PlannerInfo *root, RelOptInfo *rel,
 											  PathTarget *target,
-											  double rows, Cost startup_cost, Cost total_cost,
+											  double rows, int disabled_nodes,
+											  Cost startup_cost, Cost total_cost,
 											  List *pathkeys,
 											  Path *fdw_outerpath,
+											  List *fdw_restrictinfo,
 											  List *fdw_private);
 
 extern Relids calc_nestloop_required_outer(Relids outerrelids,
@@ -247,6 +254,7 @@ extern WindowAggPath *create_windowagg_path(PlannerInfo *root,
 											Path *subpath,
 											PathTarget *target,
 											List *windowFuncs,
+											List *runCondition,
 											WindowClause *winclause,
 											List *qual,
 											bool topwindow);
@@ -280,7 +288,8 @@ extern ModifyTablePath *create_modifytable_path(PlannerInfo *root,
 												List *updateColnosLists,
 												List *withCheckOptionLists, List *returningLists,
 												List *rowMarks, OnConflictExpr *onconflict,
-												List *mergeActionLists, int epqParam);
+												List *mergeActionLists, List *mergeJoinConditions,
+												int epqParam);
 extern LimitPath *create_limit_path(PlannerInfo *root, RelOptInfo *rel,
 									Path *subpath,
 									Node *limitOffset, Node *limitCount,
@@ -295,6 +304,8 @@ extern Path *reparameterize_path(PlannerInfo *root, Path *path,
 								 double loop_count);
 extern Path *reparameterize_path_by_child(PlannerInfo *root, Path *path,
 										  RelOptInfo *child_rel);
+extern bool path_is_reparameterizable_by_child(Path *path,
+											   RelOptInfo *child_rel);
 
 /*
  * prototypes for relnode.c
@@ -304,6 +315,7 @@ extern void expand_planner_arrays(PlannerInfo *root, int add_size);
 extern RelOptInfo *build_simple_rel(PlannerInfo *root, int relid,
 									RelOptInfo *parent);
 extern RelOptInfo *find_base_rel(PlannerInfo *root, int relid);
+extern RelOptInfo *find_base_rel_noerr(PlannerInfo *root, int relid);
 extern RelOptInfo *find_base_rel_ignore_join(PlannerInfo *root, int relid);
 extern RelOptInfo *find_join_rel(PlannerInfo *root, Relids relids);
 extern RelOptInfo *build_join_rel(PlannerInfo *root,
@@ -311,6 +323,7 @@ extern RelOptInfo *build_join_rel(PlannerInfo *root,
 								  RelOptInfo *outer_rel,
 								  RelOptInfo *inner_rel,
 								  SpecialJoinInfo *sjinfo,
+								  List *pushed_down_joins,
 								  List **restrictlist_ptr);
 extern Relids min_join_parameterization(PlannerInfo *root,
 										Relids joinrelids,
@@ -337,6 +350,7 @@ extern Bitmapset *get_param_path_clause_serials(Path *path);
 extern RelOptInfo *build_child_join_rel(PlannerInfo *root,
 										RelOptInfo *outer_rel, RelOptInfo *inner_rel,
 										RelOptInfo *parent_joinrel, List *restrictlist,
-										SpecialJoinInfo *sjinfo);
+										SpecialJoinInfo *sjinfo,
+										int nappinfos, AppendRelInfo **appinfos);
 
 #endif							/* PATHNODE_H */

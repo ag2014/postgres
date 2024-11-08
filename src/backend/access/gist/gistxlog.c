@@ -4,7 +4,7 @@
  *	  WAL replay logic for GiST.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,12 +16,10 @@
 #include "access/bufmask.h"
 #include "access/gist_private.h"
 #include "access/gistxlog.h"
-#include "access/heapam_xlog.h"
 #include "access/transam.h"
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
-#include "miscadmin.h"
-#include "storage/procarray.h"
+#include "storage/standby.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -125,7 +123,7 @@ gistRedoPageUpdateRecord(XLogReaderState *record)
 		if (data - begin < datalen)
 		{
 			OffsetNumber off = (PageIsEmpty(page)) ? FirstOffsetNumber :
-			OffsetNumberNext(PageGetMaxOffsetNumber(page));
+				OffsetNumberNext(PageGetMaxOffsetNumber(page));
 
 			while (data - begin < datalen)
 			{
@@ -177,6 +175,7 @@ gistRedoDeleteRecord(XLogReaderState *record)
 	gistxlogDelete *xldata = (gistxlogDelete *) XLogRecGetData(record);
 	Buffer		buffer;
 	Page		page;
+	OffsetNumber *toDelete = xldata->offsets;
 
 	/*
 	 * If we have any conflict processing to do, it must happen before we
@@ -184,10 +183,10 @@ gistRedoDeleteRecord(XLogReaderState *record)
 	 *
 	 * GiST delete records can conflict with standby queries.  You might think
 	 * that vacuum records would conflict as well, but we've handled that
-	 * already.  XLOG_HEAP2_PRUNE records provide the highest xid cleaned by
-	 * the vacuum of the heap and so we can resolve any conflicts just once
-	 * when that arrives.  After that we know that no conflicts exist from
-	 * individual gist vacuum records on that index.
+	 * already.  XLOG_HEAP2_PRUNE_VACUUM_SCAN records provide the highest xid
+	 * cleaned by the vacuum of the heap and so we can resolve any conflicts
+	 * just once when that arrives.  After that we know that no conflicts
+	 * exist from individual gist vacuum records on that index.
 	 */
 	if (InHotStandby)
 	{
@@ -196,6 +195,7 @@ gistRedoDeleteRecord(XLogReaderState *record)
 		XLogRecGetBlockTag(record, 0, &rlocator, NULL, NULL);
 
 		ResolveRecoveryConflictWithSnapshot(xldata->snapshotConflictHorizon,
+											xldata->isCatalogRel,
 											rlocator);
 	}
 
@@ -203,14 +203,7 @@ gistRedoDeleteRecord(XLogReaderState *record)
 	{
 		page = (Page) BufferGetPage(buffer);
 
-		if (XLogRecGetDataLen(record) > SizeOfGistxlogDelete)
-		{
-			OffsetNumber *todelete;
-
-			todelete = (OffsetNumber *) ((char *) xldata + SizeOfGistxlogDelete);
-
-			PageIndexMultiDelete(page, todelete, xldata->ntodelete);
-		}
+		PageIndexMultiDelete(page, toDelete, xldata->ntodelete);
 
 		GistClearPageHasGarbage(page);
 		GistMarkTuplesDeleted(page);
@@ -396,6 +389,7 @@ gistRedoPageReuse(XLogReaderState *record)
 	 */
 	if (InHotStandby)
 		ResolveRecoveryConflictWithSnapshotFullXid(xlrec->snapshotConflictHorizon,
+												   xlrec->isCatalogRel,
 												   xlrec->locator);
 }
 
@@ -499,12 +493,12 @@ gist_mask(char *pagedata, BlockNumber blkno)
  */
 XLogRecPtr
 gistXLogSplit(bool page_is_leaf,
-			  SplitedPageLayout *dist,
+			  SplitPageLayout *dist,
 			  BlockNumber origrlink, GistNSN orignsn,
 			  Buffer leftchildbuf, bool markfollowright)
 {
 	gistxlogPageSplit xlrec;
-	SplitedPageLayout *ptr;
+	SplitPageLayout *ptr;
 	int			npage = 0;
 	XLogRecPtr	recptr;
 	int			i;
@@ -584,8 +578,8 @@ gistXLogAssignLSN(void)
 	int			dummy = 0;
 
 	/*
-	 * Records other than SWITCH_WAL must have content. We use an integer 0 to
-	 * follow the restriction.
+	 * Records other than XLOG_SWITCH must have content. We use an integer 0
+	 * to follow the restriction.
 	 */
 	XLogBeginInsert();
 	XLogSetRecordFlags(XLOG_MARK_UNIMPORTANT);
@@ -597,7 +591,8 @@ gistXLogAssignLSN(void)
  * Write XLOG record about reuse of a deleted page.
  */
 void
-gistXLogPageReuse(Relation rel, BlockNumber blkno, FullTransactionId deleteXid)
+gistXLogPageReuse(Relation rel, Relation heaprel,
+				  BlockNumber blkno, FullTransactionId deleteXid)
 {
 	gistxlogPageReuse xlrec_reuse;
 
@@ -608,6 +603,7 @@ gistXLogPageReuse(Relation rel, BlockNumber blkno, FullTransactionId deleteXid)
 	 */
 
 	/* XLOG stuff */
+	xlrec_reuse.isCatalogRel = RelationIsAccessibleInLogicalDecoding(heaprel);
 	xlrec_reuse.locator = rel->rd_locator;
 	xlrec_reuse.block = blkno;
 	xlrec_reuse.snapshotConflictHorizon = deleteXid;
@@ -672,11 +668,12 @@ gistXLogUpdate(Buffer buffer,
  */
 XLogRecPtr
 gistXLogDelete(Buffer buffer, OffsetNumber *todelete, int ntodelete,
-			   TransactionId snapshotConflictHorizon)
+			   TransactionId snapshotConflictHorizon, Relation heaprel)
 {
 	gistxlogDelete xlrec;
 	XLogRecPtr	recptr;
 
+	xlrec.isCatalogRel = RelationIsAccessibleInLogicalDecoding(heaprel);
 	xlrec.snapshotConflictHorizon = snapshotConflictHorizon;
 	xlrec.ntodelete = ntodelete;
 

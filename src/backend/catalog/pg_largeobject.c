@@ -3,7 +3,7 @@
  * pg_largeobject.c
  *	  routines to support manipulation of the pg_largeobject relation
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,17 +14,12 @@
  */
 #include "postgres.h"
 
-#include "access/genam.h"
-#include "access/htup_details.h"
-#include "access/sysattr.h"
 #include "access/table.h"
 #include "catalog/catalog.h"
-#include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_largeobject.h"
 #include "catalog/pg_largeobject_metadata.h"
 #include "miscadmin.h"
-#include "utils/acl.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
 
@@ -157,6 +152,15 @@ LargeObjectDrop(Oid loid)
 bool
 LargeObjectExists(Oid loid)
 {
+	return LargeObjectExistsWithSnapshot(loid, NULL);
+}
+
+/*
+ * Same as LargeObjectExists(), except snapshot to read with can be specified.
+ */
+bool
+LargeObjectExistsWithSnapshot(Oid loid, Snapshot snapshot)
+{
 	Relation	pg_lo_meta;
 	ScanKeyData skey[1];
 	SysScanDesc sd;
@@ -173,7 +177,7 @@ LargeObjectExists(Oid loid)
 
 	sd = systable_beginscan(pg_lo_meta,
 							LargeObjectMetadataOidIndexId, true,
-							NULL, 1, skey);
+							snapshot, 1, skey);
 
 	tuple = systable_getnext(sd);
 	if (HeapTupleIsValid(tuple))

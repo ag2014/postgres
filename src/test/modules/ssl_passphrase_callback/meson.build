@@ -1,10 +1,8 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 if not ssl.found()
   subdir_done()
 endif
-
-# FIXME: prevent install during main install, but not during test :/
 
 ssl_passphrase_callback_sources = files(
   'ssl_passphrase_func.c',
@@ -18,11 +16,11 @@ endif
 
 ssl_passphrase_callback = shared_module('ssl_passphrase_func',
   ssl_passphrase_callback_sources,
-  kwargs: pg_mod_args + {
+  kwargs: pg_test_mod_args + {
     'dependencies': [ssl, pg_mod_args['dependencies']],
   },
 )
-testprep_targets += ssl_passphrase_callback
+test_install_libs += ssl_passphrase_callback
 
 # Targets to generate or remove the ssl certificate and key. Need to be copied
 # to the source afterwards. Normally not needed.
@@ -42,7 +40,7 @@ if openssl.found()
   custom_target('server.key',
     input: [cert[1]],
     output: ['server.key'],
-    command: [openssl, 'rsa', '-aes256', '-in', '@INPUT0@', '-out', '@OUTPUT0@', '-passout', 'pass:@0@'.format(pass)]
+    command: [openssl, 'pkey', '-aes256', '-in', '@INPUT0@', '-out', '@OUTPUT0@', '-passout', 'pass:@0@'.format(pass)]
   )
 endif
 

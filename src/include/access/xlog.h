@@ -3,7 +3,7 @@
  *
  * PostgreSQL write-ahead log manager
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/xlog.h
@@ -19,12 +19,15 @@
 
 
 /* Sync methods */
-#define SYNC_METHOD_FSYNC		0
-#define SYNC_METHOD_FDATASYNC	1
-#define SYNC_METHOD_OPEN		2	/* for O_SYNC */
-#define SYNC_METHOD_FSYNC_WRITETHROUGH	3
-#define SYNC_METHOD_OPEN_DSYNC	4	/* for O_DSYNC */
-extern PGDLLIMPORT int sync_method;
+enum WalSyncMethod
+{
+	WAL_SYNC_METHOD_FSYNC = 0,
+	WAL_SYNC_METHOD_FDATASYNC,
+	WAL_SYNC_METHOD_OPEN,		/* for O_SYNC */
+	WAL_SYNC_METHOD_FSYNC_WRITETHROUGH,
+	WAL_SYNC_METHOD_OPEN_DSYNC	/* for O_DSYNC */
+};
+extern PGDLLIMPORT int wal_sync_method;
 
 extern PGDLLIMPORT XLogRecPtr ProcLastRecPtr;
 extern PGDLLIMPORT XLogRecPtr XactLastRecEnd;
@@ -49,6 +52,8 @@ extern PGDLLIMPORT bool wal_recycle;
 extern PGDLLIMPORT bool *wal_consistency_checking;
 extern PGDLLIMPORT char *wal_consistency_checking_string;
 extern PGDLLIMPORT bool log_checkpoints;
+extern PGDLLIMPORT int CommitDelay;
+extern PGDLLIMPORT int CommitSiblings;
 extern PGDLLIMPORT bool track_wal_io_timing;
 extern PGDLLIMPORT int wal_decode_buffer_size;
 
@@ -59,7 +64,7 @@ typedef enum ArchiveMode
 {
 	ARCHIVE_MODE_OFF = 0,		/* disabled */
 	ARCHIVE_MODE_ON,			/* enabled while server is running normally */
-	ARCHIVE_MODE_ALWAYS			/* enabled always (even during recovery) */
+	ARCHIVE_MODE_ALWAYS,		/* enabled always (even during recovery) */
 } ArchiveMode;
 extern PGDLLIMPORT int XLogArchiveMode;
 
@@ -68,7 +73,7 @@ typedef enum WalLevel
 {
 	WAL_LEVEL_MINIMAL = 0,
 	WAL_LEVEL_REPLICA,
-	WAL_LEVEL_LOGICAL
+	WAL_LEVEL_LOGICAL,
 } WalLevel;
 
 /* Compression algorithms for WAL */
@@ -77,7 +82,7 @@ typedef enum WalCompression
 	WAL_COMPRESSION_NONE = 0,
 	WAL_COMPRESSION_PGLZ,
 	WAL_COMPRESSION_LZ4,
-	WAL_COMPRESSION_ZSTD
+	WAL_COMPRESSION_ZSTD,
 } WalCompression;
 
 /* Recovery states */
@@ -85,7 +90,7 @@ typedef enum RecoveryState
 {
 	RECOVERY_STATE_CRASH = 0,	/* crash recovery */
 	RECOVERY_STATE_ARCHIVE,		/* archive recovery */
-	RECOVERY_STATE_DONE			/* currently in production */
+	RECOVERY_STATE_DONE,		/* currently in production */
 } RecoveryState;
 
 extern PGDLLIMPORT int wal_level;
@@ -162,6 +167,7 @@ typedef struct CheckpointStatsData
 	TimestampTz ckpt_end_t;		/* end of checkpoint */
 
 	int			ckpt_bufs_written;	/* # of buffers written */
+	int			ckpt_slru_written;	/* # of SLRU buffers written */
 
 	int			ckpt_segs_added;	/* # of new xlog segments created */
 	int			ckpt_segs_removed;	/* # of xlog segments deleted */
@@ -187,7 +193,7 @@ typedef enum WALAvailability
 	WALAVAIL_EXTENDED,			/* WAL segment is reserved by a slot or
 								 * wal_keep_size */
 	WALAVAIL_UNRESERVED,		/* no longer reserved, but not removed yet */
-	WALAVAIL_REMOVED			/* WAL segment has been removed */
+	WALAVAIL_REMOVED,			/* WAL segment has been removed */
 } WALAvailability;
 
 struct XLogRecData;
@@ -206,6 +212,7 @@ extern int	XLogFileOpen(XLogSegNo segno, TimeLineID tli);
 
 extern void CheckXLogRemoved(XLogSegNo segno, TimeLineID tli);
 extern XLogSegNo XLogGetLastRemovedSegno(void);
+extern XLogSegNo XLogGetOldestSegno(TimeLineID tli);
 extern void XLogSetAsyncXactLSN(XLogRecPtr asyncXactLSN);
 extern void XLogSetReplicationSlotMinimumLSN(XLogRecPtr lsn);
 
@@ -227,12 +234,13 @@ extern bool DataChecksumsEnabled(void);
 extern XLogRecPtr GetFakeLSNForUnloggedRel(void);
 extern Size XLOGShmemSize(void);
 extern void XLOGShmemInit(void);
-extern void BootStrapXLOG(void);
+extern void BootStrapXLOG(uint32 data_checksum_version);
 extern void InitializeWalConsistencyChecking(void);
 extern void LocalProcessControlFile(bool reset);
+extern WalLevel GetActiveWalLevelOnStandby(void);
 extern void StartupXLOG(void);
 extern void ShutdownXLOG(int code, Datum arg);
-extern void CreateCheckPoint(int flags);
+extern bool CreateCheckPoint(int flags);
 extern bool CreateRestartPoint(int flags);
 extern WALAvailability GetWALAvailability(XLogRecPtr targetLSN);
 extern void XLogPutNextOid(Oid nextOid);
@@ -243,9 +251,13 @@ extern XLogRecPtr GetRedoRecPtr(void);
 extern XLogRecPtr GetInsertRecPtr(void);
 extern XLogRecPtr GetFlushRecPtr(TimeLineID *insertTLI);
 extern TimeLineID GetWALInsertionTimeLine(void);
+extern TimeLineID GetWALInsertionTimeLineIfSet(void);
 extern XLogRecPtr GetLastImportantRecPtr(void);
 
 extern void SetWalWriterSleeping(bool sleeping);
+
+extern Size WALReadFromBuffers(char *dstbuf, XLogRecPtr startptr, Size count,
+							   TimeLineID tli);
 
 /*
  * Routines used by xlogrecovery.c to call back into xlog.c during recovery.

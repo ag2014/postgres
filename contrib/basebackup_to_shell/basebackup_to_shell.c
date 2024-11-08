@@ -3,7 +3,7 @@
  * basebackup_to_shell.c
  *	  target base backup files to a shell command
  *
- * Copyright (c) 2016-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2024, PostgreSQL Global Development Group
  *
  *	  contrib/basebackup_to_shell/basebackup_to_shell.c
  *-------------------------------------------------------------------------
@@ -263,6 +263,11 @@ shell_run_command(bbsink_shell *sink, const char *filename)
 
 	/* Run it. */
 	sink->pipe = OpenPipeStream(sink->current_command, PG_BINARY_W);
+	if (sink->pipe == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not execute command \"%s\": %m",
+						sink->current_command)));
 }
 
 /*

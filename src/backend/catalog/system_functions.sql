@@ -1,11 +1,11 @@
 /*
  * PostgreSQL System Functions
  *
- * Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * src/backend/catalog/system_functions.sql
  *
- * This file redefines certain built-in functions that it's impractical
+ * This file redefines certain built-in functions that are impractical
  * to fully define in pg_proc.dat.  In most cases that's because they use
  * SQL-standard function bodies and/or default expressions.  The node
  * tree representations of those are too unreadable, platform-dependent,
@@ -446,6 +446,26 @@ LANGUAGE INTERNAL
 VOLATILE ROWS 1000 COST 1000
 AS 'pg_logical_slot_peek_binary_changes';
 
+CREATE OR REPLACE FUNCTION pg_logical_emit_message(
+    transactional boolean,
+    prefix text,
+    message text,
+    flush boolean DEFAULT false)
+RETURNS pg_lsn
+LANGUAGE INTERNAL
+STRICT VOLATILE
+AS 'pg_logical_emit_message_text';
+
+CREATE OR REPLACE FUNCTION pg_logical_emit_message(
+    transactional boolean,
+    prefix text,
+    message bytea,
+    flush boolean DEFAULT false)
+RETURNS pg_lsn
+LANGUAGE INTERNAL
+STRICT VOLATILE
+AS 'pg_logical_emit_message_bytea';
+
 CREATE OR REPLACE FUNCTION pg_create_physical_replication_slot(
     IN slot_name name, IN immediately_reserve boolean DEFAULT false,
     IN temporary boolean DEFAULT false,
@@ -459,6 +479,7 @@ CREATE OR REPLACE FUNCTION pg_create_logical_replication_slot(
     IN slot_name name, IN plugin name,
     IN temporary boolean DEFAULT false,
     IN twophase boolean DEFAULT false,
+    IN failover boolean DEFAULT false,
     OUT slot_name name, OUT lsn pg_lsn)
 RETURNS RECORD
 LANGUAGE INTERNAL
@@ -601,31 +622,51 @@ LANGUAGE internal
 STRICT IMMUTABLE PARALLEL SAFE
 AS 'unicode_is_normalized';
 
--- Functions with SQL-mandated special syntax and some defaults.
 CREATE OR REPLACE FUNCTION
-  "current_time"(int4 DEFAULT NULL)
- RETURNS timetz
- LANGUAGE internal
- STABLE PARALLEL SAFE
-AS 'current_time';
+  pg_stat_reset_shared(target text DEFAULT NULL)
+RETURNS void
+LANGUAGE INTERNAL
+CALLED ON NULL INPUT VOLATILE PARALLEL SAFE
+AS 'pg_stat_reset_shared';
+
 CREATE OR REPLACE FUNCTION
-  "current_timestamp"(int4 DEFAULT NULL)
- RETURNS timestamptz
- LANGUAGE internal
- STABLE PARALLEL SAFE
- AS 'current_timestamp';
+  pg_stat_reset_slru(target text DEFAULT NULL)
+RETURNS void
+LANGUAGE INTERNAL
+CALLED ON NULL INPUT VOLATILE PARALLEL SAFE
+AS 'pg_stat_reset_slru';
+
 CREATE OR REPLACE FUNCTION
-  "localtime"(int4 DEFAULT NULL)
- RETURNS time
- LANGUAGE internal
- STABLE PARALLEL SAFE
- AS 'sql_localtime';
+  pg_set_relation_stats(relation regclass,
+                        relpages integer DEFAULT NULL,
+                        reltuples real DEFAULT NULL,
+                        relallvisible integer DEFAULT NULL)
+RETURNS void
+LANGUAGE INTERNAL
+CALLED ON NULL INPUT VOLATILE
+AS 'pg_set_relation_stats';
+
 CREATE OR REPLACE FUNCTION
-  "localtimestamp"(int4 DEFAULT NULL)
- RETURNS timestamp
- LANGUAGE internal
- STABLE PARALLEL SAFE
- AS 'sql_localtimestamp';
+  pg_set_attribute_stats(relation regclass,
+                         attname name,
+                         inherited bool,
+                         null_frac real DEFAULT NULL,
+                         avg_width integer DEFAULT NULL,
+                         n_distinct real DEFAULT NULL,
+                         most_common_vals text DEFAULT NULL,
+                         most_common_freqs real[] DEFAULT NULL,
+                         histogram_bounds text DEFAULT NULL,
+                         correlation real DEFAULT NULL,
+                         most_common_elems text DEFAULT NULL,
+                         most_common_elem_freqs real[] DEFAULT NULL,
+                         elem_count_histogram real[] DEFAULT NULL,
+                         range_length_histogram text DEFAULT NULL,
+                         range_empty_frac real DEFAULT NULL,
+                         range_bounds_histogram text DEFAULT NULL)
+RETURNS void
+LANGUAGE INTERNAL
+CALLED ON NULL INPUT VOLATILE
+AS 'pg_set_attribute_stats';
 
 --
 -- The default permissions for functions mean that anyone can execute them.
@@ -643,6 +684,8 @@ REVOKE EXECUTE ON FUNCTION pg_backup_stop(boolean) FROM public;
 REVOKE EXECUTE ON FUNCTION pg_create_restore_point(text) FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_switch_wal() FROM public;
+
+REVOKE EXECUTE ON FUNCTION pg_log_standby_snapshot() FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_wal_replay_pause() FROM public;
 
@@ -670,7 +713,7 @@ REVOKE EXECUTE ON FUNCTION pg_stat_reset_single_function_counters(oid) FROM publ
 
 REVOKE EXECUTE ON FUNCTION pg_stat_reset_replication_slot(text) FROM public;
 
-REVOKE EXECUTE ON FUNCTION pg_stat_have_stats(text, oid, oid) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_stat_have_stats(text, oid, int8) FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_stat_reset_subscription_stats(oid) FROM public;
 
@@ -685,6 +728,8 @@ REVOKE EXECUTE ON FUNCTION pg_ls_logdir() FROM public;
 REVOKE EXECUTE ON FUNCTION pg_ls_waldir() FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_ls_archive_statusdir() FROM public;
+
+REVOKE EXECUTE ON FUNCTION pg_ls_summariesdir() FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_ls_tmpdir() FROM public;
 
@@ -756,6 +801,8 @@ GRANT EXECUTE ON FUNCTION pg_ls_waldir() TO pg_monitor;
 
 GRANT EXECUTE ON FUNCTION pg_ls_archive_statusdir() TO pg_monitor;
 
+GRANT EXECUTE ON FUNCTION pg_ls_summariesdir() TO pg_monitor;
+
 GRANT EXECUTE ON FUNCTION pg_ls_tmpdir() TO pg_monitor;
 
 GRANT EXECUTE ON FUNCTION pg_ls_tmpdir(oid) TO pg_monitor;
@@ -765,6 +812,10 @@ GRANT EXECUTE ON FUNCTION pg_ls_logicalsnapdir() TO pg_monitor;
 GRANT EXECUTE ON FUNCTION pg_ls_logicalmapdir() TO pg_monitor;
 
 GRANT EXECUTE ON FUNCTION pg_ls_replslotdir(text) TO pg_monitor;
+
+GRANT EXECUTE ON FUNCTION pg_current_logfile() TO pg_monitor;
+
+GRANT EXECUTE ON FUNCTION pg_current_logfile(text) TO pg_monitor;
 
 GRANT pg_read_all_settings TO pg_monitor;
 

@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Minimal test testing streaming replication
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -14,7 +14,7 @@ my $node_primary = PostgreSQL::Test::Cluster->new('primary');
 # and it needs proper authentication configuration.
 $node_primary->init(
 	allows_streaming => 1,
-	auth_extra       => [ '--create-role', 'repl_role' ]);
+	auth_extra => [ '--create-role', 'repl_role' ]);
 $node_primary->start;
 my $backup_name = 'my_backup';
 
@@ -46,6 +46,25 @@ $node_standby_2->start;
 $node_primary->safe_psql('postgres',
 	"CREATE TABLE tab_int AS SELECT generate_series(1,1002) AS a");
 
+$node_primary->safe_psql(
+	'postgres', q{
+CREATE TABLE user_logins(id serial, who text);
+
+CREATE FUNCTION on_login_proc() RETURNS EVENT_TRIGGER AS $$
+BEGIN
+  IF NOT pg_is_in_recovery() THEN
+    INSERT INTO user_logins (who) VALUES (session_user);
+  END IF;
+  IF session_user = 'regress_hacker' THEN
+    RAISE EXCEPTION 'You are not welcome!';
+  END IF;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE EVENT TRIGGER on_login_trigger ON login EXECUTE FUNCTION on_login_proc();
+ALTER EVENT TRIGGER on_login_trigger ENABLE ALWAYS;
+});
+
 # Wait for standbys to catch up
 $node_primary->wait_for_replay_catchup($node_standby_1);
 $node_standby_1->wait_for_replay_catchup($node_standby_2, $node_primary);
@@ -76,6 +95,16 @@ $result = $node_standby_2->safe_psql('postgres', "SELECT * FROM seq1");
 print "standby 2: $result\n";
 is($result, qq(33|0|t), 'check streamed sequence content on standby 2');
 
+# Check pg_sequence_last_value() returns NULL for unlogged sequence on standby
+$node_primary->safe_psql('postgres',
+	"CREATE UNLOGGED SEQUENCE ulseq; SELECT nextval('ulseq')");
+$node_primary->wait_for_replay_catchup($node_standby_1);
+is( $node_standby_1->safe_psql(
+		'postgres',
+		"SELECT pg_sequence_last_value('ulseq'::regclass) IS NULL"),
+	't',
+	'pg_sequence_last_value() on unlogged sequence on standby 1');
+
 # Check that only READ-only queries can run on standbys
 is($node_standby_1->psql('postgres', 'INSERT INTO tab_int VALUES (1)'),
 	3, 'read-only queries on standby 1');
@@ -91,18 +120,18 @@ sub test_target_session_attrs
 {
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
 
-	my $node1       = shift;
-	my $node2       = shift;
+	my $node1 = shift;
+	my $node2 = shift;
 	my $target_node = shift;
-	my $mode        = shift;
-	my $status      = shift;
+	my $mode = shift;
+	my $status = shift;
 
-	my $node1_host  = $node1->host;
-	my $node1_port  = $node1->port;
-	my $node1_name  = $node1->name;
-	my $node2_host  = $node2->host;
-	my $node2_port  = $node2->port;
-	my $node2_name  = $node2->name;
+	my $node1_host = $node1->host;
+	my $node1_port = $node1->port;
+	my $node1_name = $node1->name;
+	my $node2_host = $node2->host;
+	my $node2_port = $node2->port;
+	my $node2_name = $node2->name;
 	my $target_port = undef;
 	$target_port = $target_node->port if (defined $target_node);
 	my $target_name = undef;
@@ -218,11 +247,11 @@ $node_primary->psql(
 	'postgres', "
 CREATE ROLE repl_role REPLICATION LOGIN;
 GRANT pg_read_all_settings TO repl_role;");
-my $primary_host   = $node_primary->host;
-my $primary_port   = $node_primary->port;
+my $primary_host = $node_primary->host;
+my $primary_port = $node_primary->port;
 my $connstr_common = "host=$primary_host port=$primary_port user=repl_role";
-my $connstr_rep    = "$connstr_common replication=1";
-my $connstr_db     = "$connstr_common replication=database dbname=postgres";
+my $connstr_rep = "$connstr_common replication=1";
+my $connstr_db = "$connstr_common replication=database dbname=postgres";
 
 # Test SHOW ALL
 my ($ret, $stdout, $stderr) = $node_primary->psql(
@@ -384,6 +413,13 @@ sub replay_check
 
 replay_check();
 
+my $evttrig = $node_standby_1->safe_psql('postgres',
+	"SELECT evtname FROM pg_event_trigger WHERE evtevent = 'login'");
+is($evttrig, 'on_login_trigger', 'Name of login trigger');
+$evttrig = $node_standby_2->safe_psql('postgres',
+	"SELECT evtname FROM pg_event_trigger WHERE evtevent = 'login'");
+is($evttrig, 'on_login_trigger', 'Name of login trigger');
+
 note "enabling hot_standby_feedback";
 
 # Enable hs_feedback. The slot should gain an xmin. We set the status interval
@@ -496,11 +532,7 @@ $node_primary->safe_psql('postgres',
 my $segment_removed = $node_primary->safe_psql('postgres',
 	'SELECT pg_walfile_name(pg_current_wal_lsn())');
 chomp($segment_removed);
-$node_primary->psql(
-	'postgres', "
-	CREATE TABLE tab_phys_slot (a int);
-	INSERT INTO tab_phys_slot VALUES (generate_series(1,10));
-	SELECT pg_switch_wal();");
+$node_primary->advance_wal(1);
 my $current_lsn =
   $node_primary->safe_psql('postgres', "SELECT pg_current_wal_lsn();");
 chomp($current_lsn);
@@ -534,8 +566,8 @@ my $connstr = $node_primary->connstr('postgres') . " replication=database";
 # a replication command and a SQL command.
 $node_primary->command_fails_like(
 	[
-		'psql', '-X',          '-c', "SELECT pg_backup_start('backup', true)",
-		'-c',   'BASE_BACKUP', '-d', $connstr
+		'psql', '-X', '-c', "SELECT pg_backup_start('backup', true)",
+		'-c', 'BASE_BACKUP', '-d', $connstr
 	],
 	qr/a backup is already in progress in this session/,
 	'BASE_BACKUP cannot run in session already running backup');
@@ -553,8 +585,8 @@ my ($sigchld_bb_stdin, $sigchld_bb_stdout, $sigchld_bb_stderr) = ('', '', '');
 my $sigchld_bb = IPC::Run::start(
 	[
 		'psql', '-X', '-c', "BASE_BACKUP (CHECKPOINT 'fast', MAX_RATE 32);",
-		'-c',   'SELECT pg_backup_stop()',
-		'-d',   $connstr
+		'-c', 'SELECT pg_backup_stop()',
+		'-d', $connstr
 	],
 	'<',
 	\$sigchld_bb_stdin,
@@ -577,9 +609,9 @@ is( $node_primary->poll_query_until(
 
 # The psql command should fail on pg_backup_stop().
 ok( pump_until(
-		$sigchld_bb,         $sigchld_bb_timeout,
+		$sigchld_bb, $sigchld_bb_timeout,
 		\$sigchld_bb_stderr, qr/backup is not in progress/),
-	'base backup cleanly cancelled');
+	'base backup cleanly canceled');
 $sigchld_bb->finish();
 
 done_testing();

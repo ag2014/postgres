@@ -11,13 +11,11 @@
 #include "postgres.h"
 
 #include "access/xact.h"
-#include "backup/basebackup.h"
 #include "backup/basebackup_sink.h"
 #include "catalog/pg_authid.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
 #include "utils/acl.h"
-#include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
 typedef struct bbsink_server
@@ -72,7 +70,9 @@ bbsink_server_new(bbsink *next, char *pathname)
 	if (!has_privs_of_role(GetUserId(), ROLE_PG_WRITE_SERVER_FILES))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser or a role with privileges of the pg_write_server_files role to create backup stored on server")));
+				 errmsg("permission denied to create backup stored on server"),
+				 errdetail("Only roles with privileges of the \"%s\" role may create a backup stored on the server.",
+						   "pg_write_server_files")));
 	CommitTransactionCommand();
 
 	/*

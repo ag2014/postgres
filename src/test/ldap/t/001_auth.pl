@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use FindBin;
 use lib "$FindBin::RealBin/..";
@@ -18,15 +18,14 @@ if ($ENV{with_ldap} ne 'yes')
 {
 	plan skip_all => 'LDAP not supported by this build';
 }
-elsif ($ENV{PG_TEST_EXTRA} !~ /\bldap\b/)
+elsif (!$ENV{PG_TEST_EXTRA} || $ENV{PG_TEST_EXTRA} !~ /\bldap\b/)
 {
 	plan skip_all =>
 	  'Potentially unsafe test LDAP not enabled in PG_TEST_EXTRA';
 }
 elsif (!$LdapServer::setup)
 {
-	plan skip_all =>
-	  "ldap tests not supported on $^O or dependencies not installed";
+	plan skip_all => $LdapServer::setup_error;
 }
 
 note "setting up LDAP server";
@@ -37,8 +36,8 @@ $ldap->ldapadd_file('authdata.ldif');
 $ldap->ldapsetpw('uid=test1,dc=example,dc=net', 'secret1');
 $ldap->ldapsetpw('uid=test2,dc=example,dc=net', 'secret2');
 
-my ($ldap_server, $ldap_port,   $ldaps_port, $ldap_url,
-	$ldaps_url,   $ldap_basedn, $ldap_rootdn
+my ($ldap_server, $ldap_port, $ldaps_port, $ldap_url,
+	$ldaps_url, $ldap_basedn, $ldap_rootdn
 ) = $ldap->prop(qw(server port s_port url s_url basedn rootdn));
 
 # don't bother to check the server's cert (though perhaps we should)
@@ -101,6 +100,12 @@ test_access(
 		qr/connection authenticated: identity="uid=test1,dc=example,dc=net" method=ldap/
 	],);
 
+# require_auth=password should complete successfully; other methods should fail.
+$node->connect_ok("user=test1 require_auth=password",
+	"password authentication required, works with ldap auth");
+$node->connect_fails("user=test1 require_auth=scram-sha-256",
+	"SCRAM authentication required, fails with ldap auth");
+
 note "search+bind";
 
 unlink($node->data_dir . '/pg_hba.conf');
@@ -139,6 +144,22 @@ $ENV{"PGPASSWORD"} = 'secret1';
 test_access($node, 'test1', 0, 'search+bind authentication succeeds');
 
 note "LDAP URLs";
+
+unlink($node->data_dir . '/pg_hba.conf');
+$node->append_conf('pg_hba.conf',
+	qq{local all all ldap ldapurl="$ldap_url" ldapprefix="uid=" ldapsuffix=",dc=example,dc=net"}
+);
+$node->restart;
+
+$ENV{"PGPASSWORD"} = 'wrong';
+test_access($node, 'test0', 2,
+	'simple bind with LDAP URL authentication fails if user not found in LDAP'
+);
+test_access($node, 'test1', 2,
+	'simple bind with LDAP URL authentication fails with wrong password');
+$ENV{"PGPASSWORD"} = 'secret1';
+test_access($node, 'test1', 0,
+	'simple bind with LDAP URL authentication succeeds');
 
 unlink($node->data_dir . '/pg_hba.conf');
 $node->append_conf('pg_hba.conf',

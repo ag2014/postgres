@@ -2,7 +2,7 @@
  *
  * rewriteManip.c
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -343,7 +343,7 @@ contains_multiexpr_param(Node *node, void *context)
  * the RTEs in 'src_rtable' to now point to the perminfos' indexes in
  * *dst_perminfos.
  *
- * Note that this changes both 'dst_rtable' and 'dst_perminfo' destructively,
+ * Note that this changes both 'dst_rtable' and 'dst_perminfos' destructively,
  * so the caller should have better passed safe-to-modify copies.
  */
 void
@@ -496,9 +496,10 @@ OffsetVarNodes(Node *node, int offset, int sublevels_up)
 		/*
 		 * If we are starting at a Query, and sublevels_up is zero, then we
 		 * must also fix rangetable indexes in the Query itself --- namely
-		 * resultRelation, exclRelIndex and rowMarks entries.  sublevels_up
-		 * cannot be zero when recursing into a subquery, so there's no need
-		 * to have the same logic inside OffsetVarNodes_walker.
+		 * resultRelation, mergeTargetRelation, exclRelIndex and rowMarks
+		 * entries.  sublevels_up cannot be zero when recursing into a
+		 * subquery, so there's no need to have the same logic inside
+		 * OffsetVarNodes_walker.
 		 */
 		if (sublevels_up == 0)
 		{
@@ -506,6 +507,9 @@ OffsetVarNodes(Node *node, int offset, int sublevels_up)
 
 			if (qry->resultRelation)
 				qry->resultRelation += offset;
+
+			if (qry->mergeTargetRelation)
+				qry->mergeTargetRelation += offset;
 
 			if (qry->onConflict && qry->onConflict->exclRelIndex)
 				qry->onConflict->exclRelIndex += offset;
@@ -687,9 +691,10 @@ ChangeVarNodes(Node *node, int rt_index, int new_index, int sublevels_up)
 		/*
 		 * If we are starting at a Query, and sublevels_up is zero, then we
 		 * must also fix rangetable indexes in the Query itself --- namely
-		 * resultRelation and rowMarks entries.  sublevels_up cannot be zero
-		 * when recursing into a subquery, so there's no need to have the same
-		 * logic inside ChangeVarNodes_walker.
+		 * resultRelation, mergeTargetRelation, exclRelIndex  and rowMarks
+		 * entries.  sublevels_up cannot be zero when recursing into a
+		 * subquery, so there's no need to have the same logic inside
+		 * ChangeVarNodes_walker.
 		 */
 		if (sublevels_up == 0)
 		{
@@ -697,6 +702,9 @@ ChangeVarNodes(Node *node, int rt_index, int new_index, int sublevels_up)
 
 			if (qry->resultRelation == rt_index)
 				qry->resultRelation = new_index;
+
+			if (qry->mergeTargetRelation == rt_index)
+				qry->mergeTargetRelation = new_index;
 
 			/* this is unlikely to ever be used, but ... */
 			if (qry->onConflict && qry->onConflict->exclRelIndex == rt_index)
@@ -719,11 +727,16 @@ ChangeVarNodes(Node *node, int rt_index, int new_index, int sublevels_up)
 
 /*
  * Substitute newrelid for oldrelid in a Relid set
+ *
+ * Note: some extensions may pass a special varno such as INDEX_VAR for
+ * oldrelid.  bms_is_member won't like that, but we should tolerate it.
+ * (Perhaps newrelid could also be a special varno, but there had better
+ * not be a reason to inject that into a nullingrels or phrels set.)
  */
 static Relids
 adjust_relid_set(Relids relids, int oldrelid, int newrelid)
 {
-	if (bms_is_member(oldrelid, relids))
+	if (!IS_SPECIAL_VARNO(oldrelid) && bms_is_member(oldrelid, relids))
 	{
 		/* Ensure we have a modifiable copy */
 		relids = bms_copy(relids);
@@ -1128,7 +1141,8 @@ AddInvertedQual(Query *parsetree, Node *qual)
 /*
  * add_nulling_relids() finds Vars and PlaceHolderVars that belong to any
  * of the target_relids, and adds added_relids to their varnullingrels
- * and phnullingrels fields.
+ * and phnullingrels fields.  If target_relids is NULL, all level-zero
+ * Vars and PHVs are modified.
  */
 Node *
 add_nulling_relids(Node *node,
@@ -1157,7 +1171,8 @@ add_nulling_relids_mutator(Node *node,
 		Var		   *var = (Var *) node;
 
 		if (var->varlevelsup == context->sublevels_up &&
-			bms_is_member(var->varno, context->target_relids))
+			(context->target_relids == NULL ||
+			 bms_is_member(var->varno, context->target_relids)))
 		{
 			Relids		newnullingrels = bms_union(var->varnullingrels,
 												   context->added_relids);
@@ -1175,7 +1190,8 @@ add_nulling_relids_mutator(Node *node,
 		PlaceHolderVar *phv = (PlaceHolderVar *) node;
 
 		if (phv->phlevelsup == context->sublevels_up &&
-			bms_overlap(phv->phrels, context->target_relids))
+			(context->target_relids == NULL ||
+			 bms_overlap(phv->phrels, context->target_relids)))
 		{
 			Relids		newnullingrels = bms_union(phv->phnullingrels,
 												   context->added_relids);
@@ -1247,16 +1263,11 @@ remove_nulling_relids_mutator(Node *node,
 			!bms_is_member(var->varno, context->except_relids) &&
 			bms_overlap(var->varnullingrels, context->removable_relids))
 		{
-			Relids		newnullingrels = bms_difference(var->varnullingrels,
-														context->removable_relids);
-
-			/* Micro-optimization: ensure nullingrels is NULL if empty */
-			if (bms_is_empty(newnullingrels))
-				newnullingrels = NULL;
 			/* Copy the Var ... */
 			var = copyObject(var);
 			/* ... and replace the copy's varnullingrels field */
-			var->varnullingrels = newnullingrels;
+			var->varnullingrels = bms_difference(var->varnullingrels,
+												 context->removable_relids);
 			return (Node *) var;
 		}
 		/* Otherwise fall through to copy the Var normally */
@@ -1268,26 +1279,20 @@ remove_nulling_relids_mutator(Node *node,
 		if (phv->phlevelsup == context->sublevels_up &&
 			!bms_overlap(phv->phrels, context->except_relids))
 		{
-			Relids		newnullingrels = bms_difference(phv->phnullingrels,
-														context->removable_relids);
-
 			/*
-			 * Micro-optimization: ensure nullingrels is NULL if empty.
-			 *
 			 * Note: it might seem desirable to remove the PHV altogether if
 			 * phnullingrels goes to empty.  Currently we dare not do that
 			 * because we use PHVs in some cases to enforce separate identity
 			 * of subexpressions; see wrap_non_vars usages in prepjointree.c.
 			 */
-			if (bms_is_empty(newnullingrels))
-				newnullingrels = NULL;
 			/* Copy the PlaceHolderVar and mutate what's below ... */
 			phv = (PlaceHolderVar *)
 				expression_tree_mutator(node,
 										remove_nulling_relids_mutator,
 										(void *) context);
 			/* ... and replace the copy's phnullingrels field */
-			phv->phnullingrels = newnullingrels;
+			phv->phnullingrels = bms_difference(phv->phnullingrels,
+												context->removable_relids);
 			/* We must also update phrels, if it contains a removable RTI */
 			phv->phrels = bms_difference(phv->phrels,
 										 context->removable_relids);
@@ -1710,7 +1715,7 @@ ReplaceVarsFromTargetList_callback(Var *var,
 				break;
 
 			case REPLACEVARS_CHANGE_VARNO:
-				var = (Var *) copyObject(var);
+				var = copyObject(var);
 				var->varno = rcon->nomatch_varno;
 				/* we leave the syntactic referent alone */
 				return (Node *) var;

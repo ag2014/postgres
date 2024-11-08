@@ -2,7 +2,7 @@
  * test_ddl_deparse.c
  *		Support functions for the test_ddl_deparse module
  *
- * Copyright (c) 2014-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/test/modules/test_ddl_deparse/test_ddl_deparse.c
@@ -10,7 +10,6 @@
  */
 #include "postgres.h"
 
-#include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "nodes/execnodes.h"
 #include "tcop/deparse_utility.h"
@@ -128,6 +127,9 @@ get_altertable_subcmdinfo(PG_FUNCTION_ARGS)
 				break;
 			case AT_SetNotNull:
 				strtype = "SET NOT NULL";
+				break;
+			case AT_SetExpression:
+				strtype = "SET EXPRESSION";
 				break;
 			case AT_DropExpression:
 				strtype = "DROP EXPRESSION";
@@ -318,6 +320,7 @@ get_altertable_subcmdinfo(PG_FUNCTION_ARGS)
 		if (OidIsValid(sub->address.objectId))
 		{
 			char	   *objdesc;
+
 			objdesc = getObjectDescription((const ObjectAddress *) &sub->address, false);
 			values[1] = CStringGetTextDatum(objdesc);
 		}

@@ -1,18 +1,18 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 #
 # Tests related to WAL archiving and recovery.
 #
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
 my $primary = PostgreSQL::Test::Cluster->new('primary');
 $primary->init(
-	has_archiving    => 1,
+	has_archiving => 1,
 	allows_streaming => 1);
 $primary->append_conf('postgresql.conf', 'autovacuum = off');
 $primary->start;
@@ -39,9 +39,9 @@ $primary->safe_psql(
 # This will be used to track the activity of the archiver.
 my $segment_name_1 = $primary->safe_psql('postgres',
 	q{SELECT pg_walfile_name(pg_current_wal_lsn())});
-my $segment_path_1       = "pg_wal/archive_status/$segment_name_1";
+my $segment_path_1 = "pg_wal/archive_status/$segment_name_1";
 my $segment_path_1_ready = "$segment_path_1.ready";
-my $segment_path_1_done  = "$segment_path_1.done";
+my $segment_path_1_done = "$segment_path_1.done";
 $primary->safe_psql(
 	'postgres', q{
 	CREATE TABLE mine AS SELECT generate_series(1,10) AS x;
@@ -115,9 +115,9 @@ is( $primary->safe_psql(
 # with existing status files.
 my $segment_name_2 = $primary->safe_psql('postgres',
 	q{SELECT pg_walfile_name(pg_current_wal_lsn())});
-my $segment_path_2       = "pg_wal/archive_status/$segment_name_2";
+my $segment_path_2 = "pg_wal/archive_status/$segment_name_2";
 my $segment_path_2_ready = "$segment_path_2.ready";
-my $segment_path_2_done  = "$segment_path_2.done";
+my $segment_path_2_done = "$segment_path_2.done";
 $primary->safe_psql(
 	'postgres', q{
 	INSERT INTO mine SELECT generate_series(10,20) AS x;

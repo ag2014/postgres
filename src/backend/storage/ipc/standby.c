@@ -7,7 +7,7 @@
  *	AccessExclusiveLocks and starting snapshots for Hot Standby mode.
  *	Plus conflict recovery processing.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -24,20 +24,18 @@
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "replication/slot.h"
 #include "storage/bufmgr.h"
-#include "storage/lmgr.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/sinvaladt.h"
 #include "storage/standby.h"
 #include "utils/hsearch.h"
-#include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 
 /* User-settable GUC parameters */
-int			vacuum_defer_cleanup_age;
 int			max_standby_archive_delay = 30 * 1000;
 int			max_standby_streaming_delay = 30 * 1000;
 bool		log_recovery_conflict_waits = false;
@@ -137,7 +135,8 @@ InitRecoveryTransactionEnvironment(void)
 	 * are held by vxids and row level locks are held by xids. All queries
 	 * hold AccessShareLocks so never block while we write or lock new rows.
 	 */
-	vxid.backendId = MyBackendId;
+	MyProc->vxid.procNumber = MyProcNumber;
+	vxid.procNumber = MyProcNumber;
 	vxid.localTransactionId = GetNextLocalTransactionId();
 	VirtualXactLockTableInsert(vxid);
 
@@ -299,7 +298,7 @@ LogRecoveryConflict(ProcSignalReason reason, TimestampTz wait_start,
 		vxids = wait_list;
 		while (VirtualTransactionIdIsValid(*vxids))
 		{
-			PGPROC	   *proc = BackendIdGetProc(vxids->backendId);
+			PGPROC	   *proc = ProcNumberGetProc(vxids->procNumber);
 
 			/* proc can be NULL if the target backend is not active */
 			if (proc)
@@ -466,6 +465,7 @@ ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
  */
 void
 ResolveRecoveryConflictWithSnapshot(TransactionId snapshotConflictHorizon,
+									bool isCatalogRel,
 									RelFileLocator locator)
 {
 	VirtualTransactionId *backends;
@@ -491,6 +491,16 @@ ResolveRecoveryConflictWithSnapshot(TransactionId snapshotConflictHorizon,
 										   PROCSIG_RECOVERY_CONFLICT_SNAPSHOT,
 										   WAIT_EVENT_RECOVERY_CONFLICT_SNAPSHOT,
 										   true);
+
+	/*
+	 * Note that WaitExceedsMaxStandbyDelay() is not taken into account here
+	 * (as opposed to ResolveRecoveryConflictWithVirtualXIDs() above). That
+	 * seems OK, given that this kind of conflict should not normally be
+	 * reached, e.g. due to using a physical replication slot.
+	 */
+	if (wal_level >= WAL_LEVEL_LOGICAL && isCatalogRel)
+		InvalidateObsoleteReplicationSlots(RS_INVAL_HORIZON, 0, locator.dbOid,
+										   snapshotConflictHorizon);
 }
 
 /*
@@ -499,6 +509,7 @@ ResolveRecoveryConflictWithSnapshot(TransactionId snapshotConflictHorizon,
  */
 void
 ResolveRecoveryConflictWithSnapshotFullXid(FullTransactionId snapshotConflictHorizon,
+										   bool isCatalogRel,
 										   RelFileLocator locator)
 {
 	/*
@@ -517,7 +528,9 @@ ResolveRecoveryConflictWithSnapshotFullXid(FullTransactionId snapshotConflictHor
 		TransactionId truncated;
 
 		truncated = XidFromFullTransactionId(snapshotConflictHorizon);
-		ResolveRecoveryConflictWithSnapshot(truncated, locator);
+		ResolveRecoveryConflictWithSnapshot(truncated,
+											isCatalogRel,
+											locator);
 	}
 }
 
@@ -826,7 +839,7 @@ ResolveRecoveryConflictWithBufferPin(void)
 	 * SIGHUP signal handler, etc cannot do that because it uses the different
 	 * latch from that ProcWaitForSignal() waits on.
 	 */
-	ProcWaitForSignal(PG_WAIT_BUFFER_PIN);
+	ProcWaitForSignal(WAIT_EVENT_BUFFER_PIN);
 
 	if (got_standby_delay_timeout)
 		SendRecoveryConflictWithBufferPin(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
@@ -983,8 +996,7 @@ StandbyAcquireAccessExclusiveLock(TransactionId xid, Oid dbOid, Oid relOid)
 		TransactionIdDidAbort(xid))
 		return;
 
-	elog(trace_recovery(DEBUG4),
-		 "adding recovery lock: db %u rel %u", dbOid, relOid);
+	elog(DEBUG4, "adding recovery lock: db %u rel %u", dbOid, relOid);
 
 	/* dbOid is InvalidOid when we are locking a shared relation. */
 	Assert(OidIsValid(relOid));
@@ -1028,7 +1040,7 @@ StandbyReleaseXidEntryLocks(RecoveryLockXidEntry *xidentry)
 	{
 		LOCKTAG		locktag;
 
-		elog(trace_recovery(DEBUG4),
+		elog(DEBUG4,
 			 "releasing recovery lock: xid %u db %u rel %u",
 			 entry->key.xid, entry->key.dbOid, entry->key.relOid);
 		/* Release the lock ... */
@@ -1095,7 +1107,7 @@ StandbyReleaseAllLocks(void)
 	HASH_SEQ_STATUS status;
 	RecoveryLockXidEntry *entry;
 
-	elog(trace_recovery(DEBUG2), "release all standby locks");
+	elog(DEBUG2, "release all standby locks");
 
 	hash_seq_init(&status, RecoveryLockXidHash);
 	while ((entry = hash_seq_search(&status)))
@@ -1109,6 +1121,9 @@ StandbyReleaseAllLocks(void)
  * StandbyReleaseOldLocks
  *		Release standby locks held by top-level XIDs that aren't running,
  *		as long as they're not prepared transactions.
+ *
+ * This is needed to prune the locks of crashed transactions, which didn't
+ * write an ABORT/COMMIT record.
  */
 void
 StandbyReleaseOldLocks(TransactionId oldxid)
@@ -1172,13 +1187,22 @@ standby_redo(XLogReaderState *record)
 
 		running.xcnt = xlrec->xcnt;
 		running.subxcnt = xlrec->subxcnt;
-		running.subxid_overflow = xlrec->subxid_overflow;
+		running.subxid_status = xlrec->subxid_overflow ? SUBXIDS_MISSING : SUBXIDS_IN_ARRAY;
 		running.nextXid = xlrec->nextXid;
 		running.latestCompletedXid = xlrec->latestCompletedXid;
 		running.oldestRunningXid = xlrec->oldestRunningXid;
 		running.xids = xlrec->xids;
 
 		ProcArrayApplyRecoveryInfo(&running);
+
+		/*
+		 * The startup process currently has no convenient way to schedule
+		 * stats to be reported. XLOG_RUNNING_XACTS records issued at a
+		 * regular cadence, making this a convenient location to report stats.
+		 * While these records aren't generated with wal_level=minimal, stats
+		 * also cannot be accessed during WAL replay.
+		 */
+		pgstat_report_stat(true);
 	}
 	else if (info == XLOG_INVALIDATIONS)
 	{
@@ -1244,13 +1268,6 @@ standby_redo(XLogReaderState *record)
  * Later, when we apply the running xact data we must be careful to ignore
  * transactions already committed, since those commits raced ahead when
  * making WAL entries.
- *
- * The loose timing also means that locks may be recorded that have a
- * zero xid, since xids are removed from procs before locks are removed.
- * So we must prune the lock list down to ensure we hold locks only for
- * currently running xids, performed by StandbyReleaseOldLocks().
- * Zero xids should no longer be possible, but we may be replaying WAL
- * from a time when they were possible.
  *
  * For logical decoding only the running xacts information is needed;
  * there's no need to look at the locking information, but it's logged anyway,
@@ -1328,7 +1345,7 @@ LogCurrentRunningXacts(RunningTransactions CurrRunningXacts)
 
 	xlrec.xcnt = CurrRunningXacts->xcnt;
 	xlrec.subxcnt = CurrRunningXacts->subxcnt;
-	xlrec.subxid_overflow = CurrRunningXacts->subxid_overflow;
+	xlrec.subxid_overflow = (CurrRunningXacts->subxid_status != SUBXIDS_IN_ARRAY);
 	xlrec.nextXid = CurrRunningXacts->nextXid;
 	xlrec.oldestRunningXid = CurrRunningXacts->oldestRunningXid;
 	xlrec.latestCompletedXid = CurrRunningXacts->latestCompletedXid;
@@ -1345,17 +1362,17 @@ LogCurrentRunningXacts(RunningTransactions CurrRunningXacts)
 
 	recptr = XLogInsert(RM_STANDBY_ID, XLOG_RUNNING_XACTS);
 
-	if (CurrRunningXacts->subxid_overflow)
-		elog(trace_recovery(DEBUG2),
-			 "snapshot of %u running transactions overflowed (lsn %X/%X oldest xid %u latest complete %u next xid %u)",
+	if (xlrec.subxid_overflow)
+		elog(DEBUG2,
+			 "snapshot of %d running transactions overflowed (lsn %X/%X oldest xid %u latest complete %u next xid %u)",
 			 CurrRunningXacts->xcnt,
 			 LSN_FORMAT_ARGS(recptr),
 			 CurrRunningXacts->oldestRunningXid,
 			 CurrRunningXacts->latestCompletedXid,
 			 CurrRunningXacts->nextXid);
 	else
-		elog(trace_recovery(DEBUG2),
-			 "snapshot of %u+%u running transaction ids (lsn %X/%X oldest xid %u latest complete %u next xid %u)",
+		elog(DEBUG2,
+			 "snapshot of %d+%d running transaction ids (lsn %X/%X oldest xid %u latest complete %u next xid %u)",
 			 CurrRunningXacts->xcnt, CurrRunningXacts->subxcnt,
 			 LSN_FORMAT_ARGS(recptr),
 			 CurrRunningXacts->oldestRunningXid,
@@ -1477,6 +1494,9 @@ get_recovery_conflict_desc(ProcSignalReason reason)
 			break;
 		case PROCSIG_RECOVERY_CONFLICT_SNAPSHOT:
 			reasonDesc = _("recovery conflict on snapshot");
+			break;
+		case PROCSIG_RECOVERY_CONFLICT_LOGICALSLOT:
+			reasonDesc = _("recovery conflict on replication slot");
 			break;
 		case PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK:
 			reasonDesc = _("recovery conflict on buffer deadlock");

@@ -3,7 +3,7 @@
  * pg_rewind.h
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *-------------------------------------------------------------------------
@@ -13,10 +13,7 @@
 
 #include "access/timeline.h"
 #include "common/logging.h"
-#include "datapagemap.h"
-#include "libpq-fe.h"
-#include "storage/block.h"
-#include "storage/relfilelocator.h"
+#include "common/file_utils.h"
 
 /* Configuration options */
 extern char *datadir_target;
@@ -24,6 +21,7 @@ extern bool showprogress;
 extern bool dry_run;
 extern bool do_sync;
 extern int	WalSegSz;
+extern DataDirSyncMethod sync_method;
 
 /* Target history */
 extern TimeLineHistoryEntry *targetHistory;

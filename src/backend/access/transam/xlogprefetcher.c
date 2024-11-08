@@ -3,7 +3,7 @@
  * xlogprefetcher.c
  *		Prefetching support for recovery.
  *
- * Portions Copyright (c) 2022-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2022-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -27,25 +27,21 @@
 
 #include "postgres.h"
 
-#include "access/xlog.h"
 #include "access/xlogprefetcher.h"
 #include "access/xlogreader.h"
-#include "access/xlogutils.h"
-#include "catalog/pg_class.h"
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "commands/dbcommands_xlog.h"
-#include "utils/fmgrprotos.h"
-#include "utils/timestamp.h"
 #include "funcapi.h"
-#include "pgstat.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/bufmgr.h"
 #include "storage/shmem.h"
 #include "storage/smgr.h"
+#include "utils/fmgrprotos.h"
 #include "utils/guc_hooks.h"
 #include "utils/hsearch.h"
+#include "utils/timestamp.h"
 
 /*
  * Every time we process this much WAL, we'll update the values in
@@ -88,7 +84,7 @@ typedef enum
 {
 	LRQ_NEXT_NO_IO,
 	LRQ_NEXT_IO,
-	LRQ_NEXT_AGAIN
+	LRQ_NEXT_AGAIN,
 } LsnReadQueueNextStatus;
 
 /*
@@ -366,17 +362,15 @@ XLogPrefetcher *
 XLogPrefetcherAllocate(XLogReaderState *reader)
 {
 	XLogPrefetcher *prefetcher;
-	static HASHCTL hash_table_ctl = {
-		.keysize = sizeof(RelFileLocator),
-		.entrysize = sizeof(XLogPrefetcherFilter)
-	};
+	HASHCTL		ctl;
 
 	prefetcher = palloc0(sizeof(XLogPrefetcher));
-
 	prefetcher->reader = reader;
+
+	ctl.keysize = sizeof(RelFileLocator);
+	ctl.entrysize = sizeof(XLogPrefetcherFilter);
 	prefetcher->filter_table = hash_create("XLogPrefetcherFilterTable", 1024,
-										   &hash_table_ctl,
-										   HASH_ELEM | HASH_BLOBS);
+										   &ctl, HASH_ELEM | HASH_BLOBS);
 	dlist_init(&prefetcher->filter_queue);
 
 	SharedStats->wal_distance = 0;
@@ -457,9 +451,9 @@ XLogPrefetcherComputeStats(XLogPrefetcher *prefetcher)
  * *lsn, and the I/O will be considered to have completed once that LSN is
  * replayed.
  *
- * Returns LRQ_NO_IO if we examined the next block reference and found that it
- * was already in the buffer pool, or we decided for various reasons not to
- * prefetch.
+ * Returns LRQ_NEXT_NO_IO if we examined the next block reference and found
+ * that it was already in the buffer pool, or we decided for various reasons
+ * not to prefetch.
  */
 static LsnReadQueueNextStatus
 XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
@@ -569,7 +563,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 				if (record_type == XLOG_DBASE_CREATE_FILE_COPY)
 				{
 					xl_dbase_create_file_copy_rec *xlrec =
-					(xl_dbase_create_file_copy_rec *) record->main_data;
+						(xl_dbase_create_file_copy_rec *) record->main_data;
 					RelFileLocator rlocator =
 					{InvalidOid, xlrec->db_id, InvalidRelFileNumber};
 
@@ -596,7 +590,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 				if (record_type == XLOG_SMGR_CREATE)
 				{
 					xl_smgr_create *xlrec = (xl_smgr_create *)
-					record->main_data;
+						record->main_data;
 
 					if (xlrec->forkNum == MAIN_FORKNUM)
 					{
@@ -624,7 +618,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 				else if (record_type == XLOG_SMGR_TRUNCATE)
 				{
 					xl_smgr_truncate *xlrec = (xl_smgr_truncate *)
-					record->main_data;
+						record->main_data;
 
 					/*
 					 * Don't consider prefetching anything in the truncated
@@ -722,7 +716,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 			 * same relation (with some scheme to handle invalidations
 			 * safely), but for now we'll call smgropen() every time.
 			 */
-			reln = smgropen(block->rlocator, InvalidBackendId);
+			reln = smgropen(block->rlocator, INVALID_PROC_NUMBER);
 
 			/*
 			 * If the relation file doesn't exist on disk, for example because
@@ -785,7 +779,7 @@ XLogPrefetcherNextBlock(uintptr_t pgsr_private, XLogRecPtr *lsn)
 				block->prefetch_buffer = InvalidBuffer;
 				return LRQ_NEXT_IO;
 			}
-			else
+			else if ((io_direct_flags & IO_DIRECT_DATA) == 0)
 			{
 				/*
 				 * This shouldn't be possible, because we already determined
@@ -1089,7 +1083,7 @@ check_recovery_prefetch(int *new_value, void **extra, GucSource source)
 #ifndef USE_PREFETCH
 	if (*new_value == RECOVERY_PREFETCH_ON)
 	{
-		GUC_check_errdetail("recovery_prefetch is not supported on platforms that lack posix_fadvise().");
+		GUC_check_errdetail("\"recovery_prefetch\" is not supported on platforms that lack support for issuing read-ahead advice.");
 		return false;
 	}
 #endif

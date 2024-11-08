@@ -5,7 +5,7 @@
 #
 # Module to set up an LDAP server for testing pg_hba.conf ldap authentication
 #
-# Copyright (c) 2023, PostgreSQL Global Development Group
+# Copyright (c) 2023-2024, PostgreSQL Global Development Group
 #
 ############################################################################
 
@@ -19,7 +19,7 @@ LdapServer - class for an LDAP server for testing pg_hba.conf authentication
 
   use LdapServer;
 
-  # have we found openldap binaies suitable for setting up a server?
+  # have we found openldap binaries suitable for setting up a server?
   my $ldap_binaries_found = $LdapServer::setup;
 
   # create a server with the given root password and auth type
@@ -46,7 +46,7 @@ LdapServer - class for an LDAP server for testing pg_hba.conf authentication
 package LdapServer;
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -57,55 +57,97 @@ use File::Basename;
 # private variables
 my ($slapd, $ldap_schema_dir, @servers);
 
-# visible variable
-our ($setup);
+# visible variables
+our ($setup, $setup_error);
 
 INIT
 {
+	# Find the OpenLDAP server binary and directory containing schema
+	# definition files.  On success, $setup is set to 1. On failure,
+	# it's set to 0, and an error message is set in $setup_error.
 	$setup = 1;
-	if ($^O eq 'darwin' && -d '/opt/homebrew/opt/openldap')
+	if ($^O eq 'darwin')
 	{
-		# typical paths for Homebrew on ARM
-		$slapd           = '/opt/homebrew/opt/openldap/libexec/slapd';
-		$ldap_schema_dir = '/opt/homebrew/etc/openldap/schema';
-	}
-	elsif ($^O eq 'darwin' && -d '/usr/local/opt/openldap')
-	{
-		# typical paths for Homebrew on Intel
-		$slapd           = '/usr/local/opt/openldap/libexec/slapd';
-		$ldap_schema_dir = '/usr/local/etc/openldap/schema';
-	}
-	elsif ($^O eq 'darwin' && -d '/opt/local/etc/openldap')
-	{
-		# typical paths for MacPorts
-		$slapd           = '/opt/local/libexec/slapd';
-		$ldap_schema_dir = '/opt/local/etc/openldap/schema';
+		if (-d '/opt/homebrew/opt/openldap')
+		{
+			# typical paths for Homebrew on ARM
+			$slapd = '/opt/homebrew/opt/openldap/libexec/slapd';
+			$ldap_schema_dir = '/opt/homebrew/etc/openldap/schema';
+		}
+		elsif (-d '/usr/local/opt/openldap')
+		{
+			# typical paths for Homebrew on Intel
+			$slapd = '/usr/local/opt/openldap/libexec/slapd';
+			$ldap_schema_dir = '/usr/local/etc/openldap/schema';
+		}
+		elsif (-d '/opt/local/etc/openldap')
+		{
+			# typical paths for MacPorts
+			$slapd = '/opt/local/libexec/slapd';
+			$ldap_schema_dir = '/opt/local/etc/openldap/schema';
+		}
+		else
+		{
+			$setup_error = "OpenLDAP server installation not found";
+			$setup = 0;
+		}
 	}
 	elsif ($^O eq 'linux')
 	{
-		$slapd           = '/usr/sbin/slapd';
-		$ldap_schema_dir = '/etc/ldap/schema' if -d '/etc/ldap/schema';
-		$ldap_schema_dir = '/etc/openldap/schema'
-		  if -d '/etc/openldap/schema';
+		if (-d '/etc/ldap/schema')
+		{
+			$slapd = '/usr/sbin/slapd';
+			$ldap_schema_dir = '/etc/ldap/schema';
+		}
+		elsif (-d '/etc/openldap/schema')
+		{
+			$slapd = '/usr/sbin/slapd';
+			$ldap_schema_dir = '/etc/openldap/schema';
+		}
+		else
+		{
+			$setup_error = "OpenLDAP server installation not found";
+			$setup = 0;
+		}
 	}
 	elsif ($^O eq 'freebsd')
 	{
-		$slapd           = '/usr/local/libexec/slapd';
-		$ldap_schema_dir = '/usr/local/etc/openldap/schema';
+		if (-d '/usr/local/etc/openldap/schema')
+		{
+			$slapd = '/usr/local/libexec/slapd';
+			$ldap_schema_dir = '/usr/local/etc/openldap/schema';
+		}
+		else
+		{
+			$setup_error = "OpenLDAP server installation not found";
+			$setup = 0;
+		}
 	}
 	elsif ($^O eq 'openbsd')
 	{
-		$slapd           = '/usr/local/libexec/slapd';
-		$ldap_schema_dir = '/usr/local/share/examples/openldap/schema';
+		if (-d '/usr/local/share/examples/openldap/schema')
+		{
+			$slapd = '/usr/local/libexec/slapd';
+			$ldap_schema_dir = '/usr/local/share/examples/openldap/schema';
+		}
+		else
+		{
+			$setup_error = "OpenLDAP server installation not found";
+			$setup = 0;
+		}
 	}
 	else
 	{
+		$setup_error = "ldap tests not supported on $^O";
 		$setup = 0;
 	}
 }
 
 END
 {
+	# take care not to change the script's exit value
+	my $exit_code = $?;
+
 	foreach my $server (@servers)
 	{
 		next unless -f $server->{pidfile};
@@ -113,6 +155,8 @@ END
 		chomp $pid;
 		kill 'INT', $pid;
 	}
+
+	$? = $exit_code;
 }
 
 =pod
@@ -137,25 +181,25 @@ sub new
 {
 	die "no suitable binaries found" unless $setup;
 
-	my $class    = shift;
-	my $rootpw   = shift;
-	my $authtype = shift;                          # 'users' or 'anonymous'
+	my $class = shift;
+	my $rootpw = shift;
+	my $authtype = shift;    # 'users' or 'anonymous'
 	my $testname = basename((caller)[1], '.pl');
-	my $self     = {};
+	my $self = {};
 
 	my $test_temp = PostgreSQL::Test::Utils::tempdir("ldap-$testname");
 
-	my $ldap_datadir  = "$test_temp/openldap-data";
-	my $slapd_certs   = "$test_temp/slapd-certs";
+	my $ldap_datadir = "$test_temp/openldap-data";
+	my $slapd_certs = "$test_temp/slapd-certs";
 	my $slapd_pidfile = "$test_temp/slapd.pid";
-	my $slapd_conf    = "$test_temp/slapd.conf";
+	my $slapd_conf = "$test_temp/slapd.conf";
 	my $slapd_logfile =
 	  "${PostgreSQL::Test::Utils::log_path}/slapd-$testname.log";
 	my $ldap_server = 'localhost';
-	my $ldap_port   = PostgreSQL::Test::Cluster::get_free_port();
-	my $ldaps_port  = PostgreSQL::Test::Cluster::get_free_port();
-	my $ldap_url    = "ldap://$ldap_server:$ldap_port";
-	my $ldaps_url   = "ldaps://$ldap_server:$ldaps_port";
+	my $ldap_port = PostgreSQL::Test::Cluster::get_free_port();
+	my $ldaps_port = PostgreSQL::Test::Cluster::get_free_port();
+	my $ldap_url = "ldap://$ldap_server:$ldap_port";
+	my $ldaps_url = "ldaps://$ldap_server:$ldaps_port";
 	my $ldap_basedn = 'dc=example,dc=net';
 	my $ldap_rootdn = 'cn=Manager,dc=example,dc=net';
 	my $ldap_rootpw = $rootpw;
@@ -188,7 +232,7 @@ EOC
 	append_to_file($slapd_conf, $conf);
 
 	mkdir $ldap_datadir or die "making $ldap_datadir: $!";
-	mkdir $slapd_certs  or die "making $slapd_certs: $!";
+	mkdir $slapd_certs or die "making $slapd_certs: $!";
 
 	my $certdir = dirname(__FILE__) . "/../ssl/ssl";
 
@@ -204,7 +248,9 @@ EOC
 	append_to_file($ldap_pwfile, $ldap_rootpw);
 	chmod 0600, $ldap_pwfile or die "chmod on $ldap_pwfile";
 
-	system_or_bail $slapd, '-f', $slapd_conf, '-h', "$ldap_url $ldaps_url";
+	# -s0 prevents log messages ending up in syslog
+	system_or_bail $slapd, '-f', $slapd_conf, '-s0', '-h',
+	  "$ldap_url $ldaps_url";
 
 	# wait until slapd accepts requests
 	my $retries = 0;
@@ -214,25 +260,25 @@ EOC
 		  if (
 			system_log(
 				"ldapsearch", "-sbase",
-				"-H",         $ldap_url,
-				"-b",         $ldap_basedn,
-				"-D",         $ldap_rootdn,
-				"-y",         $ldap_pwfile,
-				"-n",         "'objectclass=*'") == 0);
+				"-H", $ldap_url,
+				"-b", $ldap_basedn,
+				"-D", $ldap_rootdn,
+				"-y", $ldap_pwfile,
+				"-n", "'objectclass=*'") == 0);
 		die "cannot connect to slapd" if ++$retries >= 300;
 		note "waiting for slapd to accept requests...";
 		Time::HiRes::usleep(1000000);
 	}
 
 	$self->{pidfile} = $slapd_pidfile;
-	$self->{pwfile}  = $ldap_pwfile;
-	$self->{url}     = $ldap_url;
-	$self->{s_url}   = $ldaps_url;
-	$self->{server}  = $ldap_server;
-	$self->{port}    = $ldap_port;
-	$self->{s_port}  = $ldaps_port;
-	$self->{basedn}  = $ldap_basedn;
-	$self->{rootdn}  = $ldap_rootdn;
+	$self->{pwfile} = $ldap_pwfile;
+	$self->{url} = $ldap_url;
+	$self->{s_url} = $ldaps_url;
+	$self->{server} = $ldap_server;
+	$self->{port} = $ldap_port;
+	$self->{s_port} = $ldaps_port;
+	$self->{basedn} = $ldap_basedn;
+	$self->{rootdn} = $ldap_rootdn;
 
 	bless $self, $class;
 	push @servers, $self;
@@ -243,8 +289,8 @@ EOC
 sub _ldapenv
 {
 	my $self = shift;
-	my %env  = %ENV;
-	$env{'LDAPURI'}    = $self->{url};
+	my %env = %ENV;
+	$env{'LDAPURI'} = $self->{url};
 	$env{'LDAPBINDDN'} = $self->{rootdn};
 	return %env;
 }
@@ -253,7 +299,7 @@ sub _ldapenv
 
 =over
 
-=item ldap_add(filename)
+=item ldapadd_file(filename)
 
 filename is the path to a file containing LDIF data which is added to the LDAP
 server.
@@ -286,8 +332,8 @@ Set the user's password in the LDAP server
 
 sub ldapsetpw
 {
-	my $self     = shift;
-	my $user     = shift;
+	my $self = shift;
+	my $user = shift;
 	my $password = shift;
 
 	local %ENV = $self->_ldapenv;

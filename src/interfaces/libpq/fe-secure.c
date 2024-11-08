@@ -6,7 +6,7 @@
  *	  message integrity and endpoint authentication.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,12 +35,10 @@
 
 #include <sys/stat.h>
 
-#ifdef ENABLE_THREAD_SAFETY
 #ifdef WIN32
 #include "pthread-win32.h"
 #else
 #include <pthread.h>
-#endif
 #endif
 
 #include "fe-auth.h"
@@ -55,8 +53,6 @@
 #ifndef WIN32
 
 #define SIGPIPE_MASKED(conn)	((conn)->sigpipe_so || (conn)->sigpipe_flag)
-
-#ifdef ENABLE_THREAD_SAFETY
 
 struct sigpipe_info
 {
@@ -90,24 +86,6 @@ struct sigpipe_info
 			pq_reset_sigpipe(&(spinfo).oldsigmask, (spinfo).sigpipe_pending, \
 							 (spinfo).got_epipe); \
 	} while (0)
-#else							/* !ENABLE_THREAD_SAFETY */
-
-#define DECLARE_SIGPIPE_INFO(spinfo) pqsigfunc spinfo = NULL
-
-#define DISABLE_SIGPIPE(conn, spinfo, failaction) \
-	do { \
-		if (!SIGPIPE_MASKED(conn)) \
-			spinfo = pqsignal(SIGPIPE, SIG_IGN); \
-	} while (0)
-
-#define REMEMBER_EPIPE(spinfo, cond)
-
-#define RESTORE_SIGPIPE(conn, spinfo) \
-	do { \
-		if (!SIGPIPE_MASKED(conn)) \
-			pqsignal(SIGPIPE, spinfo); \
-	} while (0)
-#endif							/* ENABLE_THREAD_SAFETY */
 #else							/* WIN32 */
 
 #define DECLARE_SIGPIPE_INFO(spinfo)
@@ -130,42 +108,27 @@ PQsslInUse(PGconn *conn)
 }
 
 /*
- *	Exported function to allow application to tell us it's already
- *	initialized OpenSSL.
+ *	Exported function to allow application to tell us it's already initialized
+ *	OpenSSL.  Since OpenSSL 1.1.0 it is no longer required to explicitly
+ *	initialize libssl and libcrypto, so this is a no-op.  This function remains
+ *	for backwards API compatibility.
  */
 void
 PQinitSSL(int do_init)
 {
-#ifdef USE_SSL
-	pgtls_init_library(do_init, do_init);
-#endif
+	/* no-op */
 }
 
 /*
- *	Exported function to allow application to tell us it's already
- *	initialized OpenSSL and/or libcrypto.
+ *	Exported function to allow application to tell us it's already initialized
+ *	OpenSSL.  Since OpenSSL 1.1.0 it is no longer required to explicitly
+ *	initialize libssl and libcrypto, so this is a no-op.  This function remains
+ *	for backwards API compatibility.
  */
 void
 PQinitOpenSSL(int do_ssl, int do_crypto)
 {
-#ifdef USE_SSL
-	pgtls_init_library(do_ssl, do_crypto);
-#endif
-}
-
-/*
- *	Initialize global SSL context
- */
-int
-pqsecure_initialize(PGconn *conn, bool do_ssl, bool do_crypto)
-{
-	int			r = 0;
-
-#ifdef USE_SSL
-	r = pgtls_init(conn, do_ssl, do_crypto);
-#endif
-
-	return r;
+	/* no-op */
 }
 
 /*
@@ -233,6 +196,8 @@ pqsecure_raw_read(PGconn *conn, void *ptr, size_t len)
 	int			result_errno = 0;
 	char		sebuf[PG_STRERROR_R_BUFLEN];
 
+	SOCK_ERRNO_SET(0);
+
 	n = recv(conn->sock, ptr, len, 0);
 
 	if (n < 0)
@@ -255,14 +220,19 @@ pqsecure_raw_read(PGconn *conn, void *ptr, size_t len)
 			case EPIPE:
 			case ECONNRESET:
 				libpq_append_conn_error(conn, "server closed the connection unexpectedly\n"
-								   "\tThis probably means the server terminated abnormally\n"
-								   "\tbefore or while processing the request.");
+										"\tThis probably means the server terminated abnormally\n"
+										"\tbefore or while processing the request.");
+				break;
+
+			case 0:
+				/* If errno didn't get set, treat it as regular EOF */
+				n = 0;
 				break;
 
 			default:
 				libpq_append_conn_error(conn, "could not receive data from server: %s",
-								  SOCK_STRERROR(result_errno,
-												sebuf, sizeof(sebuf)));
+										SOCK_STRERROR(result_errno,
+													  sebuf, sizeof(sebuf)));
 				break;
 		}
 	}
@@ -524,7 +494,7 @@ PQgssEncInUse(PGconn *conn)
 #endif							/* ENABLE_GSS */
 
 
-#if defined(ENABLE_THREAD_SAFETY) && !defined(WIN32)
+#if !defined(WIN32)
 
 /*
  *	Block SIGPIPE for this thread.  This prevents send()/write() from exiting
@@ -608,4 +578,4 @@ pq_reset_sigpipe(sigset_t *osigset, bool sigpipe_pending, bool got_epipe)
 	SOCK_ERRNO_SET(save_errno);
 }
 
-#endif							/* ENABLE_THREAD_SAFETY && !WIN32 */
+#endif							/* !WIN32 */

@@ -28,7 +28,7 @@
  * all these files commit in a single map file update rather than being tied
  * to transaction commit.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -46,7 +46,6 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
-#include "catalog/catalog.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/storage.h"
 #include "miscadmin.h"
@@ -303,14 +302,15 @@ RelationMapCopy(Oid dbid, Oid tsid, char *srcdbpath, char *dstdbpath)
 	 * Write the same data into the destination database's relmap file.
 	 *
 	 * No sinval is needed because no one can be connected to the destination
-	 * database yet. For the same reason, there is no need to acquire
-	 * RelationMappingLock.
+	 * database yet.
 	 *
 	 * There's no point in trying to preserve files here. The new database
 	 * isn't usable yet anyway, and won't ever be if we can't install a relmap
 	 * file.
 	 */
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
 	write_relmap_file(&map, true, false, false, dbid, tsid, dstdbpath);
+	LWLockRelease(RelationMappingLock);
 }
 
 /*
@@ -633,10 +633,12 @@ RelationMapFinishBootstrap(void)
 	Assert(pending_local_updates.num_mappings == 0);
 
 	/* Write the files; no WAL or sinval needed */
+	LWLockAcquire(RelationMappingLock, LW_EXCLUSIVE);
 	write_relmap_file(&shared_map, false, false, false,
 					  InvalidOid, GLOBALTABLESPACE_OID, "global");
 	write_relmap_file(&local_map, false, false, false,
 					  MyDatabaseId, MyDatabaseTableSpace, DatabasePath);
+	LWLockRelease(RelationMappingLock);
 }
 
 /*
@@ -801,11 +803,11 @@ read_relmap_file(RelMapFile *map, char *dbpath, bool lock_held, int elevel)
 	/*
 	 * Open the target file.
 	 *
-	 * Because Windows isn't happy about the idea of renaming over a file
-	 * that someone has open, we only open this file after acquiring the lock,
-	 * and for the same reason, we close it before releasing the lock. That
-	 * way, by the time write_relmap_file() acquires an exclusive lock, no
-	 * one else will have it open.
+	 * Because Windows isn't happy about the idea of renaming over a file that
+	 * someone has open, we only open this file after acquiring the lock, and
+	 * for the same reason, we close it before releasing the lock. That way,
+	 * by the time write_relmap_file() acquires an exclusive lock, no one else
+	 * will have it open.
 	 */
 	snprintf(mapfilename, sizeof(mapfilename), "%s/%s", dbpath,
 			 RELMAPPER_FILENAME);
@@ -890,6 +892,15 @@ write_relmap_file(RelMapFile *newmap, bool write_wal, bool send_sinval,
 	int			fd;
 	char		mapfilename[MAXPGPATH];
 	char		maptempfilename[MAXPGPATH];
+
+	/*
+	 * Even without concurrent use of this map, CheckPointRelationMap() relies
+	 * on this locking.  Without it, a restore of a base backup taken after
+	 * this function's XLogInsert() and before its durable_rename() would not
+	 * have the changes.  wal_level=minimal doesn't need the lock, but this
+	 * isn't performance-critical enough for such a micro-optimization.
+	 */
+	Assert(LWLockHeldByMeInMode(RelationMappingLock, LW_EXCLUSIVE));
 
 	/*
 	 * Fill in the overhead fields and update CRC.

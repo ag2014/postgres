@@ -3,7 +3,7 @@
  * xactdesc.c
  *	  rmgr descriptor routines for access/transam/xact.c
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,7 +25,7 @@
  * Parse the WAL format of an xact commit and abort records into an easier to
  * understand format.
  *
- * This routines are in xactdesc.c because they're accessed in backend (when
+ * These routines are in xactdesc.c because they're accessed in backend (when
  * replaying WAL) and frontend (pg_waldump) code. This file is the only xact
  * specific one shared between both. They're complicated enough that
  * duplication would be bothersome.
@@ -319,10 +319,13 @@ xact_desc_stats(StringInfo buf, const char *label,
 		appendStringInfo(buf, "; %sdropped stats:", label);
 		for (i = 0; i < ndropped; i++)
 		{
-			appendStringInfo(buf, " %d/%u/%u",
+			uint64		objid =
+				((uint64) dropped_stats[i].objid_hi) << 32 | dropped_stats[i].objid_lo;
+
+			appendStringInfo(buf, " %d/%u/%llu",
 							 dropped_stats[i].kind,
 							 dropped_stats[i].dboid,
-							 dropped_stats[i].objoid);
+							 (unsigned long long) objid);
 		}
 	}
 }

@@ -5,7 +5,7 @@
  *
  * Author: Magnus Hagander <magnus@hagander.net>
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/receivelog.c
@@ -19,7 +19,6 @@
 #include <unistd.h>
 
 #include "access/xlog_internal.h"
-#include "common/file_utils.h"
 #include "common/logging.h"
 #include "libpq-fe.h"
 #include "receivelog.h"

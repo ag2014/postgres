@@ -1,7 +1,12 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 fe_utils_sources = files(
   'archive.c',
+  'astreamer_file.c',
+  'astreamer_gzip.c',
+  'astreamer_lz4.c',
+  'astreamer_tar.c',
+  'astreamer_zstd.c',
   'cancel.c',
   'conditional.c',
   'connect_utils.c',

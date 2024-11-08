@@ -5,7 +5,7 @@
  * Assorted utility functions to work on files.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/common/file_utils.c
@@ -28,6 +28,7 @@
 #ifdef FRONTEND
 #include "common/logging.h"
 #endif
+#include "common/relpath.h"
 #include "port/pg_iovec.h"
 
 #ifdef FRONTEND
@@ -51,19 +52,52 @@ static void walkdir(const char *path,
 					int (*action) (const char *fname, bool isdir),
 					bool process_symlinks);
 
+#ifdef HAVE_SYNCFS
+
 /*
- * Issue fsync recursively on PGDATA and all its contents.
+ * do_syncfs -- Try to syncfs a file system
  *
- * We fsync regular files and directories wherever they are, but we follow
+ * Reports errors trying to open the path.  syncfs() errors are fatal.
+ */
+static void
+do_syncfs(const char *path)
+{
+	int			fd;
+
+	fd = open(path, O_RDONLY, 0);
+
+	if (fd < 0)
+	{
+		pg_log_error("could not open file \"%s\": %m", path);
+		return;
+	}
+
+	if (syncfs(fd) < 0)
+	{
+		pg_log_error("could not synchronize file system for file \"%s\": %m", path);
+		(void) close(fd);
+		exit(EXIT_FAILURE);
+	}
+
+	(void) close(fd);
+}
+
+#endif							/* HAVE_SYNCFS */
+
+/*
+ * Synchronize PGDATA and all its contents.
+ *
+ * We sync regular files and directories wherever they are, but we follow
  * symlinks only for pg_wal (or pg_xlog) and immediately under pg_tblspc.
  * Other symlinks are presumed to point at files we're not responsible for
- * fsyncing, and might not have privileges to write at all.
+ * syncing, and might not have privileges to write at all.
  *
- * serverVersion indicates the version of the server to be fsync'd.
+ * serverVersion indicates the version of the server to be sync'd.
  */
 void
-fsync_pgdata(const char *pg_data,
-			 int serverVersion)
+sync_pgdata(const char *pg_data,
+			int serverVersion,
+			DataDirSyncMethod sync_method)
 {
 	bool		xlog_is_symlink;
 	char		pg_wal[MAXPGPATH];
@@ -72,7 +106,7 @@ fsync_pgdata(const char *pg_data,
 	/* handle renaming of pg_xlog to pg_wal in post-10 clusters */
 	snprintf(pg_wal, MAXPGPATH, "%s/%s", pg_data,
 			 serverVersion < MINIMUM_VERSION_FOR_PG_WAL ? "pg_xlog" : "pg_wal");
-	snprintf(pg_tblspc, MAXPGPATH, "%s/pg_tblspc", pg_data);
+	snprintf(pg_tblspc, MAXPGPATH, "%s/%s", pg_data, PG_TBLSPC_DIR);
 
 	/*
 	 * If pg_wal is a symlink, we'll need to recurse into it separately,
@@ -89,49 +123,135 @@ fsync_pgdata(const char *pg_data,
 			xlog_is_symlink = true;
 	}
 
-	/*
-	 * If possible, hint to the kernel that we're soon going to fsync the data
-	 * directory and its contents.
-	 */
+	switch (sync_method)
+	{
+		case DATA_DIR_SYNC_METHOD_SYNCFS:
+			{
+#ifndef HAVE_SYNCFS
+				pg_log_error("this build does not support sync method \"%s\"",
+							 "syncfs");
+				exit(EXIT_FAILURE);
+#else
+				DIR		   *dir;
+				struct dirent *de;
+
+				/*
+				 * On Linux, we don't have to open every single file one by
+				 * one.  We can use syncfs() to sync whole filesystems.  We
+				 * only expect filesystem boundaries to exist where we
+				 * tolerate symlinks, namely pg_wal and the tablespaces, so we
+				 * call syncfs() for each of those directories.
+				 */
+
+				/* Sync the top level pgdata directory. */
+				do_syncfs(pg_data);
+
+				/* If any tablespaces are configured, sync each of those. */
+				dir = opendir(pg_tblspc);
+				if (dir == NULL)
+					pg_log_error("could not open directory \"%s\": %m",
+								 pg_tblspc);
+				else
+				{
+					while (errno = 0, (de = readdir(dir)) != NULL)
+					{
+						char		subpath[MAXPGPATH * 2];
+
+						if (strcmp(de->d_name, ".") == 0 ||
+							strcmp(de->d_name, "..") == 0)
+							continue;
+
+						snprintf(subpath, sizeof(subpath), "%s/%s",
+								 pg_tblspc, de->d_name);
+						do_syncfs(subpath);
+					}
+
+					if (errno)
+						pg_log_error("could not read directory \"%s\": %m",
+									 pg_tblspc);
+
+					(void) closedir(dir);
+				}
+
+				/* If pg_wal is a symlink, process that too. */
+				if (xlog_is_symlink)
+					do_syncfs(pg_wal);
+#endif							/* HAVE_SYNCFS */
+			}
+			break;
+
+		case DATA_DIR_SYNC_METHOD_FSYNC:
+			{
+				/*
+				 * If possible, hint to the kernel that we're soon going to
+				 * fsync the data directory and its contents.
+				 */
 #ifdef PG_FLUSH_DATA_WORKS
-	walkdir(pg_data, pre_sync_fname, false);
-	if (xlog_is_symlink)
-		walkdir(pg_wal, pre_sync_fname, false);
-	walkdir(pg_tblspc, pre_sync_fname, true);
+				walkdir(pg_data, pre_sync_fname, false);
+				if (xlog_is_symlink)
+					walkdir(pg_wal, pre_sync_fname, false);
+				walkdir(pg_tblspc, pre_sync_fname, true);
 #endif
 
-	/*
-	 * Now we do the fsync()s in the same order.
-	 *
-	 * The main call ignores symlinks, so in addition to specially processing
-	 * pg_wal if it's a symlink, pg_tblspc has to be visited separately with
-	 * process_symlinks = true.  Note that if there are any plain directories
-	 * in pg_tblspc, they'll get fsync'd twice.  That's not an expected case
-	 * so we don't worry about optimizing it.
-	 */
-	walkdir(pg_data, fsync_fname, false);
-	if (xlog_is_symlink)
-		walkdir(pg_wal, fsync_fname, false);
-	walkdir(pg_tblspc, fsync_fname, true);
+				/*
+				 * Now we do the fsync()s in the same order.
+				 *
+				 * The main call ignores symlinks, so in addition to specially
+				 * processing pg_wal if it's a symlink, pg_tblspc has to be
+				 * visited separately with process_symlinks = true.  Note that
+				 * if there are any plain directories in pg_tblspc, they'll
+				 * get fsync'd twice. That's not an expected case so we don't
+				 * worry about optimizing it.
+				 */
+				walkdir(pg_data, fsync_fname, false);
+				if (xlog_is_symlink)
+					walkdir(pg_wal, fsync_fname, false);
+				walkdir(pg_tblspc, fsync_fname, true);
+			}
+			break;
+	}
 }
 
 /*
- * Issue fsync recursively on the given directory and all its contents.
+ * Synchronize the given directory and all its contents.
  *
- * This is a convenient wrapper on top of walkdir().
+ * This is a convenient wrapper on top of walkdir() and do_syncfs().
  */
 void
-fsync_dir_recurse(const char *dir)
+sync_dir_recurse(const char *dir, DataDirSyncMethod sync_method)
 {
-	/*
-	 * If possible, hint to the kernel that we're soon going to fsync the data
-	 * directory and its contents.
-	 */
+	switch (sync_method)
+	{
+		case DATA_DIR_SYNC_METHOD_SYNCFS:
+			{
+#ifndef HAVE_SYNCFS
+				pg_log_error("this build does not support sync method \"%s\"",
+							 "syncfs");
+				exit(EXIT_FAILURE);
+#else
+				/*
+				 * On Linux, we don't have to open every single file one by
+				 * one.  We can use syncfs() to sync the whole filesystem.
+				 */
+				do_syncfs(dir);
+#endif							/* HAVE_SYNCFS */
+			}
+			break;
+
+		case DATA_DIR_SYNC_METHOD_FSYNC:
+			{
+				/*
+				 * If possible, hint to the kernel that we're soon going to
+				 * fsync the data directory and its contents.
+				 */
 #ifdef PG_FLUSH_DATA_WORKS
-	walkdir(dir, pre_sync_fname, false);
+				walkdir(dir, pre_sync_fname, false);
 #endif
 
-	walkdir(dir, fsync_fname, false);
+				walkdir(dir, fsync_fname, false);
+			}
+			break;
+	}
 }
 
 /*
@@ -463,6 +583,52 @@ get_dirent_type(const char *path,
 }
 
 /*
+ * Compute what remains to be done after a possibly partial vectored read or
+ * write.  The part of 'source' beginning after 'transferred' bytes is copied
+ * to 'destination', and its length is returned.  'source' and 'destination'
+ * may point to the same array, for in-place adjustment.  A return value of
+ * zero indicates completion (for callers without a cheaper way to know that).
+ */
+int
+compute_remaining_iovec(struct iovec *destination,
+						const struct iovec *source,
+						int iovcnt,
+						size_t transferred)
+{
+	Assert(iovcnt > 0);
+
+	/* Skip wholly transferred iovecs. */
+	while (source->iov_len <= transferred)
+	{
+		transferred -= source->iov_len;
+		source++;
+		iovcnt--;
+
+		/* All iovecs transferred? */
+		if (iovcnt == 0)
+		{
+			/*
+			 * We don't expect the kernel to transfer more than we asked it
+			 * to, or something is out of sync.
+			 */
+			Assert(transferred == 0);
+			return 0;
+		}
+	}
+
+	/* Copy the remaining iovecs to the front of the array. */
+	if (source != destination)
+		memmove(destination, source, sizeof(*source) * iovcnt);
+
+	/* Adjust leading iovec, which may have been partially transferred. */
+	Assert(destination->iov_len > transferred);
+	destination->iov_base = (char *) destination->iov_base + transferred;
+	destination->iov_len -= transferred;
+
+	return iovcnt;
+}
+
+/*
  * pg_pwritev_with_retry
  *
  * Convenience wrapper for pg_pwritev() that retries on partial write.  If an
@@ -482,7 +648,7 @@ pg_pwritev_with_retry(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 		return -1;
 	}
 
-	for (;;)
+	do
 	{
 		/* Write as much as we can. */
 		part = pg_pwritev(fd, iov, iovcnt, offset);
@@ -497,33 +663,14 @@ pg_pwritev_with_retry(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 		sum += part;
 		offset += part;
 
-		/* Step over iovecs that are done. */
-		while (iovcnt > 0 && iov->iov_len <= part)
-		{
-			part -= iov->iov_len;
-			++iov;
-			--iovcnt;
-		}
-
-		/* Are they all done? */
-		if (iovcnt == 0)
-		{
-			/* We don't expect the kernel to write more than requested. */
-			Assert(part == 0);
-			break;
-		}
-
 		/*
-		 * Move whatever's left to the front of our mutable copy and adjust
-		 * the leading iovec.
+		 * See what is left.  On the first loop we used the caller's array,
+		 * but in later loops we'll use our local copy that we are allowed to
+		 * mutate.
 		 */
-		Assert(iovcnt > 0);
-		memmove(iov_copy, iov, sizeof(*iov) * iovcnt);
-		Assert(iov->iov_len > part);
-		iov_copy[0].iov_base = (char *) iov_copy[0].iov_base + part;
-		iov_copy[0].iov_len -= part;
+		iovcnt = compute_remaining_iovec(iov_copy, iov, iovcnt, part);
 		iov = iov_copy;
-	}
+	} while (iovcnt > 0);
 
 	return sum;
 }
@@ -531,68 +678,48 @@ pg_pwritev_with_retry(int fd, const struct iovec *iov, int iovcnt, off_t offset)
 /*
  * pg_pwrite_zeros
  *
- * Writes zeros to file worth "size" bytes, using vectored I/O.
+ * Writes zeros to file worth "size" bytes at "offset" (from the start of the
+ * file), using vectored I/O.
  *
  * Returns the total amount of data written.  On failure, a negative value
  * is returned with errno set.
  */
 ssize_t
-pg_pwrite_zeros(int fd, size_t size)
+pg_pwrite_zeros(int fd, size_t size, off_t offset)
 {
-	PGAlignedBlock zbuffer;		/* worth BLCKSZ */
-	size_t		zbuffer_sz;
+	static const PGIOAlignedBlock zbuffer = {{0}};	/* worth BLCKSZ */
+	void	   *zerobuf_addr = unconstify(PGIOAlignedBlock *, &zbuffer)->data;
 	struct iovec iov[PG_IOV_MAX];
-	int			blocks;
-	size_t		remaining_size = 0;
-	int			i;
-	ssize_t		written;
+	size_t		remaining_size = size;
 	ssize_t		total_written = 0;
 
-	zbuffer_sz = sizeof(zbuffer.data);
-
-	/* Zero-fill the buffer. */
-	memset(zbuffer.data, 0, zbuffer_sz);
-
-	/* Prepare to write out a lot of copies of our zero buffer at once. */
-	for (i = 0; i < lengthof(iov); ++i)
-	{
-		iov[i].iov_base = zbuffer.data;
-		iov[i].iov_len = zbuffer_sz;
-	}
-
 	/* Loop, writing as many blocks as we can for each system call. */
-	blocks = size / zbuffer_sz;
-	remaining_size = size % zbuffer_sz;
-	for (i = 0; i < blocks;)
+	while (remaining_size > 0)
 	{
-		int			iovcnt = Min(blocks - i, lengthof(iov));
-		off_t		offset = i * zbuffer_sz;
+		int			iovcnt = 0;
+		ssize_t		written;
+
+		for (; iovcnt < PG_IOV_MAX && remaining_size > 0; iovcnt++)
+		{
+			size_t		this_iov_size;
+
+			iov[iovcnt].iov_base = zerobuf_addr;
+
+			if (remaining_size < BLCKSZ)
+				this_iov_size = remaining_size;
+			else
+				this_iov_size = BLCKSZ;
+
+			iov[iovcnt].iov_len = this_iov_size;
+			remaining_size -= this_iov_size;
+		}
 
 		written = pg_pwritev_with_retry(fd, iov, iovcnt, offset);
 
 		if (written < 0)
 			return written;
 
-		i += iovcnt;
-		total_written += written;
-	}
-
-	/* Now, write the remaining size, if any, of the file with zeros. */
-	if (remaining_size > 0)
-	{
-		/* We'll never write more than one block here */
-		int			iovcnt = 1;
-
-		/* Jump on to the end of previously written blocks */
-		off_t		offset = i * zbuffer_sz;
-
-		iov[0].iov_len = remaining_size;
-
-		written = pg_pwritev_with_retry(fd, iov, iovcnt, offset);
-
-		if (written < 0)
-			return written;
-
+		offset += written;
 		total_written += written;
 	}
 

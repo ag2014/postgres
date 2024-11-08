@@ -4,7 +4,7 @@
  *	  Utility routines for the Postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -23,10 +23,9 @@
 #include "commands/vacuum.h"
 #include "miscadmin.h"
 #include "storage/indexfsm.h"
-#include "storage/lmgr.h"
-#include "storage/predicate.h"
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
+#include "utils/rel.h"
 #include "utils/typcache.h"
 
 
@@ -54,8 +53,10 @@ ginhandler(PG_FUNCTION_ARGS)
 	amroutine->amclusterable = false;
 	amroutine->ampredlocks = true;
 	amroutine->amcanparallel = false;
+	amroutine->amcanbuildparallel = false;
 	amroutine->amcaninclude = false;
 	amroutine->amusemaintenanceworkmem = true;
+	amroutine->amsummarizing = false;
 	amroutine->amparallelvacuumoptions =
 		VACUUM_OPTION_PARALLEL_BULKDEL | VACUUM_OPTION_PARALLEL_CLEANUP;
 	amroutine->amkeytype = InvalidOid;
@@ -63,10 +64,12 @@ ginhandler(PG_FUNCTION_ARGS)
 	amroutine->ambuild = ginbuild;
 	amroutine->ambuildempty = ginbuildempty;
 	amroutine->aminsert = gininsert;
+	amroutine->aminsertcleanup = NULL;
 	amroutine->ambulkdelete = ginbulkdelete;
 	amroutine->amvacuumcleanup = ginvacuumcleanup;
 	amroutine->amcanreturn = NULL;
 	amroutine->amcostestimate = gincostestimate;
+	amroutine->amgettreeheight = NULL;
 	amroutine->amoptions = ginoptions;
 	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = NULL;
@@ -298,7 +301,6 @@ Buffer
 GinNewBuffer(Relation index)
 {
 	Buffer		buffer;
-	bool		needLock;
 
 	/* First, try to get a page from FSM */
 	for (;;)
@@ -327,15 +329,8 @@ GinNewBuffer(Relation index)
 	}
 
 	/* Must extend the file */
-	needLock = !RELATION_IS_LOCAL(index);
-	if (needLock)
-		LockRelationForExtension(index, ExclusiveLock);
-
-	buffer = ReadBuffer(index, P_NEW);
-	LockBuffer(buffer, GIN_EXCLUSIVE);
-
-	if (needLock)
-		UnlockRelationForExtension(index, ExclusiveLock);
+	buffer = ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
+							   EB_LOCK_FIRST);
 
 	return buffer;
 }

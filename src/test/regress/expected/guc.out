@@ -6,6 +6,10 @@ SHOW datestyle;
  Postgres, MDY
 (1 row)
 
+-- Check output style of CamelCase enum options
+SET intervalstyle to 'asd';
+ERROR:  invalid value for parameter "IntervalStyle": "asd"
+HINT:  Available values: postgres, postgres_verbose, sql_standard, iso_8601.
 -- SET to some nondefault value
 SET vacuum_cost_delay TO 40;
 SET datestyle = 'ISO, YMD';
@@ -510,7 +514,7 @@ SELECT '2006-08-13 12:34:56'::timestamptz;
 SET seq_page_cost TO 'NaN';
 ERROR:  invalid value for parameter "seq_page_cost": "NaN"
 SET vacuum_cost_delay TO '10s';
-ERROR:  10000 ms is outside the valid range for parameter "vacuum_cost_delay" (0 .. 100)
+ERROR:  10000 ms is outside the valid range for parameter "vacuum_cost_delay" (0 ms .. 100 ms)
 SET no_such_variable TO 42;
 ERROR:  unrecognized configuration parameter "no_such_variable"
 -- Test "custom" GUCs created on the fly (which aren't really an
@@ -824,6 +828,27 @@ set default_with_oids to f;
 -- Should not allow to set it to true.
 set default_with_oids to t;
 ERROR:  tables declared WITH OIDS are not supported
+-- Test that disabling track_activities disables query ID reporting in
+-- pg_stat_activity.
+SET compute_query_id = on;
+SET track_activities = on;
+SELECT query_id IS NOT NULL AS qid_set FROM pg_stat_activity
+  WHERE pid = pg_backend_pid();
+ qid_set 
+---------
+ t
+(1 row)
+
+SET track_activities = off;
+SELECT query_id IS NOT NULL AS qid_set FROM pg_stat_activity
+  WHERE pid = pg_backend_pid();
+ qid_set 
+---------
+ f
+(1 row)
+
+RESET track_activities;
+RESET compute_query_id;
 -- Test GUC categories and flag patterns
 SELECT pg_settings_get_flags(NULL);
  pg_settings_get_flags 

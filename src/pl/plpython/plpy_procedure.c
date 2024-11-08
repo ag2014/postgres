@@ -7,18 +7,15 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
-#include "access/transam.h"
-#include "funcapi.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "funcapi.h"
 #include "plpy_elog.h"
 #include "plpy_main.h"
 #include "plpy_procedure.h"
 #include "plpython.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
-#include "utils/inval.h"
-#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 
@@ -183,6 +180,7 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger)
 		proc->fn_readonly = (procStruct->provolatile != PROVOLATILE_VOLATILE);
 		proc->is_setof = procStruct->proretset;
 		proc->is_procedure = (procStruct->prokind == PROKIND_PROCEDURE);
+		proc->is_trigger = is_trigger;
 		proc->src = NULL;
 		proc->argnames = NULL;
 		proc->args = NULL;
@@ -324,10 +322,8 @@ PLy_procedure_create(HeapTuple procTup, Oid fn_oid, bool is_trigger)
 		/*
 		 * get the text of the function.
 		 */
-		prosrcdatum = SysCacheGetAttr(PROCOID, procTup,
-									  Anum_pg_proc_prosrc, &isnull);
-		if (isnull)
-			elog(ERROR, "null prosrc");
+		prosrcdatum = SysCacheGetAttrNotNull(PROCOID, procTup,
+											 Anum_pg_proc_prosrc);
 		procSource = TextDatumGetCString(prosrcdatum);
 
 		PLy_procedure_compile(proc, procSource);

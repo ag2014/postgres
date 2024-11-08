@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Basic logical replication test
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -15,7 +15,7 @@ $node_publisher->start;
 
 # Create subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+$node_subscriber->init;
 $node_subscriber->start;
 
 # Create some preexisting content on publisher
@@ -57,6 +57,11 @@ $node_publisher->safe_psql('postgres',
 	"CREATE INDEX idx_no_replidentity_index ON tab_no_replidentity_index(c1)"
 );
 
+# Replicate the changes without columns
+$node_publisher->safe_psql('postgres', "CREATE TABLE tab_no_col()");
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO tab_no_col default VALUES");
+
 # Setup structure on subscriber
 $node_subscriber->safe_psql('postgres', "CREATE TABLE tab_notrep (a int)");
 $node_subscriber->safe_psql('postgres', "CREATE TABLE tab_ins (a int)");
@@ -87,13 +92,16 @@ $node_subscriber->safe_psql('postgres',
 	"CREATE INDEX idx_no_replidentity_index ON tab_no_replidentity_index(c1)"
 );
 
+# replication of the table without columns
+$node_subscriber->safe_psql('postgres', "CREATE TABLE tab_no_col()");
+
 # Setup logical replication
 my $publisher_connstr = $node_publisher->connstr . ' dbname=postgres';
 $node_publisher->safe_psql('postgres', "CREATE PUBLICATION tap_pub");
 $node_publisher->safe_psql('postgres',
 	"CREATE PUBLICATION tap_pub_ins_only WITH (publish = insert)");
 $node_publisher->safe_psql('postgres',
-	"ALTER PUBLICATION tap_pub ADD TABLE tab_rep, tab_full, tab_full2, tab_mixed, tab_include, tab_nothing, tab_full_pk, tab_no_replidentity_index"
+	"ALTER PUBLICATION tap_pub ADD TABLE tab_rep, tab_full, tab_full2, tab_mixed, tab_include, tab_nothing, tab_full_pk, tab_no_replidentity_index, tab_no_col"
 );
 $node_publisher->safe_psql('postgres',
 	"ALTER PUBLICATION tap_pub_ins_only ADD TABLE tab_ins");
@@ -141,6 +149,9 @@ $node_publisher->safe_psql('postgres', "UPDATE tab_include SET a = -a");
 $node_publisher->safe_psql('postgres',
 	"INSERT INTO tab_no_replidentity_index VALUES(1)");
 
+$node_publisher->safe_psql('postgres',
+	"INSERT INTO tab_no_col default VALUES");
+
 $node_publisher->wait_for_catchup('tap_sub');
 
 $result = $node_subscriber->safe_psql('postgres',
@@ -168,6 +179,10 @@ is( $node_subscriber->safe_psql(
 		'postgres', q(SELECT c1 FROM tab_no_replidentity_index)),
 	1,
 	"value replicated to subscriber without replica identity index");
+
+$result =
+  $node_subscriber->safe_psql('postgres', "SELECT count(*) FROM tab_no_col");
+is($result, qq(2), 'check replicated changes for table having no columns');
 
 # insert some duplicate rows
 $node_publisher->safe_psql('postgres',
@@ -233,7 +248,8 @@ $node_subscriber->safe_psql('postgres',
 );
 
 # Wait for initial table sync to finish
-$node_subscriber->wait_for_subscription_sync($node_publisher, 'tap_sub_temp1');
+$node_subscriber->wait_for_subscription_sync($node_publisher,
+	'tap_sub_temp1');
 
 # Subscriber table will have no rows initially
 $result =
@@ -315,13 +331,8 @@ is( $result, qq(1|bar
 2|baz),
 	'update works with REPLICA IDENTITY FULL and a primary key');
 
-# Check that subscriber handles cases where update/delete target tuple
-# is missing.  We have to look for the DEBUG1 log messages about that,
-# so temporarily bump up the log verbosity.
-$node_subscriber->append_conf('postgresql.conf', "log_min_messages = debug1");
-$node_subscriber->reload;
-
 $node_subscriber->safe_psql('postgres', "DELETE FROM tab_full_pk");
+$node_subscriber->safe_psql('postgres', "DELETE FROM tab_full WHERE a = 25");
 
 # Note that the current location of the log file is not grabbed immediately
 # after reloading the configuration, but after sending one SQL command to
@@ -330,16 +341,21 @@ my $log_location = -s $node_subscriber->logfile;
 
 $node_publisher->safe_psql('postgres',
 	"UPDATE tab_full_pk SET b = 'quux' WHERE a = 1");
+$node_publisher->safe_psql('postgres',
+	"UPDATE tab_full SET a = a + 1 WHERE a = 25");
 $node_publisher->safe_psql('postgres', "DELETE FROM tab_full_pk WHERE a = 2");
 
 $node_publisher->wait_for_catchup('tap_sub');
 
 my $logfile = slurp_file($node_subscriber->logfile, $log_location);
 ok( $logfile =~
-	  qr/logical replication did not find row to be updated in replication target relation "tab_full_pk"/,
+	  qr/conflict detected on relation "public.tab_full_pk": conflict=update_missing.*\n.*DETAIL:.* Could not find the row to be updated.*\n.*Remote tuple \(1, quux\); replica identity \(a\)=\(1\)/m,
 	'update target row is missing');
 ok( $logfile =~
-	  qr/logical replication did not find row to be deleted in replication target relation "tab_full_pk"/,
+	  qr/conflict detected on relation "public.tab_full": conflict=update_missing.*\n.*DETAIL:.* Could not find the row to be updated.*\n.*Remote tuple \(26\); replica identity full \(25\)/m,
+	'update target row is missing');
+ok( $logfile =~
+	  qr/conflict detected on relation "public.tab_full_pk": conflict=delete_missing.*\n.*DETAIL:.* Could not find the row to be deleted.*\n.*Replica identity \(a\)=\(2\)/m,
 	'delete target row is missing');
 
 $node_subscriber->append_conf('postgresql.conf',
@@ -501,7 +517,7 @@ is($result, qq(1052|1|1002),
 
 $result = $node_subscriber->safe_psql('postgres',
 	"SELECT count(*), min(a), max(a) FROM tab_full");
-is($result, qq(21|0|100), 'check replicated insert after alter publication');
+is($result, qq(19|0|100), 'check replicated insert after alter publication');
 
 # check restart on rename
 $oldpid = $node_publisher->safe_psql('postgres',
@@ -557,7 +573,7 @@ CREATE PUBLICATION tap_pub2 FOR TABLE skip_wal;
 ROLLBACK;
 });
 ok( $reterr =~
-	  m/WARNING:  wal_level is insufficient to publish logical changes/,
-	'CREATE PUBLICATION while wal_level=minimal');
+	  m/WARNING:  "wal_level" is insufficient to publish logical changes/,
+	'CREATE PUBLICATION while "wal_level=minimal"');
 
 done_testing();

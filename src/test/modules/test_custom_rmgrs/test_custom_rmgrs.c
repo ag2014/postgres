@@ -3,7 +3,7 @@
  * test_custom_rmgrs.c
  *		Code for testing custom WAL resource managers.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -31,7 +31,7 @@ PG_MODULE_MAGIC;
  */
 typedef struct xl_testcustomrmgrs_message
 {
-	Size		message_size;   /* size of the message */
+	Size		message_size;	/* size of the message */
 	char		message[FLEXIBLE_ARRAY_MEMBER]; /* payload */
 } xl_testcustomrmgrs_message;
 

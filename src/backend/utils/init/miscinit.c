@@ -3,7 +3,7 @@
  * miscinit.c
  *	  miscellaneous initialization support stuff
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -38,8 +38,8 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/interrupt.h"
-#include "postmaster/pgarch.h"
 #include "postmaster/postmaster.h"
+#include "replication/slotsync.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -107,9 +107,8 @@ InitPostmasterChild(void)
 
 	/*
 	 * Set reference point for stack-depth checking.  This might seem
-	 * redundant in !EXEC_BACKEND builds; but it's not because the postmaster
-	 * launches its children from signal handlers, so we might be running on
-	 * an alternative stack.
+	 * redundant in !EXEC_BACKEND builds, but it's better to keep the depth
+	 * logic the same with and without that build option.
 	 */
 	(void) set_stack_base();
 
@@ -163,6 +162,14 @@ InitPostmasterChild(void)
 
 	/* Request a signal if the postmaster dies, if possible. */
 	PostmasterDeathSignalInit();
+
+	/* Don't give the pipe to subprograms that we execute. */
+#ifndef WIN32
+	if (fcntl(postmaster_alive_fds[POSTMASTER_FD_WATCH], F_SETFD, FD_CLOEXEC) < 0)
+		ereport(FATAL,
+				(errcode_for_socket_access(),
+				 errmsg_internal("could not set postmaster death monitoring pipe to FD_CLOEXEC mode: %m")));
+#endif
 }
 
 /*
@@ -286,6 +293,9 @@ GetBackendTypeDesc(BackendType backendType)
 		case B_LOGGER:
 			backendDesc = "logger";
 			break;
+		case B_SLOTSYNC_WORKER:
+			backendDesc = "slotsync worker";
+			break;
 		case B_STANDALONE_BACKEND:
 			backendDesc = "standalone backend";
 			break;
@@ -297,6 +307,9 @@ GetBackendTypeDesc(BackendType backendType)
 			break;
 		case B_WAL_SENDER:
 			backendDesc = "walsender";
+			break;
+		case B_WAL_SUMMARIZER:
+			backendDesc = "walsummarizer";
 			break;
 		case B_WAL_WRITER:
 			backendDesc = "walwriter";
@@ -459,8 +472,8 @@ ChangeToDataDir(void)
  * AuthenticatedUserId is determined at connection start and never changes.
  *
  * SessionUserId is initially the same as AuthenticatedUserId, but can be
- * changed by SET SESSION AUTHORIZATION (if AuthenticatedUserIsSuperuser).
- * This is the ID reported by the SESSION_USER SQL function.
+ * changed by SET SESSION AUTHORIZATION (if AuthenticatedUserId is a
+ * superuser).  This is the ID reported by the SESSION_USER SQL function.
  *
  * OuterUserId is the current user ID in effect at the "outer level" (outside
  * any transaction or function).  This is initially the same as SessionUserId,
@@ -484,8 +497,7 @@ static Oid	OuterUserId = InvalidOid;
 static Oid	CurrentUserId = InvalidOid;
 static const char *SystemUser = NULL;
 
-/* We also have to remember the superuser state of some of these levels */
-static bool AuthenticatedUserIsSuperuser = false;
+/* We also have to remember the superuser state of the session user */
 static bool SessionUserIsSuperuser = false;
 
 static int	SecurityRestrictionContext = 0;
@@ -701,6 +713,10 @@ has_rolreplication(Oid roleid)
 	bool		result = false;
 	HeapTuple	utup;
 
+	/* Superusers bypass all permission checking. */
+	if (superuser_arg(roleid))
+		return true;
+
 	utup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
 	if (HeapTupleIsValid(utup))
 	{
@@ -714,11 +730,12 @@ has_rolreplication(Oid roleid)
  * Initialize user identity during normal backend startup
  */
 void
-InitializeSessionUserId(const char *rolename, Oid roleid)
+InitializeSessionUserId(const char *rolename, Oid roleid, bool bypass_login_check)
 {
 	HeapTuple	roleTup;
 	Form_pg_authid rform;
 	char	   *rname;
+	bool		is_superuser;
 
 	/*
 	 * Don't do scans if we're bootstrapping, none of the system catalogs
@@ -758,10 +775,10 @@ InitializeSessionUserId(const char *rolename, Oid roleid)
 	rname = NameStr(rform->rolname);
 
 	AuthenticatedUserId = roleid;
-	AuthenticatedUserIsSuperuser = rform->rolsuper;
+	is_superuser = rform->rolsuper;
 
 	/* This sets OuterUserId/CurrentUserId too */
-	SetSessionUserId(roleid, AuthenticatedUserIsSuperuser);
+	SetSessionUserId(roleid, is_superuser);
 
 	/* Also mark our PGPROC entry with the authenticated user id */
 	/* (We assume this is an atomic store so no lock is needed) */
@@ -777,7 +794,7 @@ InitializeSessionUserId(const char *rolename, Oid roleid)
 		/*
 		 * Is role allowed to login at all?
 		 */
-		if (!rform->rolcanlogin)
+		if (!bypass_login_check && !rform->rolcanlogin)
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("role \"%s\" is not permitted to log in",
@@ -794,7 +811,7 @@ InitializeSessionUserId(const char *rolename, Oid roleid)
 		 * just document that the connection limit is approximate.
 		 */
 		if (rform->rolconnlimit >= 0 &&
-			!AuthenticatedUserIsSuperuser &&
+			!is_superuser &&
 			CountUserBackends(roleid) > rform->rolconnlimit)
 			ereport(FATAL,
 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
@@ -806,7 +823,7 @@ InitializeSessionUserId(const char *rolename, Oid roleid)
 	SetConfigOption("session_authorization", rname,
 					PGC_BACKEND, PGC_S_OVERRIDE);
 	SetConfigOption("is_superuser",
-					AuthenticatedUserIsSuperuser ? "on" : "off",
+					is_superuser ? "on" : "off",
 					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 
 	ReleaseSysCache(roleTup);
@@ -821,17 +838,24 @@ InitializeSessionUserIdStandalone(void)
 {
 	/*
 	 * This function should only be called in single-user mode, in autovacuum
-	 * workers, and in background workers.
+	 * workers, in slot sync worker and in background workers.
 	 */
-	Assert(!IsUnderPostmaster || IsAutoVacuumWorkerProcess() || IsBackgroundWorker);
+	Assert(!IsUnderPostmaster || AmAutoVacuumWorkerProcess() ||
+		   AmLogicalSlotSyncWorkerProcess() || AmBackgroundWorkerProcess());
 
 	/* call only once */
 	Assert(!OidIsValid(AuthenticatedUserId));
 
 	AuthenticatedUserId = BOOTSTRAP_SUPERUSERID;
-	AuthenticatedUserIsSuperuser = true;
-
 	SetSessionUserId(BOOTSTRAP_SUPERUSERID, true);
+
+	/*
+	 * XXX This should set SetConfigOption("session_authorization"), too.
+	 * Since we don't, C code will get NULL, and current_setting() will get an
+	 * empty string.
+	 */
+	SetConfigOption("is_superuser", "on",
+					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 }
 
 /*
@@ -877,28 +901,12 @@ system_user(PG_FUNCTION_ARGS)
 /*
  * Change session auth ID while running
  *
- * Only a superuser may set auth ID to something other than himself.  Note
- * that in case of multiple SETs in a single session, the original userid's
- * superuserness is what matters.  But we set the GUC variable is_superuser
- * to indicate whether the *current* session userid is a superuser.
- *
- * Note: this is not an especially clean place to do the permission check.
- * It's OK because the check does not require catalog access and can't
- * fail during an end-of-transaction GUC reversion, but we may someday
- * have to push it up into assign_session_authorization.
+ * Note that we set the GUC variable is_superuser to indicate whether the
+ * current role is a superuser.
  */
 void
 SetSessionAuthorization(Oid userid, bool is_superuser)
 {
-	/* Must have authenticated already, else can't make permission check */
-	Assert(OidIsValid(AuthenticatedUserId));
-
-	if (userid != AuthenticatedUserId &&
-		!AuthenticatedUserIsSuperuser)
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("permission denied to set session authorization")));
-
 	SetSessionUserId(userid, is_superuser);
 
 	SetConfigOption("is_superuser",
@@ -1364,10 +1372,10 @@ CreateLockFile(const char *filename, bool amPostmaster,
 	 * both datadir and socket lockfiles; although more stuff may get added to
 	 * the datadir lockfile later.
 	 */
-	snprintf(buffer, sizeof(buffer), "%d\n%s\n%ld\n%d\n%s\n",
+	snprintf(buffer, sizeof(buffer), "%d\n%s\n" INT64_FORMAT "\n%d\n%s\n",
 			 amPostmaster ? (int) my_pid : -((int) my_pid),
 			 DataDir,
-			 (long) MyStartTime,
+			 MyStartTime,
 			 PostPortNumber,
 			 socketDir);
 

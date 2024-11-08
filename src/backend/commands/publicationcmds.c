@@ -3,7 +3,7 @@
  * publicationcmds.c
  *		publication manipulation
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -14,7 +14,6 @@
 
 #include "postgres.h"
 
-#include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
@@ -23,7 +22,6 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/objectaddress.h"
-#include "catalog/partition.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
@@ -31,12 +29,10 @@
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_namespace.h"
 #include "catalog/pg_publication_rel.h"
-#include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/publicationcmds.h"
-#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parse_clause.h"
@@ -44,10 +40,7 @@
 #include "parser/parse_relation.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
-#include "utils/array.h"
 #include "utils/builtins.h"
-#include "utils/catcache.h"
-#include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -85,12 +78,15 @@ parse_publication_options(ParseState *pstate,
 						  bool *publish_given,
 						  PublicationActions *pubactions,
 						  bool *publish_via_partition_root_given,
-						  bool *publish_via_partition_root)
+						  bool *publish_via_partition_root,
+						  bool *publish_generated_columns_given,
+						  bool *publish_generated_columns)
 {
 	ListCell   *lc;
 
 	*publish_given = false;
 	*publish_via_partition_root_given = false;
+	*publish_generated_columns_given = false;
 
 	/* defaults */
 	pubactions->pubinsert = true;
@@ -98,6 +94,7 @@ parse_publication_options(ParseState *pstate,
 	pubactions->pubdelete = true;
 	pubactions->pubtruncate = true;
 	*publish_via_partition_root = false;
+	*publish_generated_columns = false;
 
 	/* Parse options */
 	foreach(lc, options)
@@ -157,6 +154,13 @@ parse_publication_options(ParseState *pstate,
 				errorConflictingDefElem(defel, pstate);
 			*publish_via_partition_root_given = true;
 			*publish_via_partition_root = defGetBoolean(defel);
+		}
+		else if (strcmp(defel->defname, "publish_generated_columns") == 0)
+		{
+			if (*publish_generated_columns_given)
+				errorConflictingDefElem(defel, pstate);
+			*publish_generated_columns_given = true;
+			*publish_generated_columns = defGetBoolean(defel);
 		}
 		else
 			ereport(ERROR,
@@ -744,6 +748,8 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	PublicationActions pubactions;
 	bool		publish_via_partition_root_given;
 	bool		publish_via_partition_root;
+	bool		publish_generated_columns_given;
+	bool		publish_generated_columns;
 	AclResult	aclresult;
 	List	   *relations = NIL;
 	List	   *schemaidlist = NIL;
@@ -783,7 +789,9 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 							  stmt->options,
 							  &publish_given, &pubactions,
 							  &publish_via_partition_root_given,
-							  &publish_via_partition_root);
+							  &publish_via_partition_root,
+							  &publish_generated_columns_given,
+							  &publish_generated_columns);
 
 	puboid = GetNewOidWithIndex(rel, PublicationObjectIndexId,
 								Anum_pg_publication_oid);
@@ -800,6 +808,8 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 		BoolGetDatum(pubactions.pubtruncate);
 	values[Anum_pg_publication_pubviaroot - 1] =
 		BoolGetDatum(publish_via_partition_root);
+	values[Anum_pg_publication_pubgencols - 1] =
+		BoolGetDatum(publish_generated_columns);
 
 	tup = heap_form_tuple(RelationGetDescr(rel), values, nulls);
 
@@ -865,8 +875,8 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	if (wal_level != WAL_LEVEL_LOGICAL)
 		ereport(WARNING,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("wal_level is insufficient to publish logical changes"),
-				 errhint("Set wal_level to \"logical\" before creating subscriptions.")));
+				 errmsg("\"wal_level\" is insufficient to publish logical changes"),
+				 errhint("Set \"wal_level\" to \"logical\" before creating subscriptions.")));
 
 	return myself;
 }
@@ -885,6 +895,8 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	PublicationActions pubactions;
 	bool		publish_via_partition_root_given;
 	bool		publish_via_partition_root;
+	bool		publish_generated_columns_given;
+	bool		publish_generated_columns;
 	ObjectAddress obj;
 	Form_pg_publication pubform;
 	List	   *root_relids = NIL;
@@ -894,7 +906,9 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 							  stmt->options,
 							  &publish_given, &pubactions,
 							  &publish_via_partition_root_given,
-							  &publish_via_partition_root);
+							  &publish_via_partition_root,
+							  &publish_generated_columns_given,
+							  &publish_generated_columns);
 
 	pubform = (Form_pg_publication) GETSTRUCT(tup);
 
@@ -1002,6 +1016,12 @@ AlterPublicationOptions(ParseState *pstate, AlterPublicationStmt *stmt,
 	{
 		values[Anum_pg_publication_pubviaroot - 1] = BoolGetDatum(publish_via_partition_root);
 		replaces[Anum_pg_publication_pubviaroot - 1] = true;
+	}
+
+	if (publish_generated_columns_given)
+	{
+		values[Anum_pg_publication_pubgencols - 1] = BoolGetDatum(publish_generated_columns);
+		replaces[Anum_pg_publication_pubgencols - 1] = true;
 	}
 
 	tup = heap_modify_tuple(tup, RelationGetDescr(rel), values, nulls,
@@ -1183,21 +1203,13 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 				newrelid = RelationGetRelid(newpubrel->relation);
 
 				/*
-				 * If the new publication has column list, transform it to a
-				 * bitmap too.
+				 * Validate the column list.  If the column list or WHERE
+				 * clause changes, then the validation done here will be
+				 * duplicated inside PublicationAddTables().  The validation
+				 * is cheap enough that that seems harmless.
 				 */
-				if (newpubrel->columns)
-				{
-					ListCell   *lc;
-
-					foreach(lc, newpubrel->columns)
-					{
-						char	   *colname = strVal(lfirst(lc));
-						AttrNumber	attnum = get_attnum(newrelid, colname);
-
-						newcolumns = bms_add_member(newcolumns, attnum);
-					}
-				}
+				newcolumns = pub_collist_validate(newpubrel->relation,
+												  newpubrel->columns);
 
 				/*
 				 * Check if any of the new set of relations matches with the
@@ -1206,7 +1218,7 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 				 * expressions also match. Same for the column list. Drop the
 				 * rest.
 				 */
-				if (RelationGetRelid(newpubrel->relation) == oldrelid)
+				if (newrelid == oldrelid)
 				{
 					if (equal(oldrelwhereclause, newpubrel->whereClause) &&
 						bms_equal(oldcolumns, newcolumns))

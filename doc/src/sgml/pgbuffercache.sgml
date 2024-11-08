@@ -1,7 +1,8 @@
 <!-- doc/src/sgml/pgbuffercache.sgml -->
 
 <sect1 id="pgbuffercache" xreflabel="pg_buffercache">
- <title>pg_buffercache &mdash; inspect Postgres buffer cache state</title>
+ <title>pg_buffercache &mdash; inspect <productname>PostgreSQL</productname>
+    buffer cache state</title>
 
  <indexterm zone="pgbuffercache">
   <primary>pg_buffercache</primary>
@@ -10,6 +11,8 @@
  <para>
   The <filename>pg_buffercache</filename> module provides a means for
   examining what's happening in the shared buffer cache in real time.
+  It also offers a low-level way to evict data from it, for testing
+  purposes.
  </para>
 
  <indexterm>
@@ -20,10 +23,16 @@
   <primary>pg_buffercache_summary</primary>
  </indexterm>
 
+ <indexterm>
+  <primary>pg_buffercache_evict</primary>
+ </indexterm>
+
  <para>
-  The module provides the <function>pg_buffercache_pages()</function>
-  function, wrapped in the <structname>pg_buffercache</structname> view, and
-  the <function>pg_buffercache_summary()</function> function.
+  This module provides the <function>pg_buffercache_pages()</function>
+  function (wrapped in the <structname>pg_buffercache</structname> view),
+  the <function>pg_buffercache_summary()</function> function, the
+  <function>pg_buffercache_usage_counts()</function> function and
+  the <function>pg_buffercache_evict()</function> function.
  </para>
 
  <para>
@@ -39,9 +48,21 @@
  </para>
 
  <para>
-  By default, use is restricted to superusers and roles with privileges of the
-  <literal>pg_monitor</literal> role. Access may be granted to others
-  using <command>GRANT</command>.
+  The <function>pg_buffercache_usage_counts()</function> function returns a set
+  of records, each row describing the number of buffers with a given usage
+  count.
+ </para>
+
+ <para>
+  By default, use of the above functions is restricted to superusers and roles
+  with privileges of the <literal>pg_monitor</literal> role. Access may be
+  granted to others using <command>GRANT</command>.
+ </para>
+
+ <para>
+  The <function>pg_buffercache_evict()</function> function allows a block to
+  be evicted from the buffer pool given a buffer identifier.  Use of this
+  function is restricted to superusers only.
  </para>
 
  <sect2 id="pgbuffercache-pg-buffercache">
@@ -206,7 +227,7 @@
        <structfield>buffers_used</structfield> <type>int4</type>
       </para>
       <para>
-       Number of unused shared buffers
+       Number of used shared buffers
       </para></entry>
      </row>
 
@@ -242,7 +263,7 @@
        <structfield>usagecount_avg</structfield> <type>float8</type>
       </para>
       <para>
-       Average usagecount of used shared buffers
+       Average usage count of used shared buffers
       </para></entry>
      </row>
     </tbody>
@@ -265,7 +286,99 @@
   </para>
  </sect2>
 
- <sect2 id="pgbuffercache-sample-output">
+ <sect2 id="pgbuffercache-usage-counts">
+  <title>The <function>pg_buffercache_usage_counts()</function> Function</title>
+
+  <para>
+   The definitions of the columns exposed by the function are shown in
+   <xref linkend="pgbuffercache_usage_counts-columns"/>.
+  </para>
+
+  <table id="pgbuffercache_usage_counts-columns">
+   <title><function>pg_buffercache_usage_counts()</function> Output Columns</title>
+   <tgroup cols="1">
+    <thead>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       Column Type
+      </para>
+      <para>
+       Description
+      </para></entry>
+     </row>
+    </thead>
+
+    <tbody>
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>usage_count</structfield> <type>int4</type>
+      </para>
+      <para>
+       A possible buffer usage count
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>buffers</structfield> <type>int4</type>
+      </para>
+      <para>
+       Number of buffers with the usage count
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>dirty</structfield> <type>int4</type>
+      </para>
+      <para>
+       Number of dirty buffers with the usage count
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>pinned</structfield> <type>int4</type>
+      </para>
+      <para>
+       Number of pinned buffers with the usage count
+      </para></entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
+
+  <para>
+   The <function>pg_buffercache_usage_counts()</function> function returns a
+   set of rows summarizing the states of all shared buffers, aggregated over
+   the possible usage count values.  Similar and more detailed information is
+   provided by the <structname>pg_buffercache</structname> view, but
+   <function>pg_buffercache_usage_counts()</function> is significantly cheaper.
+  </para>
+
+  <para>
+   Like the <structname>pg_buffercache</structname> view,
+   <function>pg_buffercache_usage_counts()</function> does not acquire buffer
+   manager locks. Therefore concurrent activity can lead to minor inaccuracies
+   in the result.
+  </para>
+ </sect2>
+
+ <sect2 id="pgbuffercache-pg-buffercache-evict">
+  <title>The <structname>pg_buffercache_evict</structname> Function</title>
+  <para>
+   The <function>pg_buffercache_evict()</function> function takes a buffer
+   identifier, as shown in the <structfield>bufferid</structfield> column of
+   the <structname>pg_buffercache</structname> view.  It returns true on success,
+   and false if the buffer wasn't valid, if it couldn't be evicted because it
+   was pinned, or if it became dirty again after an attempt to write it out.
+   The result is immediately out of date upon return, as the buffer might
+   become valid again at any time due to concurrent activity.  The function is
+   intended for developer testing only.
+  </para>
+ </sect2>
+
+<sect2 id="pgbuffercache-sample-output">
   <title>Sample Output</title>
 
 <screen>
@@ -299,6 +412,18 @@ regression=# SELECT * FROM pg_buffercache_summary();
 --------------+----------------+---------------+----------------+----------------
           248 |        2096904 |            39 |              0 |       3.141129
 (1 row)
+
+
+regression=# SELECT * FROM pg_buffercache_usage_counts();
+ usage_count | buffers | dirty | pinned
+-------------+---------+-------+--------
+           0 |   14650 |     0 |      0
+           1 |    1436 |   671 |      0
+           2 |     102 |    88 |      0
+           3 |      23 |    21 |      0
+           4 |       9 |     7 |      0
+           5 |     164 |   106 |      0
+(6 rows)
 </screen>
  </sect2>
 

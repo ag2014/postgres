@@ -685,10 +685,21 @@ select split_part('joeuser@mydatabase','@',-3) AS "empty string";
 select split_part('@joeuser@mydatabase@','@',-2) AS "mydatabase";
 
 --
--- test to_hex
+-- test to_bin, to_oct, and to_hex
 --
-select to_hex(256*256*256 - 1) AS "ffffff";
+select to_bin(-1234) AS "11111111111111111111101100101110";
+select to_bin(-1234::bigint);
+select to_bin(256*256*256 - 1) AS "111111111111111111111111";
+select to_bin(256::bigint*256::bigint*256::bigint*256::bigint - 1) AS "11111111111111111111111111111111";
 
+select to_oct(-1234) AS "37777775456";
+select to_oct(-1234::bigint) AS "1777777777777777775456";
+select to_oct(256*256*256 - 1) AS "77777777";
+select to_oct(256::bigint*256::bigint*256::bigint*256::bigint - 1) AS "37777777777";
+
+select to_hex(-1234) AS "fffffb2e";
+select to_hex(-1234::bigint) AS "fffffffffffffb2e";
+select to_hex(256*256*256 - 1) AS "ffffff";
 select to_hex(256::bigint*256::bigint*256::bigint*256::bigint - 1) AS "ffffffff";
 
 --
@@ -707,6 +718,15 @@ SELECT sha384('The quick brown fox jumps over the lazy dog.');
 
 SELECT sha512('');
 SELECT sha512('The quick brown fox jumps over the lazy dog.');
+
+--
+-- CRC
+--
+SELECT crc32('');
+SELECT crc32('The quick brown fox jumps over the lazy dog.');
+
+SELECT crc32c('');
+SELECT crc32c('The quick brown fox jumps over the lazy dog.');
 
 --
 -- encode/decode

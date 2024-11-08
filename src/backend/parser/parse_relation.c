@@ -3,7 +3,7 @@
  * parse_relation.c
  *	  parser support routines dealing with relations
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -1392,6 +1392,7 @@ buildNSItemFromLists(RangeTblEntry *rte, Index rtindex,
 	nsitem->p_names = rte->eref;
 	nsitem->p_rte = rte;
 	nsitem->p_rtindex = rtindex;
+	nsitem->p_perminfo = NULL;
 	nsitem->p_nscolumns = nscolumns;
 	/* set default visibility flags; might get changed later */
 	nsitem->p_rel_visible = true;
@@ -1499,6 +1500,7 @@ addRangeTableEntry(ParseState *pstate,
 	 */
 	rel = parserOpenTable(pstate, relation, lockmode);
 	rte->relid = RelationGetRelid(rel);
+	rte->inh = inh;
 	rte->relkind = rel->rd_rel->relkind;
 	rte->rellockmode = lockmode;
 
@@ -1516,7 +1518,6 @@ addRangeTableEntry(ParseState *pstate,
 	 * which is the right thing for all except target tables.
 	 */
 	rte->lateral = false;
-	rte->inh = inh;
 	rte->inFromCl = inFromCl;
 
 	perminfo = addRTEPermissionInfo(&pstate->p_rteperminfos, rte);
@@ -1584,6 +1585,7 @@ addRangeTableEntryForRelation(ParseState *pstate,
 	rte->rtekind = RTE_RELATION;
 	rte->alias = alias;
 	rte->relid = RelationGetRelid(rel);
+	rte->inh = inh;
 	rte->relkind = rel->rd_rel->relkind;
 	rte->rellockmode = lockmode;
 
@@ -1601,7 +1603,6 @@ addRangeTableEntryForRelation(ParseState *pstate,
 	 * which is the right thing for all except target tables.
 	 */
 	rte->lateral = false;
-	rte->inh = inh;
 	rte->inFromCl = inFromCl;
 
 	perminfo = addRTEPermissionInfo(&pstate->p_rteperminfos, rte);
@@ -1699,7 +1700,6 @@ addRangeTableEntryForSubquery(ParseState *pstate,
 	 * addRTEPermissionInfo().
 	 */
 	rte->lateral = lateral;
-	rte->inh = false;			/* never true for subqueries */
 	rte->inFromCl = inFromCl;
 
 	/*
@@ -2022,7 +2022,6 @@ addRangeTableEntryForFunction(ParseState *pstate,
 	 * ExecCheckPermissions()), so no need to perform addRTEPermissionInfo().
 	 */
 	rte->lateral = lateral;
-	rte->inh = false;			/* never true for functions */
 	rte->inFromCl = inFromCl;
 
 	/*
@@ -2072,8 +2071,6 @@ addRangeTableEntryForTableFunc(ParseState *pstate,
 	Assert(list_length(tf->coltypmods) == list_length(tf->colnames));
 	Assert(list_length(tf->colcollations) == list_length(tf->colnames));
 
-	refname = alias ? alias->aliasname : pstrdup("xmltable");
-
 	rte->rtekind = RTE_TABLEFUNC;
 	rte->relid = InvalidOid;
 	rte->subquery = NULL;
@@ -2083,6 +2080,8 @@ addRangeTableEntryForTableFunc(ParseState *pstate,
 	rte->colcollations = tf->colcollations;
 	rte->alias = alias;
 
+	refname = alias ? alias->aliasname :
+		pstrdup(tf->functype == TFT_XMLTABLE ? "xmltable" : "json_table");
 	eref = alias ? copyObject(alias) : makeAlias(refname, NIL);
 	numaliases = list_length(eref->colnames);
 
@@ -2095,7 +2094,7 @@ addRangeTableEntryForTableFunc(ParseState *pstate,
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
 				 errmsg("%s function has %d columns available but %d columns specified",
-						"XMLTABLE",
+						tf->functype == TFT_XMLTABLE ? "XMLTABLE" : "JSON_TABLE",
 						list_length(tf->colnames), numaliases)));
 
 	rte->eref = eref;
@@ -2107,7 +2106,6 @@ addRangeTableEntryForTableFunc(ParseState *pstate,
 	 * ExecCheckPermissions()), so no need to perform addRTEPermissionInfo().
 	 */
 	rte->lateral = lateral;
-	rte->inh = false;			/* never true for tablefunc RTEs */
 	rte->inFromCl = inFromCl;
 
 	/*
@@ -2188,7 +2186,6 @@ addRangeTableEntryForValues(ParseState *pstate,
 	 * addRTEPermissionInfo().
 	 */
 	rte->lateral = lateral;
-	rte->inh = false;			/* never true for values RTEs */
 	rte->inFromCl = inFromCl;
 
 	/*
@@ -2279,7 +2276,6 @@ addRangeTableEntryForJoin(ParseState *pstate,
 	 * addRTEPermissionInfo().
 	 */
 	rte->lateral = false;
-	rte->inh = false;			/* never true for joins */
 	rte->inFromCl = inFromCl;
 
 	/*
@@ -2345,9 +2341,10 @@ addRangeTableEntryForCTE(ParseState *pstate,
 		cte->cterefcount++;
 
 	/*
-	 * We throw error if the CTE is INSERT/UPDATE/DELETE without RETURNING.
-	 * This won't get checked in case of a self-reference, but that's OK
-	 * because data-modifying CTEs aren't allowed to be recursive anyhow.
+	 * We throw error if the CTE is INSERT/UPDATE/DELETE/MERGE without
+	 * RETURNING.  This won't get checked in case of a self-reference, but
+	 * that's OK because data-modifying CTEs aren't allowed to be recursive
+	 * anyhow.
 	 */
 	if (IsA(cte->ctequery, Query))
 	{
@@ -2424,7 +2421,6 @@ addRangeTableEntryForCTE(ParseState *pstate,
 	 * addRTEPermissionInfo().
 	 */
 	rte->lateral = false;
-	rte->inh = false;			/* never true for subqueries */
 	rte->inFromCl = inFromCl;
 
 	/*
@@ -2544,7 +2540,6 @@ addRangeTableEntryForENR(ParseState *pstate,
 	 * addRTEPermissionInfo().
 	 */
 	rte->lateral = false;
-	rte->inh = false;			/* never true for ENRs */
 	rte->inFromCl = inFromCl;
 
 	/*
@@ -2560,6 +2555,79 @@ addRangeTableEntryForENR(ParseState *pstate,
 	 */
 	return buildNSItemFromTupleDesc(rte, list_length(pstate->p_rtable), NULL,
 									tupdesc);
+}
+
+/*
+ * Add an entry for grouping step to the pstate's range table (p_rtable).
+ * Then, construct and return a ParseNamespaceItem for the new RTE.
+ */
+ParseNamespaceItem *
+addRangeTableEntryForGroup(ParseState *pstate,
+						   List *groupClauses)
+{
+	RangeTblEntry *rte = makeNode(RangeTblEntry);
+	Alias	   *eref;
+	List	   *groupexprs;
+	List	   *coltypes,
+			   *coltypmods,
+			   *colcollations;
+	ListCell   *lc;
+	ParseNamespaceItem *nsitem;
+
+	Assert(pstate != NULL);
+
+	rte->rtekind = RTE_GROUP;
+	rte->alias = NULL;
+
+	eref = makeAlias("*GROUP*", NIL);
+
+	/* fill in any unspecified alias columns, and extract column type info */
+	groupexprs = NIL;
+	coltypes = coltypmods = colcollations = NIL;
+	foreach(lc, groupClauses)
+	{
+		TargetEntry *te = (TargetEntry *) lfirst(lc);
+		char	   *colname = te->resname ? pstrdup(te->resname) : "?column?";
+
+		eref->colnames = lappend(eref->colnames, makeString(colname));
+
+		groupexprs = lappend(groupexprs, copyObject(te->expr));
+
+		coltypes = lappend_oid(coltypes,
+							   exprType((Node *) te->expr));
+		coltypmods = lappend_int(coltypmods,
+								 exprTypmod((Node *) te->expr));
+		colcollations = lappend_oid(colcollations,
+									exprCollation((Node *) te->expr));
+	}
+
+	rte->eref = eref;
+	rte->groupexprs = groupexprs;
+
+	/*
+	 * Set flags.
+	 *
+	 * The grouping step is never checked for access rights, so no need to
+	 * perform addRTEPermissionInfo().
+	 */
+	rte->lateral = false;
+	rte->inFromCl = false;
+
+	/*
+	 * Add completed RTE to pstate's range table list, so that we know its
+	 * index.  But we don't add it to the join list --- caller must do that if
+	 * appropriate.
+	 */
+	pstate->p_rtable = lappend(pstate->p_rtable, rte);
+
+	/*
+	 * Build a ParseNamespaceItem, but don't add it to the pstate's namespace
+	 * list --- caller must do that if appropriate.
+	 */
+	nsitem = buildNSItemFromLists(rte, list_length(pstate->p_rtable),
+								  coltypes, coltypmods, colcollations);
+
+	return nsitem;
 }
 
 
@@ -2697,15 +2765,16 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 					Assert(varattno == te->resno);
 
 					/*
-					 * In scenarios where columns have been added to a view
-					 * since the outer query was originally parsed, there can
-					 * be more items in the subquery tlist than the outer
-					 * query expects.  We should ignore such extra column(s)
-					 * --- compare the behavior for composite-returning
-					 * functions, in the RTE_FUNCTION case below.
+					 * Formerly it was possible for the subquery tlist to have
+					 * more non-junk entries than the colnames list does (if
+					 * this RTE has been expanded from a view that has more
+					 * columns than it did when the current query was parsed).
+					 * Now that ApplyRetrieveRule cleans up such cases, we
+					 * shouldn't see that anymore, but let's just check.
 					 */
 					if (!aliasp_item)
-						break;
+						elog(ERROR, "too few column names for subquery %s",
+							 rte->eref->aliasname);
 
 					if (colnames)
 					{
@@ -2742,12 +2811,17 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 				{
 					RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
 					TypeFuncClass functypclass;
-					Oid			funcrettype;
-					TupleDesc	tupdesc;
+					Oid			funcrettype = InvalidOid;
+					TupleDesc	tupdesc = NULL;
 
-					functypclass = get_expr_result_type(rtfunc->funcexpr,
-														&funcrettype,
-														&tupdesc);
+					/* If it has a coldeflist, it returns RECORD */
+					if (rtfunc->funccolnames != NIL)
+						functypclass = TYPEFUNC_RECORD;
+					else
+						functypclass = get_expr_result_type(rtfunc->funcexpr,
+															&funcrettype,
+															&tupdesc);
+
 					if (functypclass == TYPEFUNC_COMPOSITE ||
 						functypclass == TYPEFUNC_COMPOSITE_DOMAIN)
 					{
@@ -3002,6 +3076,7 @@ expandRTE(RangeTblEntry *rte, int rtindex, int sublevels_up,
 			}
 			break;
 		case RTE_RESULT:
+		case RTE_GROUP:
 			/* These expose no columns, so nothing to do */
 			break;
 		default:
@@ -3316,10 +3391,11 @@ get_rte_attribute_is_dropped(RangeTblEntry *rte, AttrNumber attnum)
 		case RTE_TABLEFUNC:
 		case RTE_VALUES:
 		case RTE_CTE:
+		case RTE_GROUP:
 
 			/*
-			 * Subselect, Table Functions, Values, CTE RTEs never have dropped
-			 * columns
+			 * Subselect, Table Functions, Values, CTE, GROUP RTEs never have
+			 * dropped columns
 			 */
 			result = false;
 			break;
@@ -3372,6 +3448,10 @@ get_rte_attribute_is_dropped(RangeTblEntry *rte, AttrNumber attnum)
 						attnum <= atts_done + rtfunc->funccolcount)
 					{
 						TupleDesc	tupdesc;
+
+						/* If it has a coldeflist, it returns RECORD */
+						if (rtfunc->funccolnames != NIL)
+							return false;	/* can't have any dropped columns */
 
 						tupdesc = get_expr_result_tupdesc(rtfunc->funcexpr,
 														  true);

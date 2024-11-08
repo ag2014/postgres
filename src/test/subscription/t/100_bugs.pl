@@ -1,9 +1,9 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 # Tests for various bugs found over time
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -24,7 +24,7 @@ $node_publisher->init(allows_streaming => 'logical');
 $node_publisher->start;
 
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+$node_subscriber->init;
 $node_subscriber->start;
 
 my $publisher_connstr = $node_publisher->connstr . ' dbname=postgres';
@@ -127,8 +127,8 @@ $node_twoways->start;
 for my $db (qw(d1 d2))
 {
 	$node_twoways->safe_psql('postgres', "CREATE DATABASE $db");
-	$node_twoways->safe_psql($db,        "CREATE TABLE t (f int)");
-	$node_twoways->safe_psql($db,        "CREATE TABLE t2 (f int)");
+	$node_twoways->safe_psql($db, "CREATE TABLE t (f int)");
+	$node_twoways->safe_psql($db, "CREATE TABLE t2 (f int)");
 }
 
 my $rows = 3000;
@@ -141,7 +141,7 @@ $node_twoways->safe_psql(
 	});
 
 $node_twoways->safe_psql('d2',
-	    "CREATE SUBSCRIPTION testsub CONNECTION \$\$"
+		"CREATE SUBSCRIPTION testsub CONNECTION \$\$"
 	  . $node_twoways->connstr('d1')
 	  . "\$\$ PUBLICATION testpub WITH (create_slot=false, "
 	  . "slot_name='testslot')");
@@ -175,7 +175,7 @@ $node_pub_sub->init(allows_streaming => 'logical');
 $node_pub_sub->start;
 
 my $node_sub = PostgreSQL::Test::Cluster->new('testsubscriber1');
-$node_sub->init(allows_streaming => 'logical');
+$node_sub->init;
 $node_sub->start;
 
 # Create the tables in all nodes.
@@ -369,6 +369,123 @@ $node_subscriber->wait_for_subscription_sync($node_publisher, 'tap_sub_sch');
 $result = $node_subscriber->safe_psql('postgres', "SELECT * FROM sch2.t1");
 is( $result, qq(1
 3), 'check data in subscriber sch2.t1 after schema rename');
+
+# Again, drop replication state but not tables.
+$node_subscriber->safe_psql('postgres', "DROP SUBSCRIPTION tap_sub_sch");
+$node_publisher->safe_psql('postgres', "DROP PUBLICATION tap_pub_sch");
+
+$node_publisher->stop('fast');
+$node_subscriber->stop('fast');
+
+# The bug was that when the REPLICA IDENTITY FULL is used with dropped or
+# generated columns, we fail to apply updates and deletes
+$node_publisher->rotate_logfile();
+$node_publisher->start();
+
+$node_subscriber->rotate_logfile();
+$node_subscriber->start();
+
+$node_publisher->safe_psql(
+	'postgres', qq(
+	CREATE TABLE dropped_cols (a int, b_drop int, c int);
+	ALTER TABLE dropped_cols REPLICA IDENTITY FULL;
+	CREATE TABLE generated_cols (a int, b_gen int GENERATED ALWAYS AS (5 * a) STORED, c int);
+	ALTER TABLE generated_cols REPLICA IDENTITY FULL;
+	CREATE PUBLICATION pub_dropped_cols FOR TABLE dropped_cols, generated_cols;
+	-- some initial data
+	INSERT INTO dropped_cols VALUES (1, 1, 1);
+	INSERT INTO generated_cols (a, c) VALUES (1, 1);
+));
+
+$node_subscriber->safe_psql(
+	'postgres', qq(
+	 CREATE TABLE dropped_cols (a int, b_drop int, c int);
+	 CREATE TABLE generated_cols (a int, b_gen int GENERATED ALWAYS AS (5 * a) STORED, c int);
+));
+
+$publisher_connstr = $node_publisher->connstr . ' dbname=postgres';
+$node_subscriber->safe_psql('postgres',
+	"CREATE SUBSCRIPTION sub_dropped_cols CONNECTION '$publisher_connstr' PUBLICATION pub_dropped_cols"
+);
+$node_subscriber->wait_for_subscription_sync;
+
+$node_publisher->safe_psql(
+	'postgres', qq(
+		ALTER TABLE dropped_cols DROP COLUMN b_drop;
+));
+$node_subscriber->safe_psql(
+	'postgres', qq(
+		ALTER TABLE dropped_cols DROP COLUMN b_drop;
+));
+
+$node_publisher->safe_psql(
+	'postgres', qq(
+		UPDATE dropped_cols SET a = 100;
+		UPDATE generated_cols SET a = 100;
+));
+$node_publisher->wait_for_catchup('sub_dropped_cols');
+
+is( $node_subscriber->safe_psql(
+		'postgres', "SELECT count(*) FROM dropped_cols WHERE a = 100"),
+	qq(1),
+	'replication with RI FULL and dropped columns');
+
+is( $node_subscriber->safe_psql(
+		'postgres', "SELECT count(*) FROM generated_cols WHERE a = 100"),
+	qq(1),
+	'replication with RI FULL and generated columns');
+
+$node_publisher->stop('fast');
+$node_subscriber->stop('fast');
+
+# The bug was that pgoutput was incorrectly replacing missing attributes in
+# tuples with NULL. This could result in incorrect replication with
+# `REPLICA IDENTITY FULL`.
+
+$node_publisher->rotate_logfile();
+$node_publisher->start();
+
+$node_subscriber->rotate_logfile();
+$node_subscriber->start();
+
+# Set up a table with schema `(a int, b bool)` where the `b` attribute is
+# missing for one row due to the `ALTER TABLE ... ADD COLUMN ... DEFAULT`
+# fast path.
+$node_publisher->safe_psql(
+	'postgres', qq(
+	CREATE TABLE tab_default (a int);
+	ALTER TABLE tab_default REPLICA IDENTITY FULL;
+	INSERT INTO tab_default VALUES (1);
+	ALTER TABLE tab_default ADD COLUMN b bool DEFAULT false NOT NULL;
+	INSERT INTO tab_default VALUES (2, true);
+	CREATE PUBLICATION pub1 FOR TABLE tab_default;
+));
+
+# Replicate to the subscriber.
+$node_subscriber->safe_psql(
+	'postgres', qq(
+	CREATE TABLE tab_default (a int, b bool);
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub1;
+));
+
+$node_subscriber->wait_for_subscription_sync($node_publisher, 'sub1');
+$result =
+  $node_subscriber->safe_psql('postgres', "SELECT a, b FROM tab_default");
+is( $result, qq(1|f
+2|t), 'check snapshot on subscriber');
+
+# Update all rows in the table and ensure the rows with the missing `b`
+# attribute replicate correctly.
+$node_publisher->safe_psql('postgres', "UPDATE tab_default SET a = a + 1");
+$node_publisher->wait_for_catchup('sub1');
+
+# When the bug is present, the `1|f` row will not be updated to `2|f` because
+# the publisher incorrectly fills in `NULL` for `b` and publishes an update
+# for `1|NULL`, which doesn't exist in the subscriber.
+$result =
+  $node_subscriber->safe_psql('postgres', "SELECT a, b FROM tab_default");
+is( $result, qq(2|f
+3|t), 'check replicated update on subscriber');
 
 $node_publisher->stop('fast');
 $node_subscriber->stop('fast');

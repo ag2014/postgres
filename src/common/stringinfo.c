@@ -7,7 +7,7 @@
  * (null-terminated text) or arbitrary binary data.  All storage is allocated
  * with palloc() (falling back to malloc in frontend code).
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *	  src/common/stringinfo.c
@@ -23,9 +23,6 @@
 #else
 
 #include "postgres_fe.h"
-
-/* It's possible we could use a different value for this in frontend code */
-#define MaxAllocSize	((Size) 0x3fffffff) /* 1 gigabyte - 1 */
 
 #endif
 
@@ -70,10 +67,16 @@ initStringInfo(StringInfo str)
  *
  * Reset the StringInfo: the data buffer remains valid, but its
  * previous content, if any, is cleared.
+ *
+ * Read-only StringInfos as initialized by initReadOnlyStringInfo cannot be
+ * reset.
  */
 void
 resetStringInfo(StringInfo str)
 {
+	/* don't allow resets of read-only StringInfos */
+	Assert(str->maxlen != 0);
+
 	str->data[0] = '\0';
 	str->len = 0;
 	str->cursor = 0;
@@ -284,6 +287,9 @@ enlargeStringInfo(StringInfo str, int needed)
 {
 	int			newlen;
 
+	/* validate this is not a read-only StringInfo */
+	Assert(str->maxlen != 0);
+
 	/*
 	 * Guard against out-of-range "needed" values.  Without this, we can get
 	 * an overflow or infinite loop in the following.
@@ -302,13 +308,13 @@ enlargeStringInfo(StringInfo str, int needed)
 #ifndef FRONTEND
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("out of memory"),
+				 errmsg("string buffer exceeds maximum allowed length (%zu bytes)", MaxAllocSize),
 				 errdetail("Cannot enlarge string buffer containing %d bytes by %d more bytes.",
 						   str->len, needed)));
 #else
 		fprintf(stderr,
-				_("out of memory\n\nCannot enlarge string buffer containing %d bytes by %d more bytes.\n"),
-				str->len, needed);
+				_("string buffer exceeds maximum allowed length (%zu bytes)\n\nCannot enlarge string buffer containing %d bytes by %d more bytes.\n"),
+				MaxAllocSize, str->len, needed);
 		exit(EXIT_FAILURE);
 #endif
 	}
@@ -340,4 +346,20 @@ enlargeStringInfo(StringInfo str, int needed)
 	str->data = (char *) repalloc(str->data, newlen);
 
 	str->maxlen = newlen;
+}
+
+/*
+ * destroyStringInfo
+ *
+ * Frees a StringInfo and its buffer (opposite of makeStringInfo()).
+ * This must only be called on palloc'd StringInfos.
+ */
+void
+destroyStringInfo(StringInfo str)
+{
+	/* don't allow destroys of read-only StringInfos */
+	Assert(str->maxlen != 0);
+
+	pfree(str->data);
+	pfree(str);
 }

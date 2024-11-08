@@ -4,7 +4,7 @@
  *	  PlaceHolderVar and PlaceHolderInfo manipulation routines
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -125,8 +125,6 @@ find_placeholder_info(PlannerInfo *root, PlaceHolderVar *phv)
 	 */
 	rels_used = pull_varnos(root, (Node *) phv->phexpr);
 	phinfo->ph_lateral = bms_difference(rels_used, phv->phrels);
-	if (bms_is_empty(phinfo->ph_lateral))
-		phinfo->ph_lateral = NULL;	/* make it exactly NULL if empty */
 	phinfo->ph_eval_at = bms_int_members(rels_used, phv->phrels);
 	/* If no contained vars, force evaluation at syntactic location */
 	if (bms_is_empty(phinfo->ph_eval_at))
@@ -317,6 +315,33 @@ fix_placeholder_input_needed_levels(PlannerInfo *root)
 }
 
 /*
+ * rebuild_placeholder_attr_needed
+ *	  Put back attr_needed bits for Vars/PHVs needed in PlaceHolderVars.
+ *
+ * This is used to rebuild attr_needed/ph_needed sets after removal of a
+ * useless outer join.  It should match what
+ * fix_placeholder_input_needed_levels did, except that we call
+ * add_vars_to_attr_needed not add_vars_to_targetlist.
+ */
+void
+rebuild_placeholder_attr_needed(PlannerInfo *root)
+{
+	ListCell   *lc;
+
+	foreach(lc, root->placeholder_list)
+	{
+		PlaceHolderInfo *phinfo = (PlaceHolderInfo *) lfirst(lc);
+		List	   *vars = pull_var_clause((Node *) phinfo->ph_var->phexpr,
+										   PVC_RECURSE_AGGREGATES |
+										   PVC_RECURSE_WINDOWFUNCS |
+										   PVC_INCLUDE_PLACEHOLDERS);
+
+		add_vars_to_attr_needed(root, vars, phinfo->ph_eval_at);
+		list_free(vars);
+	}
+}
+
+/*
  * add_placeholders_to_base_rels
  *		Add any required PlaceHolderVars to base rels' targetlists.
  *
@@ -377,6 +402,7 @@ add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
 							SpecialJoinInfo *sjinfo)
 {
 	Relids		relids = joinrel->relids;
+	int64		tuple_width = joinrel->reltarget->width;
 	ListCell   *lc;
 
 	foreach(lc, root->placeholder_list)
@@ -421,7 +447,7 @@ add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
 					cost_qual_eval_node(&cost, (Node *) phv->phexpr, root);
 					joinrel->reltarget->cost.startup += cost.startup;
 					joinrel->reltarget->cost.per_tuple += cost.per_tuple;
-					joinrel->reltarget->width += phinfo->ph_width;
+					tuple_width += phinfo->ph_width;
 				}
 			}
 
@@ -445,6 +471,8 @@ add_placeholders_to_joinrel(PlannerInfo *root, RelOptInfo *joinrel,
 								phinfo->ph_lateral);
 		}
 	}
+
+	joinrel->reltarget->width = clamp_width_est(tuple_width);
 }
 
 /*

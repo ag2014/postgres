@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 # .. so that includes of hstore/hstore.h work
 hstore_inc = include_directories('.', '../')
@@ -50,6 +50,7 @@ tests += {
   'regress': {
     'sql': [
       'hstore',
+      'hstore_utf8',
     ],
   },
 }

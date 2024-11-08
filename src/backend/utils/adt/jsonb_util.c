@@ -3,7 +3,7 @@
  * jsonb_util.c
  *	  converting between Jsonb and JsonbValues, and iterating.
  *
- * Copyright (c) 2014-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2024, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -14,13 +14,11 @@
 #include "postgres.h"
 
 #include "catalog/pg_collation.h"
-#include "catalog/pg_type.h"
 #include "common/hashfn.h"
-#include "common/jsonapi.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
-#include "utils/builtins.h"
 #include "utils/datetime.h"
+#include "utils/fmgrprotos.h"
 #include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/memutils.h"
@@ -64,7 +62,8 @@ static int	lengthCompareJsonbStringValue(const void *a, const void *b);
 static int	lengthCompareJsonbString(const char *val1, int len1,
 									 const char *val2, int len2);
 static int	lengthCompareJsonbPair(const void *a, const void *b, void *binequal);
-static void uniqueifyJsonbObject(JsonbValue *object);
+static void uniqueifyJsonbObject(JsonbValue *object, bool unique_keys,
+								 bool skip_nulls);
 static JsonbValue *pushJsonbValueScalar(JsonbParseState **pstate,
 										JsonbIteratorToken seq,
 										JsonbValue *scalarVal);
@@ -689,7 +688,9 @@ pushJsonbValueScalar(JsonbParseState **pstate, JsonbIteratorToken seq,
 			appendElement(*pstate, scalarVal);
 			break;
 		case WJB_END_OBJECT:
-			uniqueifyJsonbObject(&(*pstate)->contVal);
+			uniqueifyJsonbObject(&(*pstate)->contVal,
+								 (*pstate)->unique_keys,
+								 (*pstate)->skip_nulls);
 			/* fall through! */
 		case WJB_END_ARRAY:
 			/* Steps here common to WJB_END_OBJECT case */
@@ -732,6 +733,9 @@ pushState(JsonbParseState **pstate)
 	JsonbParseState *ns = palloc(sizeof(JsonbParseState));
 
 	ns->next = *pstate;
+	ns->unique_keys = false;
+	ns->skip_nulls = false;
+
 	return ns;
 }
 
@@ -1664,7 +1668,7 @@ convertJsonbArray(StringInfo buffer, JEntry *header, JsonbValue *val, int level)
 		if (totallen > JENTRY_OFFLENMASK)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("total size of jsonb array elements exceeds the maximum of %u bytes",
+					 errmsg("total size of jsonb array elements exceeds the maximum of %d bytes",
 							JENTRY_OFFLENMASK)));
 
 		/*
@@ -1684,7 +1688,7 @@ convertJsonbArray(StringInfo buffer, JEntry *header, JsonbValue *val, int level)
 	if (totallen > JENTRY_OFFLENMASK)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("total size of jsonb array elements exceeds the maximum of %u bytes",
+				 errmsg("total size of jsonb array elements exceeds the maximum of %d bytes",
 						JENTRY_OFFLENMASK)));
 
 	/* Initialize the header of this node in the container's JEntry array */
@@ -1745,7 +1749,7 @@ convertJsonbObject(StringInfo buffer, JEntry *header, JsonbValue *val, int level
 		if (totallen > JENTRY_OFFLENMASK)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("total size of jsonb object elements exceeds the maximum of %u bytes",
+					 errmsg("total size of jsonb object elements exceeds the maximum of %d bytes",
 							JENTRY_OFFLENMASK)));
 
 		/*
@@ -1780,7 +1784,7 @@ convertJsonbObject(StringInfo buffer, JEntry *header, JsonbValue *val, int level
 		if (totallen > JENTRY_OFFLENMASK)
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-					 errmsg("total size of jsonb object elements exceeds the maximum of %u bytes",
+					 errmsg("total size of jsonb object elements exceeds the maximum of %d bytes",
 							JENTRY_OFFLENMASK)));
 
 		/*
@@ -1800,7 +1804,7 @@ convertJsonbObject(StringInfo buffer, JEntry *header, JsonbValue *val, int level
 	if (totallen > JENTRY_OFFLENMASK)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("total size of jsonb object elements exceeds the maximum of %u bytes",
+				 errmsg("total size of jsonb object elements exceeds the maximum of %d bytes",
 						JENTRY_OFFLENMASK)));
 
 	/* Initialize the header of this node in the container's JEntry array */
@@ -1936,7 +1940,7 @@ lengthCompareJsonbPair(const void *a, const void *b, void *binequal)
  * Sort and unique-ify pairs in JsonbValue object
  */
 static void
-uniqueifyJsonbObject(JsonbValue *object)
+uniqueifyJsonbObject(JsonbValue *object, bool unique_keys, bool skip_nulls)
 {
 	bool		hasNonUniq = false;
 
@@ -1946,23 +1950,43 @@ uniqueifyJsonbObject(JsonbValue *object)
 		qsort_arg(object->val.object.pairs, object->val.object.nPairs, sizeof(JsonbPair),
 				  lengthCompareJsonbPair, &hasNonUniq);
 
-	if (hasNonUniq)
-	{
-		JsonbPair  *ptr = object->val.object.pairs + 1,
-				   *res = object->val.object.pairs;
+	if (hasNonUniq && unique_keys)
+		ereport(ERROR,
+				errcode(ERRCODE_DUPLICATE_JSON_OBJECT_KEY_VALUE),
+				errmsg("duplicate JSON object key value"));
 
-		while (ptr - object->val.object.pairs < object->val.object.nPairs)
+	if (hasNonUniq || skip_nulls)
+	{
+		JsonbPair  *ptr,
+				   *res;
+
+		while (skip_nulls && object->val.object.nPairs > 0 &&
+			   object->val.object.pairs->value.type == jbvNull)
 		{
-			/* Avoid copying over duplicate */
-			if (lengthCompareJsonbStringValue(ptr, res) != 0)
-			{
-				res++;
-				if (ptr != res)
-					memcpy(res, ptr, sizeof(JsonbPair));
-			}
-			ptr++;
+			/* If skip_nulls is true, remove leading items with null */
+			object->val.object.pairs++;
+			object->val.object.nPairs--;
 		}
 
-		object->val.object.nPairs = res + 1 - object->val.object.pairs;
+		if (object->val.object.nPairs > 0)
+		{
+			ptr = object->val.object.pairs + 1;
+			res = object->val.object.pairs;
+
+			while (ptr - object->val.object.pairs < object->val.object.nPairs)
+			{
+				/* Avoid copying over duplicate or null */
+				if (lengthCompareJsonbStringValue(ptr, res) != 0 &&
+					(!skip_nulls || ptr->value.type != jbvNull))
+				{
+					res++;
+					if (ptr != res)
+						memcpy(res, ptr, sizeof(JsonbPair));
+				}
+				ptr++;
+			}
+
+			object->val.object.nPairs = res + 1 - object->val.object.pairs;
+		}
 	}
 }

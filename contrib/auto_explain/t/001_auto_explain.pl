@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -19,7 +19,7 @@ sub query_log
 	local $ENV{PGOPTIONS} = join " ",
 	  map { "-c $_=$params->{$_}" } keys %$params;
 
-	my $log    = $node->logfile();
+	my $log = $node->logfile();
 	my $offset = -s $log;
 
 	$node->safe_psql("postgres", $sql);
@@ -113,7 +113,7 @@ $log_contents = query_log(
 	"SELECT * FROM pg_class;",
 	{
 		"auto_explain.log_verbose" => "on",
-		"compute_query_id"         => "on"
+		"compute_query_id" => "on"
 	});
 
 like(
@@ -127,7 +127,7 @@ $log_contents = query_log(
 	"SELECT * FROM pg_class;",
 	{
 		"auto_explain.log_verbose" => "on",
-		"compute_query_id"         => "regress"
+		"compute_query_id" => "regress"
 	});
 
 unlike(

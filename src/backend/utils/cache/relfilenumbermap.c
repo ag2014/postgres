@@ -3,7 +3,7 @@
  * relfilenumbermap.c
  *	  relfilenumber to oid mapping cache.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,12 +19,10 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_tablespace.h"
 #include "miscadmin.h"
-#include "utils/builtins.h"
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
-#include "utils/rel.h"
 #include "utils/relfilenumbermap.h"
 #include "utils/relmapper.h"
 
@@ -143,7 +141,6 @@ RelidByRelfilenumber(Oid reltablespace, RelFileNumber relfilenumber)
 	SysScanDesc scandesc;
 	Relation	relation;
 	HeapTuple	ntp;
-	ScanKeyData skey[2];
 	Oid			relid;
 
 	if (RelfilenumberMapHash == NULL)
@@ -183,6 +180,8 @@ RelidByRelfilenumber(Oid reltablespace, RelFileNumber relfilenumber)
 	}
 	else
 	{
+		ScanKeyData skey[2];
+
 		/*
 		 * Not a shared table, could either be a plain relation or a
 		 * non-shared, nailed one, like e.g. pg_class.
@@ -191,10 +190,8 @@ RelidByRelfilenumber(Oid reltablespace, RelFileNumber relfilenumber)
 		/* check for plain relations by looking in pg_class */
 		relation = table_open(RelationRelationId, AccessShareLock);
 
-		/* copy scankey to local copy, it will be modified during the scan */
+		/* copy scankey to local copy and set scan arguments */
 		memcpy(skey, relfilenumber_skey, sizeof(skey));
-
-		/* set scan arguments */
 		skey[0].sk_argument = ObjectIdGetDatum(reltablespace);
 		skey[1].sk_argument = ObjectIdGetDatum(relfilenumber);
 

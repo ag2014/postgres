@@ -32,14 +32,11 @@
 #include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/relation.h"
-#include "access/table.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
-#include "storage/lmgr.h"
-#include "utils/builtins.h"
 #include "utils/rel.h"
 #include "utils/varlena.h"
 
@@ -238,6 +235,18 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 				 errmsg("cannot access temporary tables of other sessions")));
 
 	/*
+	 * A !indisready index could lead to ERRCODE_DATA_CORRUPTED later, so exit
+	 * early.  We're capable of assessing an indisready&&!indisvalid index,
+	 * but the results could be confusing.  For example, the index's size
+	 * could be too low for a valid index of the table.
+	 */
+	if (!rel->rd_index->indisvalid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("index \"%s\" is not valid",
+						RelationGetRelationName(rel))));
+
+	/*
 	 * Read metapage
 	 */
 	{
@@ -299,7 +308,7 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 
 			max_avail = BLCKSZ - (BLCKSZ - ((PageHeader) page)->pd_special + SizeOfPageHeaderData);
 			indexStat.max_avail += max_avail;
-			indexStat.free_space += PageGetFreeSpace(page);
+			indexStat.free_space += PageGetExactFreeSpace(page);
 
 			indexStat.leaf_pages++;
 
@@ -523,6 +532,13 @@ pgstatginindex_internal(Oid relid, FunctionCallInfo fcinfo)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary indexes of other sessions")));
 
+	/* see pgstatindex_impl */
+	if (!rel->rd_index->indisvalid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("index \"%s\" is not valid",
+						RelationGetRelationName(rel))));
+
 	/*
 	 * Read metapage
 	 */
@@ -581,10 +597,9 @@ pgstathashindex(PG_FUNCTION_ARGS)
 	float8		free_percent;
 	uint64		total_space;
 
-	rel = index_open(relid, AccessShareLock);
+	rel = relation_open(relid, AccessShareLock);
 
-	/* index_open() checks that it's an index */
-	if (!IS_HASH(rel))
+	if (!IS_INDEX(rel) || !IS_HASH(rel))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("relation \"%s\" is not a hash index",
@@ -599,6 +614,13 @@ pgstathashindex(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary indexes of other sessions")));
+
+	/* see pgstatindex_impl */
+	if (!rel->rd_index->indisvalid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("index \"%s\" is not valid",
+						RelationGetRelationName(rel))));
 
 	/* Get the information we need from the metapage. */
 	memset(&stats, 0, sizeof(stats));

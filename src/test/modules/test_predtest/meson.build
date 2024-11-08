@@ -1,6 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
-
-# FIXME: prevent install during main install, but not during test :/
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 test_predtest_sources = files(
   'test_predtest.c',
@@ -14,14 +12,13 @@ endif
 
 test_predtest = shared_module('test_predtest',
   test_predtest_sources,
-  kwargs: pg_mod_args,
+  kwargs: pg_test_mod_args,
 )
-testprep_targets += test_predtest
+test_install_libs += test_predtest
 
-install_data(
+test_install_data += files(
   'test_predtest.control',
   'test_predtest--1.0.sql',
-  kwargs: contrib_data_args,
 )
 
 tests += {

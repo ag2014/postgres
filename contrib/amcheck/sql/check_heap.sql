@@ -36,26 +36,30 @@ INSERT INTO heaptest (a, b)
 --
 -- Create an alternative tablespace and move the heaptest table to it, causing
 -- it to be rewritten and all the blocks to reliably evicted from shared
--- buffers -- guaranteeing actual reads when we next select from it.
+-- buffers -- guaranteeing actual reads when we next select from it in the
+-- same transaction.  The heaptest table is smaller than the default
+-- wal_skip_threshold, so a wal_level=minimal commit reads the table into
+-- shared_buffers.  A transaction delays that and excludes any autovacuum.
 SET allow_in_place_tablespaces = true;
 CREATE TABLESPACE regress_test_stats_tblspc LOCATION '';
 SELECT sum(reads) AS stats_bulkreads_before
-  FROM pg_stat_io WHERE io_context = 'bulkread' \gset
+  FROM pg_stat_io WHERE context = 'bulkread' \gset
+BEGIN;
 ALTER TABLE heaptest SET TABLESPACE regress_test_stats_tblspc;
-
 -- Check that valid options are not rejected nor corruption reported
 -- for a non-empty table
 SELECT * FROM verify_heapam(relation := 'heaptest', skip := 'none');
 SELECT * FROM verify_heapam(relation := 'heaptest', skip := 'all-frozen');
 SELECT * FROM verify_heapam(relation := 'heaptest', skip := 'all-visible');
 SELECT * FROM verify_heapam(relation := 'heaptest', startblock := 0, endblock := 0);
+COMMIT;
 
 -- verify_heapam should have read in the page written out by
 --   ALTER TABLE ... SET TABLESPACE ...
 -- causing an additional bulkread, which should be reflected in pg_stat_io.
 SELECT pg_stat_force_next_flush();
 SELECT sum(reads) AS stats_bulkreads_after
-  FROM pg_stat_io WHERE io_context = 'bulkread' \gset
+  FROM pg_stat_io WHERE context = 'bulkread' \gset
 SELECT :stats_bulkreads_after > :stats_bulkreads_before;
 
 CREATE ROLE regress_heaptest_role;

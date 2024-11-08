@@ -2,7 +2,7 @@
  * applyparallelworker.c
  *	   Support routines for applying xact by parallel apply worker
  *
- * Copyright (c) 2023, PostgreSQL Global Development Group
+ * Copyright (c) 2023-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/applyparallelworker.c
@@ -435,7 +435,8 @@ pa_launch_parallel_worker(void)
 		return NULL;
 	}
 
-	launched = logicalrep_worker_launch(MyLogicalRepWorker->dbid,
+	launched = logicalrep_worker_launch(WORKERTYPE_PARALLEL_APPLY,
+										MyLogicalRepWorker->dbid,
 										MySubscription->oid,
 										MySubscription->name,
 										MyLogicalRepWorker->userid,
@@ -508,7 +509,6 @@ pa_allocate_worker(TransactionId xid)
 	winfo->in_use = true;
 	winfo->serialize_changes = false;
 	entry->winfo = winfo;
-	entry->xid = xid;
 }
 
 /*
@@ -577,16 +577,7 @@ pa_free_worker(ParallelApplyWorkerInfo *winfo)
 		list_length(ParallelApplyWorkerPool) >
 		(max_parallel_apply_workers_per_subscription / 2))
 	{
-		int			slot_no;
-		uint16		generation;
-
-		SpinLockAcquire(&winfo->shared->mutex);
-		generation = winfo->shared->logicalrep_worker_generation;
-		slot_no = winfo->shared->logicalrep_worker_slot_no;
-		SpinLockRelease(&winfo->shared->mutex);
-
-		logicalrep_pa_worker_stop(slot_no, generation);
-
+		logicalrep_pa_worker_stop(winfo);
 		pa_free_worker_info(winfo);
 
 		return;
@@ -636,8 +627,11 @@ pa_detach_all_error_mq(void)
 	{
 		ParallelApplyWorkerInfo *winfo = (ParallelApplyWorkerInfo *) lfirst(lc);
 
-		shm_mq_detach(winfo->error_mq_handle);
-		winfo->error_mq_handle = NULL;
+		if (winfo->error_mq_handle)
+		{
+			shm_mq_detach(winfo->error_mq_handle);
+			winfo->error_mq_handle = NULL;
+		}
 	}
 }
 
@@ -779,10 +773,7 @@ LogicalParallelApplyLoop(shm_mq_handle *mqh)
 			if (len == 0)
 				elog(ERROR, "invalid message length");
 
-			s.cursor = 0;
-			s.maxlen = -1;
-			s.data = (char *) data;
-			s.len = len;
+			initReadOnlyStringInfo(&s, data, len);
 
 			/*
 			 * The first byte of messages sent from leader apply worker to
@@ -845,13 +836,16 @@ LogicalParallelApplyLoop(shm_mq_handle *mqh)
  * Make sure the leader apply worker tries to read from our error queue one more
  * time. This guards against the case where we exit uncleanly without sending
  * an ErrorResponse, for example because some code calls proc_exit directly.
+ *
+ * Also explicitly detach from dsm segment to invoke on_dsm_detach callbacks,
+ * if any. See ParallelWorkerShutdown for details.
  */
 static void
 pa_shutdown(int code, Datum arg)
 {
 	SendProcSignal(MyLogicalRepWorker->leader_pid,
 				   PROCSIG_PARALLEL_APPLY_MESSAGE,
-				   InvalidBackendId);
+				   INVALID_PROC_NUMBER);
 
 	dsm_detach((dsm_segment *) DatumGetPointer(arg));
 }
@@ -873,6 +867,8 @@ ParallelApplyWorkerMain(Datum main_arg)
 	int			worker_slot = DatumGetInt32(main_arg);
 	char		originname[NAMEDATALEN];
 
+	InitializingApplyWorker = true;
+
 	/* Setup signal handling. */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGINT, SignalHandlerForShutdownRequest);
@@ -891,15 +887,13 @@ ParallelApplyWorkerMain(Datum main_arg)
 	if (!seg)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("unable to map dynamic shared memory segment")));
+				 errmsg("could not map dynamic shared memory segment")));
 
 	toc = shm_toc_attach(PG_LOGICAL_APPLY_SHM_MAGIC, dsm_segment_address(seg));
 	if (!toc)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("bad magic number in dynamic shared memory segment")));
-
-	before_shmem_exit(pa_shutdown, PointerGetDatum(seg));
+				 errmsg("invalid magic number in dynamic shared memory segment")));
 
 	/* Look up the shared information. */
 	shared = shm_toc_lookup(toc, PARALLEL_APPLY_KEY_SHARED, false);
@@ -919,6 +913,13 @@ ParallelApplyWorkerMain(Datum main_arg)
 	 */
 	logicalrep_worker_attach(worker_slot);
 
+	/*
+	 * Register the shutdown callback after we are attached to the worker
+	 * slot. This is to ensure that MyLogicalRepWorker remains valid when this
+	 * callback is invoked.
+	 */
+	before_shmem_exit(pa_shutdown, PointerGetDatum(seg));
+
 	SpinLockAcquire(&MyParallelShared->mutex);
 	MyParallelShared->logicalrep_worker_generation = MyLogicalRepWorker->generation;
 	MyParallelShared->logicalrep_worker_slot_no = worker_slot;
@@ -933,12 +934,14 @@ ParallelApplyWorkerMain(Datum main_arg)
 
 	pq_redirect_to_shm_mq(seg, error_mqh);
 	pq_set_parallel_leader(MyLogicalRepWorker->leader_pid,
-						   InvalidBackendId);
+						   INVALID_PROC_NUMBER);
 
 	MyLogicalRepWorker->last_send_time = MyLogicalRepWorker->last_recv_time =
 		MyLogicalRepWorker->reply_time = 0;
 
-	InitializeApplyWorker();
+	InitializeLogRepWorker();
+
+	InitializingApplyWorker = false;
 
 	/* Setup replication origin tracking. */
 	StartTransactionCommand();
@@ -1153,7 +1156,7 @@ pa_send_data(ParallelApplyWorkerInfo *winfo, Size nbytes, const void *data)
 	 * We don't try to send data to parallel worker for 'immediate' mode. This
 	 * is primarily used for testing purposes.
 	 */
-	if (unlikely(logical_replication_mode == LOGICAL_REP_MODE_IMMEDIATE))
+	if (unlikely(debug_logical_replication_streaming == DEBUG_LOGICAL_REP_STREAMING_IMMEDIATE))
 		return false;
 
 /*

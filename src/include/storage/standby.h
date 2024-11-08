@@ -4,7 +4,7 @@
  *	  Definitions for hot standby mode.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/standby.h
@@ -21,7 +21,6 @@
 #include "storage/standbydefs.h"
 
 /* User-settable GUC parameters */
-extern PGDLLIMPORT int vacuum_defer_cleanup_age;
 extern PGDLLIMPORT int max_standby_archive_delay;
 extern PGDLLIMPORT int max_standby_streaming_delay;
 extern PGDLLIMPORT bool log_recovery_conflict_waits;
@@ -30,8 +29,10 @@ extern void InitRecoveryTransactionEnvironment(void);
 extern void ShutdownRecoveryTransactionEnvironment(void);
 
 extern void ResolveRecoveryConflictWithSnapshot(TransactionId snapshotConflictHorizon,
+												bool isCatalogRel,
 												RelFileLocator locator);
 extern void ResolveRecoveryConflictWithSnapshotFullXid(FullTransactionId snapshotConflictHorizon,
+													   bool isCatalogRel,
 													   RelFileLocator locator);
 extern void ResolveRecoveryConflictWithTablespace(Oid tsid);
 extern void ResolveRecoveryConflictWithDatabase(Oid dbid);
@@ -74,13 +75,23 @@ extern void StandbyReleaseOldLocks(TransactionId oldxid);
  * almost immediately see the data we need to begin executing queries.
  */
 
+typedef enum
+{
+	SUBXIDS_IN_ARRAY,			/* xids array includes all running subxids */
+	SUBXIDS_MISSING,			/* snapshot overflowed, subxids are missing */
+	SUBXIDS_IN_SUBTRANS,		/* subxids are not included in 'xids', but
+								 * pg_subtrans is fully up-to-date */
+} subxids_array_status;
+
 typedef struct RunningTransactionsData
 {
 	int			xcnt;			/* # of xact ids in xids[] */
 	int			subxcnt;		/* # of subxact ids in xids[] */
-	bool		subxid_overflow;	/* snapshot overflowed, subxids missing */
-	TransactionId nextXid;		/* xid from ShmemVariableCache->nextXid */
+	subxids_array_status subxid_status;
+	TransactionId nextXid;		/* xid from TransamVariables->nextXid */
 	TransactionId oldestRunningXid; /* *not* oldestXmin */
+	TransactionId oldestDatabaseRunningXid; /* same as above, but within the
+											 * current database */
 	TransactionId latestCompletedXid;	/* so we can set xmax */
 
 	TransactionId *xids;		/* array of (sub)xids still running */

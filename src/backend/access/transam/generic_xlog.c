@@ -4,7 +4,7 @@
  *	 Implementation of generic xlog records.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/generic_xlog.c
@@ -17,7 +17,6 @@
 #include "access/generic_xlog.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
-#include "utils/memutils.h"
 
 /*-------------------------------------------------------------------------
  * Internally, a delta between pages consists of a set of fragments.  Each
@@ -56,25 +55,28 @@ typedef struct
 	char	   *image;			/* copy of page image for modification, do not
 								 * do it in-place to have aligned memory chunk */
 	char		delta[MAX_DELTA_SIZE];	/* delta between page images */
-} PageData;
+} GenericXLogPageData;
 
-/* State of generic xlog record construction */
+/*
+ * State of generic xlog record construction.  Must be allocated at an I/O
+ * aligned address.
+ */
 struct GenericXLogState
 {
+	/* Page images (properly aligned, must be first) */
+	PGIOAlignedBlock images[MAX_GENERIC_XLOG_PAGES];
 	/* Info about each page, see above */
-	PageData	pages[MAX_GENERIC_XLOG_PAGES];
+	GenericXLogPageData pages[MAX_GENERIC_XLOG_PAGES];
 	bool		isLogged;
-	/* Page images (properly aligned) */
-	PGAlignedBlock images[MAX_GENERIC_XLOG_PAGES];
 };
 
-static void writeFragment(PageData *pageData, OffsetNumber offset,
+static void writeFragment(GenericXLogPageData *pageData, OffsetNumber offset,
 						  OffsetNumber length, const char *data);
-static void computeRegionDelta(PageData *pageData,
+static void computeRegionDelta(GenericXLogPageData *pageData,
 							   const char *curpage, const char *targetpage,
 							   int targetStart, int targetEnd,
 							   int validStart, int validEnd);
-static void computeDelta(PageData *pageData, Page curpage, Page targetpage);
+static void computeDelta(GenericXLogPageData *pageData, Page curpage, Page targetpage);
 static void applyPageRedo(Page page, const char *delta, Size deltaSize);
 
 
@@ -85,7 +87,7 @@ static void applyPageRedo(Page page, const char *delta, Size deltaSize);
  * actual data (of length length).
  */
 static void
-writeFragment(PageData *pageData, OffsetNumber offset, OffsetNumber length,
+writeFragment(GenericXLogPageData *pageData, OffsetNumber offset, OffsetNumber length,
 			  const char *data)
 {
 	char	   *ptr = pageData->delta + pageData->deltaLen;
@@ -116,7 +118,7 @@ writeFragment(PageData *pageData, OffsetNumber offset, OffsetNumber length,
  * about the data-matching loops.
  */
 static void
-computeRegionDelta(PageData *pageData,
+computeRegionDelta(GenericXLogPageData *pageData,
 				   const char *curpage, const char *targetpage,
 				   int targetStart, int targetEnd,
 				   int validStart, int validEnd)
@@ -223,7 +225,7 @@ computeRegionDelta(PageData *pageData,
  * and store it in pageData's delta field.
  */
 static void
-computeDelta(PageData *pageData, Page curpage, Page targetpage)
+computeDelta(GenericXLogPageData *pageData, Page curpage, Page targetpage)
 {
 	int			targetLower = ((PageHeader) targetpage)->pd_lower,
 				targetUpper = ((PageHeader) targetpage)->pd_upper,
@@ -269,7 +271,9 @@ GenericXLogStart(Relation relation)
 	GenericXLogState *state;
 	int			i;
 
-	state = (GenericXLogState *) palloc(sizeof(GenericXLogState));
+	state = (GenericXLogState *) palloc_aligned(sizeof(GenericXLogState),
+												PG_IO_ALIGN_SIZE,
+												0);
 	state->isLogged = RelationNeedsWAL(relation);
 
 	for (i = 0; i < MAX_GENERIC_XLOG_PAGES; i++)
@@ -299,7 +303,7 @@ GenericXLogRegisterBuffer(GenericXLogState *state, Buffer buffer, int flags)
 	/* Search array for existing entry or first unused slot */
 	for (block_id = 0; block_id < MAX_GENERIC_XLOG_PAGES; block_id++)
 	{
-		PageData   *page = &state->pages[block_id];
+		GenericXLogPageData *page = &state->pages[block_id];
 
 		if (BufferIsInvalid(page->buffer))
 		{
@@ -342,9 +346,13 @@ GenericXLogFinish(GenericXLogState *state)
 
 		START_CRIT_SECTION();
 
+		/*
+		 * Compute deltas if necessary, write changes to buffers, mark buffers
+		 * dirty, and register changes.
+		 */
 		for (i = 0; i < MAX_GENERIC_XLOG_PAGES; i++)
 		{
-			PageData   *pageData = &state->pages[i];
+			GenericXLogPageData *pageData = &state->pages[i];
 			Page		page;
 			PageHeader	pageHeader;
 
@@ -354,41 +362,34 @@ GenericXLogFinish(GenericXLogState *state)
 			page = BufferGetPage(pageData->buffer);
 			pageHeader = (PageHeader) pageData->image;
 
+			/*
+			 * Compute delta while we still have both the unmodified page and
+			 * the new image. Not needed if we are logging the full image.
+			 */
+			if (!(pageData->flags & GENERIC_XLOG_FULL_IMAGE))
+				computeDelta(pageData, page, (Page) pageData->image);
+
+			/*
+			 * Apply the image, being careful to zero the "hole" between
+			 * pd_lower and pd_upper in order to avoid divergence between
+			 * actual page state and what replay would produce.
+			 */
+			memcpy(page, pageData->image, pageHeader->pd_lower);
+			memset(page + pageHeader->pd_lower, 0,
+				   pageHeader->pd_upper - pageHeader->pd_lower);
+			memcpy(page + pageHeader->pd_upper,
+				   pageData->image + pageHeader->pd_upper,
+				   BLCKSZ - pageHeader->pd_upper);
+
+			MarkBufferDirty(pageData->buffer);
+
 			if (pageData->flags & GENERIC_XLOG_FULL_IMAGE)
 			{
-				/*
-				 * A full-page image does not require us to supply any xlog
-				 * data.  Just apply the image, being careful to zero the
-				 * "hole" between pd_lower and pd_upper in order to avoid
-				 * divergence between actual page state and what replay would
-				 * produce.
-				 */
-				memcpy(page, pageData->image, pageHeader->pd_lower);
-				memset(page + pageHeader->pd_lower, 0,
-					   pageHeader->pd_upper - pageHeader->pd_lower);
-				memcpy(page + pageHeader->pd_upper,
-					   pageData->image + pageHeader->pd_upper,
-					   BLCKSZ - pageHeader->pd_upper);
-
 				XLogRegisterBuffer(i, pageData->buffer,
 								   REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
 			}
 			else
 			{
-				/*
-				 * In normal mode, calculate delta and write it as xlog data
-				 * associated with this page.
-				 */
-				computeDelta(pageData, page, (Page) pageData->image);
-
-				/* Apply the image, with zeroed "hole" as above */
-				memcpy(page, pageData->image, pageHeader->pd_lower);
-				memset(page + pageHeader->pd_lower, 0,
-					   pageHeader->pd_upper - pageHeader->pd_lower);
-				memcpy(page + pageHeader->pd_upper,
-					   pageData->image + pageHeader->pd_upper,
-					   BLCKSZ - pageHeader->pd_upper);
-
 				XLogRegisterBuffer(i, pageData->buffer, REGBUF_STANDARD);
 				XLogRegisterBufData(i, pageData->delta, pageData->deltaLen);
 			}
@@ -397,15 +398,14 @@ GenericXLogFinish(GenericXLogState *state)
 		/* Insert xlog record */
 		lsn = XLogInsert(RM_GENERIC_ID, 0);
 
-		/* Set LSN and mark buffers dirty */
+		/* Set LSN */
 		for (i = 0; i < MAX_GENERIC_XLOG_PAGES; i++)
 		{
-			PageData   *pageData = &state->pages[i];
+			GenericXLogPageData *pageData = &state->pages[i];
 
 			if (BufferIsInvalid(pageData->buffer))
 				continue;
 			PageSetLSN(BufferGetPage(pageData->buffer), lsn);
-			MarkBufferDirty(pageData->buffer);
 		}
 		END_CRIT_SECTION();
 	}
@@ -415,7 +415,7 @@ GenericXLogFinish(GenericXLogState *state)
 		START_CRIT_SECTION();
 		for (i = 0; i < MAX_GENERIC_XLOG_PAGES; i++)
 		{
-			PageData   *pageData = &state->pages[i];
+			GenericXLogPageData *pageData = &state->pages[i];
 
 			if (BufferIsInvalid(pageData->buffer))
 				continue;

@@ -1,11 +1,13 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 pg_dump_common_sources = files(
   'compress_gzip.c',
   'compress_io.c',
   'compress_lz4.c',
   'compress_none.c',
+  'compress_zstd.c',
   'dumputils.c',
+  'filter.c',
   'parallel.c',
   'pg_backup_archiver.c',
   'pg_backup_custom.c',
@@ -19,7 +21,7 @@ pg_dump_common_sources = files(
 pg_dump_common = static_library('libpgdump_common',
   pg_dump_common_sources,
   c_pch: pch_postgres_fe_h,
-  dependencies: [frontend_code, libpq, lz4, zlib],
+  dependencies: [frontend_code, libpq, lz4, zlib, zstd],
   kwargs: internal_lib_args,
 )
 
@@ -88,13 +90,17 @@ tests += {
   'bd': meson.current_build_dir(),
   'tap': {
     'env': {
-      'GZIP_PROGRAM': gzip.path(),
+      'GZIP_PROGRAM': gzip.found() ? gzip.path() : '',
       'LZ4': program_lz4.found() ? program_lz4.path() : '',
+      'ZSTD': program_zstd.found() ? program_zstd.path() : '',
+      'with_icu': icu.found() ? 'yes' : 'no',
     },
     'tests': [
       't/001_basic.pl',
       't/002_pg_dump.pl',
       't/003_pg_dump_with_server.pl',
+      't/004_pg_dump_parallel.pl',
+      't/005_pg_dump_filterfile.pl',
       't/010_dump_connstr.pl',
     ],
   },

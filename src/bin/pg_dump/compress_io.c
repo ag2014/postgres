@@ -4,7 +4,7 @@
  *	 Routines for archivers to write an uncompressed or compressed data
  *	 stream.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * This file includes two APIs for dealing with compressed data. The first
@@ -52,8 +52,8 @@
  *
  *	InitDiscoverCompressFileHandle tries to infer the compression by the
  *	filename suffix. If the suffix is not yet known then it tries to simply
- *	open the file and if it fails, it tries to open the same file with the .gz
- *	suffix, and then again with the .lz4 suffix.
+ *	open the file and if it fails, it tries to open the same file with
+ *	compressed suffixes (.gz, .lz4 and .zst, in this order).
  *
  * IDENTIFICATION
  *	   src/bin/pg_dump/compress_io.c
@@ -69,7 +69,7 @@
 #include "compress_io.h"
 #include "compress_lz4.h"
 #include "compress_none.h"
-#include "pg_backup_utils.h"
+#include "compress_zstd.h"
 
 /*----------------------
  * Generic functions
@@ -77,7 +77,8 @@
  */
 
 /*
- * Checks whether a compression algorithm is supported.
+ * Checks whether support for a compression algorithm is implemented in
+ * pg_dump/restore.
  *
  * On success returns NULL, otherwise returns a malloc'ed string which can be
  * used by the caller in an error message.
@@ -85,8 +86,8 @@
 char *
 supports_compression(const pg_compress_specification compression_spec)
 {
-	const pg_compress_algorithm	algorithm = compression_spec.algorithm;
-	bool						supported = false;
+	const pg_compress_algorithm algorithm = compression_spec.algorithm;
+	bool		supported = false;
 
 	if (algorithm == PG_COMPRESSION_NONE)
 		supported = true;
@@ -98,9 +99,13 @@ supports_compression(const pg_compress_specification compression_spec)
 	if (algorithm == PG_COMPRESSION_LZ4)
 		supported = true;
 #endif
+#ifdef USE_ZSTD
+	if (algorithm == PG_COMPRESSION_ZSTD)
+		supported = true;
+#endif
 
 	if (!supported)
-		return psprintf("this build does not support compression with %s",
+		return psprintf(_("this build does not support compression with %s"),
 						get_compress_algorithm_name(algorithm));
 
 	return NULL;
@@ -130,6 +135,8 @@ AllocateCompressor(const pg_compress_specification compression_spec,
 		InitCompressorGzip(cs, compression_spec);
 	else if (compression_spec.algorithm == PG_COMPRESSION_LZ4)
 		InitCompressorLZ4(cs, compression_spec);
+	else if (compression_spec.algorithm == PG_COMPRESSION_ZSTD)
+		InitCompressorZstd(cs, compression_spec);
 
 	return cs;
 }
@@ -196,8 +203,24 @@ InitCompressFileHandle(const pg_compress_specification compression_spec)
 		InitCompressFileHandleGzip(CFH, compression_spec);
 	else if (compression_spec.algorithm == PG_COMPRESSION_LZ4)
 		InitCompressFileHandleLZ4(CFH, compression_spec);
+	else if (compression_spec.algorithm == PG_COMPRESSION_ZSTD)
+		InitCompressFileHandleZstd(CFH, compression_spec);
 
 	return CFH;
+}
+
+/*
+ * Checks if a compressed file (with the specified extension) exists.
+ *
+ * The filename of the tested file is stored to fname buffer (the existing
+ * buffer is freed, new buffer is allocated and returned through the pointer).
+ */
+static bool
+check_compressed_file(const char *path, char **fname, char *ext)
+{
+	free_keep_errno(*fname);
+	*fname = psprintf("%s.%s", path, ext);
+	return (access(*fname, F_OK) == 0);
 }
 
 /*
@@ -205,11 +228,11 @@ InitCompressFileHandle(const pg_compress_specification compression_spec)
  * be either "r" or "rb".
  *
  * If the file at 'path' contains the suffix of a supported compression method,
- * currently this includes ".gz" and ".lz4", then this compression will be used
+ * currently this includes ".gz", ".lz4" and ".zst", then this compression will be used
  * throughout. Otherwise the compression will be inferred by iteratively trying
  * to open the file at 'path', first as is, then by appending known compression
  * suffixes. So if you pass "foo" as 'path', this will open either "foo" or
- * "foo.gz" or "foo.lz4", trying in that order.
+ * "foo.{gz,lz4,zst}", trying in that order.
  *
  * On failure, return NULL with an error code in errno.
  */
@@ -225,44 +248,28 @@ InitDiscoverCompressFileHandle(const char *path, const char *mode)
 
 	Assert(strcmp(mode, PG_BINARY_R) == 0);
 
-	fname = strdup(path);
+	fname = pg_strdup(path);
 
 	if (hasSuffix(fname, ".gz"))
 		compression_spec.algorithm = PG_COMPRESSION_GZIP;
+	else if (hasSuffix(fname, ".lz4"))
+		compression_spec.algorithm = PG_COMPRESSION_LZ4;
+	else if (hasSuffix(fname, ".zst"))
+		compression_spec.algorithm = PG_COMPRESSION_ZSTD;
 	else
 	{
-		bool		exists;
-
-		exists = (stat(path, &st) == 0);
-		/* avoid unused warning if it is not built with compression */
-		if (exists)
+		if (stat(path, &st) == 0)
 			compression_spec.algorithm = PG_COMPRESSION_NONE;
-#ifdef HAVE_LIBZ
-		if (!exists)
-		{
-			free_keep_errno(fname);
-			fname = psprintf("%s.gz", path);
-			exists = (stat(fname, &st) == 0);
-
-			if (exists)
-				compression_spec.algorithm = PG_COMPRESSION_GZIP;
-		}
-#endif
-#ifdef USE_LZ4
-		if (!exists)
-		{
-			free_keep_errno(fname);
-			fname = psprintf("%s.lz4", path);
-			exists = (stat(fname, &st) == 0);
-
-			if (exists)
-				compression_spec.algorithm = PG_COMPRESSION_LZ4;
-		}
-#endif
+		else if (check_compressed_file(path, &fname, "gz"))
+			compression_spec.algorithm = PG_COMPRESSION_GZIP;
+		else if (check_compressed_file(path, &fname, "lz4"))
+			compression_spec.algorithm = PG_COMPRESSION_LZ4;
+		else if (check_compressed_file(path, &fname, "zst"))
+			compression_spec.algorithm = PG_COMPRESSION_ZSTD;
 	}
 
 	CFH = InitCompressFileHandle(compression_spec);
-	if (CFH->open_func(fname, -1, mode, CFH))
+	if (!CFH->open_func(fname, -1, mode, CFH))
 	{
 		free_keep_errno(CFH);
 		CFH = NULL;
@@ -275,12 +282,12 @@ InitDiscoverCompressFileHandle(const char *path, const char *mode)
 /*
  * Close an open file handle and release its memory.
  *
- * On failure, returns an error value and sets errno appropriately.
+ * On failure, returns false and sets errno appropriately.
  */
-int
+bool
 EndCompressFileHandle(CompressFileHandle *CFH)
 {
-	int			ret = 0;
+	bool		ret = false;
 
 	if (CFH->private_data)
 		ret = CFH->close_func(CFH);

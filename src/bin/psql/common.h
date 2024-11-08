@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2024, PostgreSQL Global Development Group
  *
  * src/bin/psql/common.h
  */
@@ -29,8 +29,10 @@ extern sigjmp_buf sigint_interrupt_jmp;
 
 extern void psql_setup_cancel_handler(void);
 
+extern void SetShellResultVariables(int wait_result);
+
 extern PGresult *PSQLexec(const char *query);
-extern int	PSQLexecWatch(const char *query, const printQueryOpt *opt, FILE *printQueryFout);
+extern int	PSQLexecWatch(const char *query, const printQueryOpt *opt, FILE *printQueryFout, int min_rows);
 
 extern bool SendQuery(const char *query);
 
@@ -39,6 +41,7 @@ extern bool standard_strings(void);
 extern const char *session_username(void);
 
 extern void expand_tilde(char **filename);
+extern void clean_extended_state(void);
 
 extern bool recognized_connection_string(const char *connstr);
 

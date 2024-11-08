@@ -6,7 +6,7 @@
  * We don't support copying RelOptInfo, IndexOptInfo, or Path nodes.
  * There are some subsidiary structs that are useful to copy, though.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/pathnodes.h
@@ -76,7 +76,7 @@ typedef enum UpperRelationKind
 	UPPERREL_PARTIAL_DISTINCT,	/* result of partial "SELECT DISTINCT", if any */
 	UPPERREL_DISTINCT,			/* result of "SELECT DISTINCT", if any */
 	UPPERREL_ORDERED,			/* result of ORDER BY, if any */
-	UPPERREL_FINAL				/* result of any remaining top-level actions */
+	UPPERREL_FINAL,				/* result of any remaining top-level actions */
 	/* NB: UPPERREL_FINAL must be last enum entry; it's used to size arrays */
 } UpperRelationKind;
 
@@ -104,6 +104,9 @@ typedef struct PlannerGlobal
 	/* Plans for SubPlan nodes */
 	List	   *subplans;
 
+	/* Paths from which the SubPlan Plans were made */
+	List	   *subpaths;
+
 	/* PlannerInfos for SubPlan nodes */
 	List	   *subroots pg_node_attr(read_write_ignore);
 
@@ -124,9 +127,6 @@ typedef struct PlannerGlobal
 
 	/* "flat" list of AppendRelInfos */
 	List	   *appendRelations;
-
-	/* List of PartitionPruneInfo contained in the plan */
-	List	   *partPruneInfos;
 
 	/* OIDs of relations the plan depends on */
 	List	   *relationOids;
@@ -400,6 +400,8 @@ struct PlannerInfo
 	List	   *distinct_pathkeys;
 	/* sortClause pathkeys, if any */
 	List	   *sort_pathkeys;
+	/* set operator pathkeys, if any */
+	List	   *setop_pathkeys;
 
 	/* Canonicalised partition schemes used in the query. */
 	List	   *part_schemes pg_node_attr(read_write_ignore);
@@ -424,7 +426,11 @@ struct PlannerInfo
 	 * items to be proven redundant, implying that there is only one group
 	 * containing all the query's rows.  Hence, if you want to check whether
 	 * GROUP BY was specified, test for nonempty parse->groupClause, not for
-	 * nonempty processed_groupClause.
+	 * nonempty processed_groupClause.  Optimizer chooses specific order of
+	 * group-by clauses during the upper paths generation process, attempting
+	 * to use different strategies to minimize number of sorts or engage
+	 * incremental sort.  See preprocess_groupclause() and
+	 * get_useful_group_keys_orderings() for details.
 	 *
 	 * Currently, when grouping sets are specified we do not attempt to
 	 * optimize the groupClause, so that processed_groupClause will be
@@ -504,6 +510,12 @@ struct PlannerInfo
 	bool		hasRecursion;
 
 	/*
+	 * The rangetable index for the RTE_GROUP RTE, or 0 if there is no
+	 * RTE_GROUP RTE.
+	 */
+	int			group_rtindex;
+
+	/*
 	 * Information about aggregates. Filled by preprocess_aggrefs().
 	 */
 	/* AggInfo structs */
@@ -547,9 +559,6 @@ struct PlannerInfo
 
 	/* Does this query modify any partition key columns? */
 	bool		partColsUpdated;
-
-	/* PartitionPruneInfos added in this query's plan. */
-	List	   *partPruneInfos;
 };
 
 
@@ -820,7 +829,7 @@ typedef enum RelOptKind
 	RELOPT_OTHER_MEMBER_REL,
 	RELOPT_OTHER_JOINREL,
 	RELOPT_UPPER_REL,
-	RELOPT_OTHER_UPPER_REL
+	RELOPT_OTHER_UPPER_REL,
 } RelOptKind;
 
 /*
@@ -919,6 +928,12 @@ typedef struct RelOptInfo
 	Relids	   *attr_needed pg_node_attr(read_write_ignore);
 	/* array indexed [min_attr .. max_attr] */
 	int32	   *attr_widths pg_node_attr(read_write_ignore);
+
+	/*
+	 * Zero-based set containing attnums of NOT NULL columns.  Not populated
+	 * for rels corresponding to non-partitioned inh==true RTEs.
+	 */
+	Bitmapset  *notnullattnums;
 	/* relids of outer joins that can null this baserel */
 	Relids		nulling_relids;
 	/* LATERAL Vars and PHVs referenced by rel */
@@ -1092,6 +1107,9 @@ typedef struct IndexOptInfo IndexOptInfo;
 #define HAVE_INDEXOPTINFO_TYPEDEF 1
 #endif
 
+struct IndexPath;				/* avoid including pathnodes.h here */
+struct PlannerInfo;				/* avoid including pathnodes.h here */
+
 struct IndexOptInfo
 {
 	pg_node_attr(no_copy_equal, no_read, no_query_jumble)
@@ -1191,7 +1209,7 @@ struct IndexOptInfo
 	bool		amcanmarkpos;
 	/* AM's cost estimator */
 	/* Rather than include amapi.h here, we declare amcostestimate like this */
-	void		(*amcostestimate) () pg_node_attr(read_write_ignore);
+	void		(*amcostestimate) (struct PlannerInfo *, struct IndexPath *, double, Cost *, Cost *, Selectivity *, double *, double *) pg_node_attr(read_write_ignore);
 };
 
 /*
@@ -1463,6 +1481,23 @@ typedef struct PathKey
 } PathKey;
 
 /*
+ * Contains an order of group-by clauses and the corresponding list of
+ * pathkeys.
+ *
+ * The elements of 'clauses' list should have the same order as the head of
+ * 'pathkeys' list.  The tleSortGroupRef of the clause should be equal to
+ * ec_sortref of the pathkey equivalence class.  If there are redundant
+ * clauses with the same tleSortGroupRef, they must be grouped together.
+ */
+typedef struct GroupByOrdering
+{
+	NodeTag		type;
+
+	List	   *pathkeys;
+	List	   *clauses;
+} GroupByOrdering;
+
+/*
  * VolatileFunctionStatus -- allows nodes to cache their
  * contain_volatile_functions properties. VOLATILITY_UNKNOWN means not yet
  * determined.
@@ -1471,7 +1506,7 @@ typedef enum VolatileFunctionStatus
 {
 	VOLATILITY_UNKNOWN = 0,
 	VOLATILITY_VOLATILE,
-	VOLATILITY_NOVOLATILE
+	VOLATILITY_NOVOLATILE,
 } VolatileFunctionStatus;
 
 /*
@@ -1632,6 +1667,7 @@ typedef struct Path
 
 	/* estimated size/costs for path (see costsize.c for more info) */
 	Cardinality rows;			/* estimated number of result tuples */
+	int			disabled_nodes; /* count of disabled nodes */
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 
@@ -1828,6 +1864,10 @@ typedef struct SubqueryScanPath
  * ForeignPath represents a potential scan of a foreign table, foreign join
  * or foreign upper-relation.
  *
+ * In the case of a foreign join, fdw_restrictinfo stores the RestrictInfos to
+ * apply to the join, which are used by createplan.c to get pseudoconstant
+ * clauses evaluated as one-time quals in a gating Result plan node.
+ *
  * fdw_private stores FDW private data about the scan.  While fdw_private is
  * not actually touched by the core code during normal operations, it's
  * generally a good idea to use a representation that can be dumped by
@@ -1838,19 +1878,27 @@ typedef struct ForeignPath
 {
 	Path		path;
 	Path	   *fdw_outerpath;
+	List	   *fdw_restrictinfo;
 	List	   *fdw_private;
 } ForeignPath;
 
 /*
- * CustomPath represents a table scan done by some out-of-core extension.
+ * CustomPath represents a table scan or a table join done by some out-of-core
+ * extension.
  *
  * We provide a set of hooks here - which the provider must take care to set
  * up correctly - to allow extensions to supply their own methods of scanning
- * a relation.  For example, a provider might provide GPU acceleration, a
- * cache-based scan, or some other kind of logic we haven't dreamed up yet.
+ * a relation or join relations.  For example, a provider might provide GPU
+ * acceleration, a cache-based scan, or some other kind of logic we haven't
+ * dreamed up yet.
  *
- * CustomPaths can be injected into the planning process for a relation by
- * set_rel_pathlist_hook functions.
+ * CustomPaths can be injected into the planning process for a base or join
+ * relation by set_rel_pathlist_hook or set_join_pathlist_hook functions,
+ * respectively.
+ *
+ * In the case of a table join, custom_restrictinfo stores the RestrictInfos
+ * to apply to the join, which are used by createplan.c to get pseudoconstant
+ * clauses evaluated as one-time quals in a gating Result plan node.
  *
  * Core code must avoid assuming that the CustomPath is only as large as
  * the structure declared here; providers are allowed to make it the first
@@ -1868,6 +1916,7 @@ typedef struct CustomPath
 	uint32		flags;			/* mask of CUSTOMPATH_* flags, see
 								 * nodes/extensible.h */
 	List	   *custom_paths;	/* list of child Path nodes, if any */
+	List	   *custom_restrictinfo;
 	List	   *custom_private;
 	const struct CustomPathMethods *methods;
 } CustomPath;
@@ -1980,7 +2029,7 @@ typedef enum UniquePathMethod
 {
 	UNIQUE_PATH_NOOP,			/* input is known unique already */
 	UNIQUE_PATH_HASH,			/* use hashing */
-	UNIQUE_PATH_SORT			/* use sorting */
+	UNIQUE_PATH_SORT,			/* use sorting */
 } UniquePathMethod;
 
 typedef struct UniquePath
@@ -2280,6 +2329,7 @@ typedef struct WindowAggPath
 	Path	   *subpath;		/* path representing input source */
 	WindowClause *winclause;	/* WindowClause we'll be using */
 	List	   *qual;			/* lower-level WindowAgg runconditions */
+	List	   *runCondition;	/* OpExpr List to short-circuit execution */
 	bool		topwindow;		/* false for all apart from the WindowAgg
 								 * that's closest to the root of the plan */
 } WindowAggPath;
@@ -2337,7 +2387,7 @@ typedef struct ModifyTablePath
 	CmdType		operation;		/* INSERT, UPDATE, DELETE, or MERGE */
 	bool		canSetTag;		/* do we set the command tag/es_processed? */
 	Index		nominalRelation;	/* Parent RT index for use of EXPLAIN */
-	Index		rootRelation;	/* Root RT index, if target is partitioned */
+	Index		rootRelation;	/* Root RT index, if partitioned/inherited */
 	bool		partColsUpdated;	/* some part key in hierarchy updated? */
 	List	   *resultRelations;	/* integer list of RT indexes */
 	List	   *updateColnosLists;	/* per-target-table update_colnos lists */
@@ -2348,6 +2398,8 @@ typedef struct ModifyTablePath
 	int			epqParam;		/* ID of Param for EvalPlanQual re-eval */
 	List	   *mergeActionLists;	/* per-target-table lists of actions for
 									 * MERGE */
+	List	   *mergeJoinConditions;	/* per-target-table join conditions
+										 * for MERGE */
 } ModifyTablePath;
 
 /*
@@ -2435,6 +2487,15 @@ typedef struct LimitPath
  * (In short, is_pushed_down is only false for non-degenerate outer join
  * conditions.  Possibly we should rename it to reflect that meaning?  But
  * see also the comments for RINFO_IS_PUSHED_DOWN, below.)
+ *
+ * There is also an incompatible_relids field, which is a set of outer-join
+ * relids above which we cannot evaluate the clause (because they might null
+ * Vars it uses that should not be nulled yet).  In principle this could be
+ * filled in any RestrictInfo as the set of OJ relids that appear above the
+ * clause and null Vars that it uses.  In practice we only bother to populate
+ * it for "clone" clauses, as it's currently only needed to prevent multiple
+ * clones of the same clause from being accepted for evaluation at the same
+ * join level.
  *
  * There is also an outer_relids field, which is NULL except for outer join
  * clauses; for those, it is the set of relids on the outer side of the
@@ -2543,6 +2604,9 @@ typedef struct RestrictInfo
 	/* The set of relids required to evaluate the clause: */
 	Relids		required_relids;
 
+	/* Relids above which we cannot evaluate the clause (see comment above) */
+	Relids		incompatible_relids;
+
 	/* If an outer-join clause, the outer-side relations, else NULL: */
 	Relids		outer_relids;
 
@@ -2569,7 +2633,10 @@ typedef struct RestrictInfo
 	 * 2. If we manufacture a commuted version of a qual to use as an index
 	 * condition, it copies the original's rinfo_serial, since it is in
 	 * practice the same condition.
-	 * 3. RestrictInfos made for a child relation copy their parent's
+	 * 3. If we reduce a qual to constant-FALSE, the new constant-FALSE qual
+	 * copies the original's rinfo_serial, since it is in practice the same
+	 * condition.
+	 * 4. RestrictInfos made for a child relation copy their parent's
 	 * rinfo_serial.  Likewise, when an EquivalenceClass makes a derived
 	 * equality clause for a child relation, it copies the rinfo_serial of
 	 * the matching equality clause for the parent.  This allows detection
@@ -2766,8 +2833,9 @@ typedef struct PlaceHolderVar
  * min_lefthand and min_righthand for higher joins.)
  *
  * jointype is never JOIN_RIGHT; a RIGHT JOIN is handled by switching
- * the inputs to make it a LEFT JOIN.  So the allowed values of jointype
- * in a join_info_list member are only LEFT, FULL, SEMI, or ANTI.
+ * the inputs to make it a LEFT JOIN.  It's never JOIN_RIGHT_SEMI or
+ * JOIN_RIGHT_ANTI either.  So the allowed values of jointype in a
+ * join_info_list member are only LEFT, FULL, SEMI, or ANTI.
  *
  * ojrelid is the RT index of the join RTE representing this outer join,
  * if there is one.  It is zero when jointype is INNER or SEMI, and can be
@@ -2788,11 +2856,15 @@ typedef struct PlaceHolderVar
  * 3, when this join is in the RHS of the upper join (so, this is the lower
  * join in the second form of the identity).
  *
- * commute_below is filled with the relids of syntactically-lower outer joins
- * that have been found to commute with this one per outer join identity 3.
- * (We need not record which side they are on, since that can be determined
- * by seeing whether the lower join's relid appears in syn_lefthand or
- * syn_righthand.)
+ * commute_below_l is filled with the relids of syntactically-lower outer
+ * joins that have been found to commute with this one per outer join identity
+ * 3 and are in the LHS of this join (so, this is the upper join in the first
+ * form of the identity).
+ *
+ * commute_below_r is filled with the relids of syntactically-lower outer
+ * joins that have been found to commute with this one per outer join identity
+ * 3 and are in the RHS of this join (so, this is the upper join in the second
+ * form of the identity).
  *
  * lhs_strict is true if the special join's condition cannot succeed when the
  * LHS variables are all NULL (this means that an outer join can commute with
@@ -2815,6 +2887,9 @@ typedef struct PlaceHolderVar
  * cost estimation purposes it is sometimes useful to know the join size under
  * plain innerjoin semantics.  Note that lhs_strict and the semi_xxx fields
  * are not set meaningfully within such structs.
+ *
+ * We also create transient SpecialJoinInfos for child joins during
+ * partitionwise join planning, which are also not present in join_info_list.
  */
 #ifndef HAVE_SPECIALJOININFO_TYPEDEF
 typedef struct SpecialJoinInfo SpecialJoinInfo;
@@ -2834,7 +2909,8 @@ struct SpecialJoinInfo
 	Index		ojrelid;		/* outer join's RT index; 0 if none */
 	Relids		commute_above_l;	/* commuting OJs above this one, if LHS */
 	Relids		commute_above_r;	/* commuting OJs above this one, if RHS */
-	Relids		commute_below;	/* commuting OJs below this one */
+	Relids		commute_below_l;	/* commuting OJs in this one's LHS */
+	Relids		commute_below_r;	/* commuting OJs in this one's RHS */
 	bool		lhs_strict;		/* joinclause is strict for some LHS rel */
 	/* Remaining fields are set only for JOIN_SEMI jointype: */
 	bool		semi_can_btree; /* true if semi_operators are all btree */
@@ -3203,7 +3279,7 @@ typedef enum
 {
 	PARTITIONWISE_AGGREGATE_NONE,
 	PARTITIONWISE_AGGREGATE_FULL,
-	PARTITIONWISE_AGGREGATE_PARTIAL
+	PARTITIONWISE_AGGREGATE_PARTIAL,
 } PartitionwiseAggregateType;
 
 /*
@@ -3267,6 +3343,7 @@ typedef struct
 typedef struct JoinCostWorkspace
 {
 	/* Preliminary cost estimates --- must not be larger than final ones! */
+	int			disabled_nodes;
 	Cost		startup_cost;	/* cost expended before fetching any tuples */
 	Cost		total_cost;		/* total cost (assuming all tuples fetched) */
 

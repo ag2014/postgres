@@ -3,7 +3,7 @@
  * numutils.c
  *	  utility functions for I/O of built-in numeric types.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,8 +19,8 @@
 #include <ctype.h>
 
 #include "common/int.h"
-#include "utils/builtins.h"
 #include "port/pg_bitutils.h"
+#include "utils/builtins.h"
 
 /*
  * A table of all two-digit numbers. This is used to speed up decimal digit
@@ -97,9 +97,18 @@ static const int8 hexlookup[128] = {
 };
 
 /*
- * Convert input string to a signed 16 bit integer.
+ * Convert input string to a signed 16 bit integer.  Input strings may be
+ * expressed in base-10, hexadecimal, octal, or binary format, all of which
+ * can be prefixed by an optional sign character, either '+' (the default) or
+ * '-' for negative numbers.  Hex strings are recognized by the digits being
+ * prefixed by 0x or 0X while octal strings are recognized by the 0o or 0O
+ * prefix.  The binary representation is recognized by the 0b or 0B prefix.
  *
- * Allows any number of leading or trailing whitespace characters.
+ * Allows any number of leading or trailing whitespace characters.  Digits may
+ * optionally be separated by a single underscore character.  These can only
+ * come between digits and not before or after the digits.  Underscores have
+ * no effect on the return value and are supported only to assist in improving
+ * the human readability of the input strings.
  *
  * pg_strtoint16() will throw ereport() upon bad input format or overflow;
  * while pg_strtoint16_safe() instead returns such complaints in *escontext,
@@ -122,9 +131,84 @@ pg_strtoint16_safe(const char *s, Node *escontext)
 	const char *firstdigit;
 	uint16		tmp = 0;
 	bool		neg = false;
+	unsigned char digit;
+	int16		result;
+
+	/*
+	 * The majority of cases are likely to be base-10 digits without any
+	 * underscore separator characters.  We'll first try to parse the string
+	 * with the assumption that's the case and only fallback on a slower
+	 * implementation which handles hex, octal and binary strings and
+	 * underscores if the fastpath version cannot parse the string.
+	 */
+
+	/* leave it up to the slow path to look for leading spaces */
+
+	if (*ptr == '-')
+	{
+		ptr++;
+		neg = true;
+	}
+
+	/* a leading '+' is uncommon so leave that for the slow path */
+
+	/* process the first digit */
+	digit = (*ptr - '0');
+
+	/*
+	 * Exploit unsigned arithmetic to save having to check both the upper and
+	 * lower bounds of the digit.
+	 */
+	if (likely(digit < 10))
+	{
+		ptr++;
+		tmp = digit;
+	}
+	else
+	{
+		/* we need at least one digit */
+		goto slow;
+	}
+
+	/* process remaining digits */
+	for (;;)
+	{
+		digit = (*ptr - '0');
+
+		if (digit >= 10)
+			break;
+
+		ptr++;
+
+		if (unlikely(tmp > -(PG_INT16_MIN / 10)))
+			goto out_of_range;
+
+		tmp = tmp * 10 + digit;
+	}
+
+	/* when the string does not end in a digit, let the slow path handle it */
+	if (unlikely(*ptr != '\0'))
+		goto slow;
+
+	if (neg)
+	{
+		if (unlikely(pg_neg_u16_overflow(tmp, &result)))
+			goto out_of_range;
+		return result;
+	}
+
+	if (unlikely(tmp > PG_INT16_MAX))
+		goto out_of_range;
+
+	return (int16) tmp;
+
+slow:
+	tmp = 0;
+	ptr = s;
+	/* no need to reset neg */
 
 	/* skip leading spaces */
-	while (likely(*ptr) && isspace((unsigned char) *ptr))
+	while (isspace((unsigned char) *ptr))
 		ptr++;
 
 	/* handle sign */
@@ -141,7 +225,7 @@ pg_strtoint16_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr += 2;
 
-		while (*ptr)
+		for (;;)
 		{
 			if (isxdigit((unsigned char) *ptr))
 			{
@@ -165,7 +249,7 @@ pg_strtoint16_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr += 2;
 
-		while (*ptr)
+		for (;;)
 		{
 			if (*ptr >= '0' && *ptr <= '7')
 			{
@@ -189,7 +273,7 @@ pg_strtoint16_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr += 2;
 
-		while (*ptr)
+		for (;;)
 		{
 			if (*ptr >= '0' && *ptr <= '1')
 			{
@@ -213,9 +297,9 @@ pg_strtoint16_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr;
 
-		while (*ptr)
+		for (;;)
 		{
-			if (isdigit((unsigned char) *ptr))
+			if (*ptr >= '0' && *ptr <= '9')
 			{
 				if (unlikely(tmp > -(PG_INT16_MIN / 10)))
 					goto out_of_range;
@@ -242,7 +326,7 @@ pg_strtoint16_safe(const char *s, Node *escontext)
 		goto invalid_syntax;
 
 	/* allow trailing whitespace, but not other trailing chars */
-	while (*ptr != '\0' && isspace((unsigned char) *ptr))
+	while (isspace((unsigned char) *ptr))
 		ptr++;
 
 	if (unlikely(*ptr != '\0'))
@@ -250,10 +334,9 @@ pg_strtoint16_safe(const char *s, Node *escontext)
 
 	if (neg)
 	{
-		/* check the negative equivalent will fit without overflowing */
-		if (tmp > (uint16) (-(PG_INT16_MIN + 1)) + 1)
+		if (unlikely(pg_neg_u16_overflow(tmp, &result)))
 			goto out_of_range;
-		return -((int16) tmp);
+		return result;
 	}
 
 	if (tmp > PG_INT16_MAX)
@@ -275,9 +358,18 @@ invalid_syntax:
 }
 
 /*
- * Convert input string to a signed 32 bit integer.
+ * Convert input string to a signed 32 bit integer.  Input strings may be
+ * expressed in base-10, hexadecimal, octal, or binary format, all of which
+ * can be prefixed by an optional sign character, either '+' (the default) or
+ * '-' for negative numbers.  Hex strings are recognized by the digits being
+ * prefixed by 0x or 0X while octal strings are recognized by the 0o or 0O
+ * prefix.  The binary representation is recognized by the 0b or 0B prefix.
  *
- * Allows any number of leading or trailing whitespace characters.
+ * Allows any number of leading or trailing whitespace characters.  Digits may
+ * optionally be separated by a single underscore character.  These can only
+ * come between digits and not before or after the digits.  Underscores have
+ * no effect on the return value and are supported only to assist in improving
+ * the human readability of the input strings.
  *
  * pg_strtoint32() will throw ereport() upon bad input format or overflow;
  * while pg_strtoint32_safe() instead returns such complaints in *escontext,
@@ -300,9 +392,84 @@ pg_strtoint32_safe(const char *s, Node *escontext)
 	const char *firstdigit;
 	uint32		tmp = 0;
 	bool		neg = false;
+	unsigned char digit;
+	int32		result;
+
+	/*
+	 * The majority of cases are likely to be base-10 digits without any
+	 * underscore separator characters.  We'll first try to parse the string
+	 * with the assumption that's the case and only fallback on a slower
+	 * implementation which handles hex, octal and binary strings and
+	 * underscores if the fastpath version cannot parse the string.
+	 */
+
+	/* leave it up to the slow path to look for leading spaces */
+
+	if (*ptr == '-')
+	{
+		ptr++;
+		neg = true;
+	}
+
+	/* a leading '+' is uncommon so leave that for the slow path */
+
+	/* process the first digit */
+	digit = (*ptr - '0');
+
+	/*
+	 * Exploit unsigned arithmetic to save having to check both the upper and
+	 * lower bounds of the digit.
+	 */
+	if (likely(digit < 10))
+	{
+		ptr++;
+		tmp = digit;
+	}
+	else
+	{
+		/* we need at least one digit */
+		goto slow;
+	}
+
+	/* process remaining digits */
+	for (;;)
+	{
+		digit = (*ptr - '0');
+
+		if (digit >= 10)
+			break;
+
+		ptr++;
+
+		if (unlikely(tmp > -(PG_INT32_MIN / 10)))
+			goto out_of_range;
+
+		tmp = tmp * 10 + digit;
+	}
+
+	/* when the string does not end in a digit, let the slow path handle it */
+	if (unlikely(*ptr != '\0'))
+		goto slow;
+
+	if (neg)
+	{
+		if (unlikely(pg_neg_u32_overflow(tmp, &result)))
+			goto out_of_range;
+		return result;
+	}
+
+	if (unlikely(tmp > PG_INT32_MAX))
+		goto out_of_range;
+
+	return (int32) tmp;
+
+slow:
+	tmp = 0;
+	ptr = s;
+	/* no need to reset neg */
 
 	/* skip leading spaces */
-	while (likely(*ptr) && isspace((unsigned char) *ptr))
+	while (isspace((unsigned char) *ptr))
 		ptr++;
 
 	/* handle sign */
@@ -319,7 +486,7 @@ pg_strtoint32_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr += 2;
 
-		while (*ptr)
+		for (;;)
 		{
 			if (isxdigit((unsigned char) *ptr))
 			{
@@ -343,7 +510,7 @@ pg_strtoint32_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr += 2;
 
-		while (*ptr)
+		for (;;)
 		{
 			if (*ptr >= '0' && *ptr <= '7')
 			{
@@ -367,7 +534,7 @@ pg_strtoint32_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr += 2;
 
-		while (*ptr)
+		for (;;)
 		{
 			if (*ptr >= '0' && *ptr <= '1')
 			{
@@ -391,9 +558,9 @@ pg_strtoint32_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr;
 
-		while (*ptr)
+		for (;;)
 		{
-			if (isdigit((unsigned char) *ptr))
+			if (*ptr >= '0' && *ptr <= '9')
 			{
 				if (unlikely(tmp > -(PG_INT32_MIN / 10)))
 					goto out_of_range;
@@ -420,7 +587,7 @@ pg_strtoint32_safe(const char *s, Node *escontext)
 		goto invalid_syntax;
 
 	/* allow trailing whitespace, but not other trailing chars */
-	while (*ptr != '\0' && isspace((unsigned char) *ptr))
+	while (isspace((unsigned char) *ptr))
 		ptr++;
 
 	if (unlikely(*ptr != '\0'))
@@ -428,10 +595,9 @@ pg_strtoint32_safe(const char *s, Node *escontext)
 
 	if (neg)
 	{
-		/* check the negative equivalent will fit without overflowing */
-		if (tmp > (uint32) (-(PG_INT32_MIN + 1)) + 1)
+		if (unlikely(pg_neg_u32_overflow(tmp, &result)))
 			goto out_of_range;
-		return -((int32) tmp);
+		return result;
 	}
 
 	if (tmp > PG_INT32_MAX)
@@ -453,9 +619,18 @@ invalid_syntax:
 }
 
 /*
- * Convert input string to a signed 64 bit integer.
+ * Convert input string to a signed 64 bit integer.  Input strings may be
+ * expressed in base-10, hexadecimal, octal, or binary format, all of which
+ * can be prefixed by an optional sign character, either '+' (the default) or
+ * '-' for negative numbers.  Hex strings are recognized by the digits being
+ * prefixed by 0x or 0X while octal strings are recognized by the 0o or 0O
+ * prefix.  The binary representation is recognized by the 0b or 0B prefix.
  *
- * Allows any number of leading or trailing whitespace characters.
+ * Allows any number of leading or trailing whitespace characters.  Digits may
+ * optionally be separated by a single underscore character.  These can only
+ * come between digits and not before or after the digits.  Underscores have
+ * no effect on the return value and are supported only to assist in improving
+ * the human readability of the input strings.
  *
  * pg_strtoint64() will throw ereport() upon bad input format or overflow;
  * while pg_strtoint64_safe() instead returns such complaints in *escontext,
@@ -478,9 +653,84 @@ pg_strtoint64_safe(const char *s, Node *escontext)
 	const char *firstdigit;
 	uint64		tmp = 0;
 	bool		neg = false;
+	unsigned char digit;
+	int64		result;
+
+	/*
+	 * The majority of cases are likely to be base-10 digits without any
+	 * underscore separator characters.  We'll first try to parse the string
+	 * with the assumption that's the case and only fallback on a slower
+	 * implementation which handles hex, octal and binary strings and
+	 * underscores if the fastpath version cannot parse the string.
+	 */
+
+	/* leave it up to the slow path to look for leading spaces */
+
+	if (*ptr == '-')
+	{
+		ptr++;
+		neg = true;
+	}
+
+	/* a leading '+' is uncommon so leave that for the slow path */
+
+	/* process the first digit */
+	digit = (*ptr - '0');
+
+	/*
+	 * Exploit unsigned arithmetic to save having to check both the upper and
+	 * lower bounds of the digit.
+	 */
+	if (likely(digit < 10))
+	{
+		ptr++;
+		tmp = digit;
+	}
+	else
+	{
+		/* we need at least one digit */
+		goto slow;
+	}
+
+	/* process remaining digits */
+	for (;;)
+	{
+		digit = (*ptr - '0');
+
+		if (digit >= 10)
+			break;
+
+		ptr++;
+
+		if (unlikely(tmp > -(PG_INT64_MIN / 10)))
+			goto out_of_range;
+
+		tmp = tmp * 10 + digit;
+	}
+
+	/* when the string does not end in a digit, let the slow path handle it */
+	if (unlikely(*ptr != '\0'))
+		goto slow;
+
+	if (neg)
+	{
+		if (unlikely(pg_neg_u64_overflow(tmp, &result)))
+			goto out_of_range;
+		return result;
+	}
+
+	if (unlikely(tmp > PG_INT64_MAX))
+		goto out_of_range;
+
+	return (int64) tmp;
+
+slow:
+	tmp = 0;
+	ptr = s;
+	/* no need to reset neg */
 
 	/* skip leading spaces */
-	while (*ptr && isspace((unsigned char) *ptr))
+	while (isspace((unsigned char) *ptr))
 		ptr++;
 
 	/* handle sign */
@@ -497,7 +747,7 @@ pg_strtoint64_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr += 2;
 
-		while (*ptr)
+		for (;;)
 		{
 			if (isxdigit((unsigned char) *ptr))
 			{
@@ -521,7 +771,7 @@ pg_strtoint64_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr += 2;
 
-		while (*ptr)
+		for (;;)
 		{
 			if (*ptr >= '0' && *ptr <= '7')
 			{
@@ -545,7 +795,7 @@ pg_strtoint64_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr += 2;
 
-		while (*ptr)
+		for (;;)
 		{
 			if (*ptr >= '0' && *ptr <= '1')
 			{
@@ -569,9 +819,9 @@ pg_strtoint64_safe(const char *s, Node *escontext)
 	{
 		firstdigit = ptr;
 
-		while (*ptr)
+		for (;;)
 		{
-			if (isdigit((unsigned char) *ptr))
+			if (*ptr >= '0' && *ptr <= '9')
 			{
 				if (unlikely(tmp > -(PG_INT64_MIN / 10)))
 					goto out_of_range;
@@ -598,7 +848,7 @@ pg_strtoint64_safe(const char *s, Node *escontext)
 		goto invalid_syntax;
 
 	/* allow trailing whitespace, but not other trailing chars */
-	while (*ptr != '\0' && isspace((unsigned char) *ptr))
+	while (isspace((unsigned char) *ptr))
 		ptr++;
 
 	if (unlikely(*ptr != '\0'))
@@ -606,10 +856,9 @@ pg_strtoint64_safe(const char *s, Node *escontext)
 
 	if (neg)
 	{
-		/* check the negative equivalent will fit without overflowing */
-		if (tmp > (uint64) (-(PG_INT64_MIN + 1)) + 1)
+		if (unlikely(pg_neg_u64_overflow(tmp, &result)))
 			goto out_of_range;
-		return -((int64) tmp);
+		return result;
 	}
 
 	if (tmp > PG_INT64_MAX)
@@ -639,7 +888,7 @@ invalid_syntax:
  * so that caller can parse the rest.  Otherwise, it's an error if anything
  * but whitespace follows.
  *
- * typname is what is reported in error messges.
+ * typname is what is reported in error messages.
  *
  * If escontext points to an ErrorSaveContext node, that is filled instead
  * of throwing an error; the caller must check SOFT_ERROR_OCCURRED()
@@ -726,7 +975,7 @@ uint32in_subr(const char *s, char **endloc,
  * so that caller can parse the rest.  Otherwise, it's an error if anything
  * but whitespace follows.
  *
- * typname is what is reported in error messges.
+ * typname is what is reported in error messages.
  *
  * If escontext points to an ErrorSaveContext node, that is filled instead
  * of throwing an error; the caller must check SOFT_ERROR_OCCURRED()

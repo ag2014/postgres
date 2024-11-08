@@ -3,7 +3,7 @@
  * partbounds.c
  *		Support routines for manipulating partition bounds
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -30,7 +30,6 @@
 #include "parser/parse_coerce.h"
 #include "partitioning/partbounds.h"
 #include "partitioning/partdesc.h"
-#include "partitioning/partprune.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -2340,9 +2339,9 @@ merge_default_partitions(PartitionMap *outer_map,
 		/*
 		 * The default partitions have to be joined with each other, so merge
 		 * them.  Note that each of the default partitions isn't merged yet
-		 * (see, process_outer_partition()/process_innerer_partition()), so
-		 * they should be merged successfully.  The merged partition will act
-		 * as the default partition of the join relation.
+		 * (see, process_outer_partition()/process_inner_partition()), so they
+		 * should be merged successfully.  The merged partition will act as
+		 * the default partition of the join relation.
 		 */
 		Assert(outer_merged_index == -1);
 		Assert(inner_merged_index == -1);
@@ -3193,7 +3192,7 @@ check_new_partition_bound(char *relname, Relation parent,
 								 * datums list.
 								 */
 								PartitionRangeDatum *datum =
-								list_nth(spec->upperdatums, abs(cmpval) - 1);
+									list_nth(spec->upperdatums, abs(cmpval) - 1);
 
 								/*
 								 * The new partition overlaps with the
@@ -4311,19 +4310,14 @@ get_qual_for_range(Relation parent, PartitionBoundSpec *spec,
 			Oid			inhrelid = inhoids[k];
 			HeapTuple	tuple;
 			Datum		datum;
-			bool		isnull;
 			PartitionBoundSpec *bspec;
 
-			tuple = SearchSysCache1(RELOID, inhrelid);
+			tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(inhrelid));
 			if (!HeapTupleIsValid(tuple))
 				elog(ERROR, "cache lookup failed for relation %u", inhrelid);
 
-			datum = SysCacheGetAttr(RELOID, tuple,
-									Anum_pg_class_relpartbound,
-									&isnull);
-			if (isnull)
-				elog(ERROR, "null relpartbound for relation %u", inhrelid);
-
+			datum = SysCacheGetAttrNotNull(RELOID, tuple,
+										   Anum_pg_class_relpartbound);
 			bspec = (PartitionBoundSpec *)
 				stringToNode(TextDatumGetCString(datum));
 			if (!IsA(bspec, PartitionBoundSpec))
@@ -4725,8 +4719,8 @@ get_range_nulltest(PartitionKey key)
  * Compute the hash value for given partition key values.
  */
 uint64
-compute_partition_hash_value(int partnatts, FmgrInfo *partsupfunc, Oid *partcollation,
-							 Datum *values, bool *isnull)
+compute_partition_hash_value(int partnatts, FmgrInfo *partsupfunc, const Oid *partcollation,
+							 const Datum *values, const bool *isnull)
 {
 	int			i;
 	uint64		rowHash = 0;

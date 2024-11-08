@@ -1,8 +1,8 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 # Test partial-column publication of tables
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -14,13 +14,13 @@ $node_publisher->start;
 
 # create subscriber node
 my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
-$node_subscriber->init(allows_streaming => 'logical');
+$node_subscriber->init;
 $node_subscriber->append_conf('postgresql.conf',
 	qq(max_logical_replication_workers = 6));
 $node_subscriber->start;
 
 my $publisher_connstr = $node_publisher->connstr . ' dbname=postgres';
-my $offset            = 0;
+my $offset = 0;
 
 # setup tables on both nodes
 
@@ -370,7 +370,8 @@ $node_subscriber->safe_psql(
 
 $node_subscriber->safe_psql(
 	'postgres', qq(
-	ALTER SUBSCRIPTION sub1 SET PUBLICATION pub2, pub3
+	DROP SUBSCRIPTION sub1;
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub2, pub3
 ));
 
 $node_subscriber->wait_for_subscription_sync($node_publisher, 'sub1');
@@ -411,7 +412,8 @@ $node_subscriber->safe_psql(
 
 $node_subscriber->safe_psql(
 	'postgres', qq(
-	ALTER SUBSCRIPTION sub1 SET PUBLICATION pub4
+	DROP SUBSCRIPTION sub1;
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub4
 ));
 
 $node_subscriber->wait_for_subscription_sync;
@@ -487,7 +489,8 @@ $node_subscriber->safe_psql(
 
 $node_subscriber->safe_psql(
 	'postgres', qq(
-	ALTER SUBSCRIPTION sub1 SET PUBLICATION pub5
+	DROP SUBSCRIPTION sub1;
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub5
 ));
 
 $node_subscriber->wait_for_subscription_sync;
@@ -601,10 +604,12 @@ $node_publisher->safe_psql(
 	ALTER PUBLICATION pub6 ADD TABLE test_part_a_2 (b);
 ));
 
-# add the publication to our subscription, wait for sync to complete
+# create the subscription for the above publication, wait for sync to
+# complete
 $node_subscriber->safe_psql(
 	'postgres', qq(
-	ALTER SUBSCRIPTION sub1 SET PUBLICATION pub6
+	DROP SUBSCRIPTION sub1;
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub6
 ));
 
 $node_subscriber->wait_for_subscription_sync;
@@ -667,10 +672,12 @@ $node_publisher->safe_psql(
 	CREATE PUBLICATION pub7 FOR TABLE test_part_b (a, b) WITH (publish_via_partition_root = true);
 ));
 
-# add the publication to our subscription, wait for sync to complete
+# create the subscription for the above publication, wait for sync to
+# complete
 $node_subscriber->safe_psql(
 	'postgres', qq(
-	ALTER SUBSCRIPTION sub1 SET PUBLICATION pub7
+	DROP SUBSCRIPTION sub1;
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub7
 ));
 
 $node_subscriber->wait_for_subscription_sync;
@@ -737,7 +744,8 @@ $node_publisher->safe_psql(
 	ALTER PUBLICATION pub8 ADD TABLE test_part_c_2 (a,b);
 ));
 
-# add the publication to our subscription, wait for sync to complete
+# create the subscription for the above publication, wait for sync to
+# complete
 $node_subscriber->safe_psql(
 	'postgres', qq(
 	DROP SUBSCRIPTION sub1;
@@ -835,10 +843,12 @@ $node_publisher->safe_psql(
 	CREATE PUBLICATION pub9 FOR TABLE test_part_d (a) WITH (publish_via_partition_root = true);
 ));
 
-# add the publication to our subscription, wait for sync to complete
+# create the subscription for the above publication, wait for sync to
+# complete
 $node_subscriber->safe_psql(
 	'postgres', qq(
-	ALTER SUBSCRIPTION sub1 SET PUBLICATION pub9
+	DROP SUBSCRIPTION sub1;
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub9
 ));
 
 $node_subscriber->wait_for_subscription_sync;
@@ -880,8 +890,8 @@ $node_publisher->safe_psql(
 $node_subscriber->safe_psql(
 	'postgres', qq(
 	CREATE TABLE test_mix_2 (a int PRIMARY KEY, b int, c int);
-	ALTER SUBSCRIPTION sub1 SET PUBLICATION pub_mix_3, pub_mix_4;
-	ALTER SUBSCRIPTION sub1 REFRESH PUBLICATION;
+	DROP SUBSCRIPTION sub1;
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub_mix_3, pub_mix_4;
 ));
 
 $node_subscriber->wait_for_subscription_sync;
@@ -959,16 +969,21 @@ $node_publisher->safe_psql(
 	CREATE TABLE test_root_1 PARTITION OF test_root FOR VALUES FROM (1) TO (10);
 	CREATE TABLE test_root_2 PARTITION OF test_root FOR VALUES FROM (10) TO (20);
 
-	CREATE PUBLICATION pub_root_true FOR TABLE test_root (a) WITH (publish_via_partition_root = true);
+	CREATE PUBLICATION pub_test_root FOR TABLE test_root (a) WITH (publish_via_partition_root = true);
+	CREATE PUBLICATION pub_test_root_1 FOR TABLE test_root_1 (a, b);
 
 	-- initial data
 	INSERT INTO test_root VALUES (1, 2, 3);
 	INSERT INTO test_root VALUES (10, 20, 30);
 ));
 
+# Subscribe to pub_test_root and pub_test_root_1 at the same time, which means
+# that the initial data will be synced once, and only the column list of the
+# parent table (test_root) in the publication pub_test_root will be used for
+# both table sync and data replication.
 $node_subscriber->safe_psql(
 	'postgres', qq(
-	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub_root_true;
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub_test_root, pub_test_root_1;
 ));
 
 $node_subscriber->wait_for_subscription_sync;
@@ -1017,7 +1032,8 @@ $node_subscriber->safe_psql(
 	CREATE TABLE s1.t (a int, b int, c int) PARTITION BY RANGE (a);
 	CREATE TABLE t_1 PARTITION OF s1.t FOR VALUES FROM (1) TO (10);
 
-	ALTER SUBSCRIPTION sub1 SET PUBLICATION pub1, pub2;
+	DROP SUBSCRIPTION sub1;
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub1, pub2;
 ));
 
 $node_subscriber->wait_for_subscription_sync;
@@ -1085,7 +1101,8 @@ $node_subscriber->safe_psql(
 		   PARTITION BY RANGE (a);
 	CREATE TABLE t_2 PARTITION OF t_1 FOR VALUES FROM (1) TO (10);
 
-	ALTER SUBSCRIPTION sub1 SET PUBLICATION pub3;
+	DROP SUBSCRIPTION sub1;
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub3;
 ));
 
 $node_subscriber->wait_for_subscription_sync;
@@ -1133,7 +1150,8 @@ $node_subscriber->safe_psql(
 		   PARTITION BY RANGE (a);
 	CREATE TABLE t_2 PARTITION OF t_1 FOR VALUES FROM (1) TO (10);
 
-	ALTER SUBSCRIPTION sub1 SET PUBLICATION pub4;
+	DROP SUBSCRIPTION sub1;
+	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub4;
 ));
 
 $node_subscriber->wait_for_subscription_sync;
@@ -1184,9 +1202,10 @@ $result = $node_publisher->safe_psql(
 is( $result, qq(t
 t), 'check the number of columns in the old tuple');
 
-# TEST: Generated and dropped columns are not considered for the column list.
-# So, the publication having a column list except for those columns and a
-# publication without any column (aka all columns as part of the columns
+# TEST: Dropped columns are not considered for the column list, and generated
+# columns are not replicated if they are not explicitly included in the column
+# list. So, the publication having a column list except for those columns and a
+# publication without any column list (aka all columns as part of the columns
 # list) are considered to have the same column list.
 $node_publisher->safe_psql(
 	'postgres', qq(

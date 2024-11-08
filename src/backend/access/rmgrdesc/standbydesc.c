@@ -3,7 +3,7 @@
  * standbydesc.c
  *	  rmgr descriptor routines for storage/ipc/standby.c
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -96,11 +96,7 @@ standby_identify(uint8 info)
 	return id;
 }
 
-/*
- * This routine is used by both standby_desc and xact_desc, because
- * transaction commits and XLOG_INVALIDATIONS messages contain invalidations;
- * it seems pointless to duplicate the code.
- */
+/* also used by non-standby records having analogous invalidation fields */
 void
 standby_desc_invalidations(StringInfo buf,
 						   int nmsgs, SharedInvalidationMessage *msgs,

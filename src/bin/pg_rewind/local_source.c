@@ -3,7 +3,7 @@
  * local_source.c
  *	  Functions for using a local data directory as the source.
  *
- * Portions Copyright (c) 2013-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2013-2024, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -12,10 +12,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "datapagemap.h"
+#include "common/logging.h"
 #include "file_ops.h"
-#include "filemap.h"
-#include "pg_rewind.h"
 #include "rewind_source.h"
 
 typedef struct
@@ -59,7 +57,7 @@ init_local_source(const char *datadir)
 static void
 local_traverse_files(rewind_source *source, process_file_callback_t callback)
 {
-	traverse_datadir(((local_source *) source)->datadir, &process_source_file);
+	traverse_datadir(((local_source *) source)->datadir, callback);
 }
 
 static char *
@@ -77,7 +75,7 @@ static void
 local_queue_fetch_file(rewind_source *source, const char *path, size_t len)
 {
 	const char *datadir = ((local_source *) source)->datadir;
-	PGAlignedBlock buf;
+	PGIOAlignedBlock buf;
 	char		srcpath[MAXPGPATH];
 	int			srcfd;
 	size_t		written_len;
@@ -129,7 +127,7 @@ local_queue_fetch_range(rewind_source *source, const char *path, off_t off,
 						size_t len)
 {
 	const char *datadir = ((local_source *) source)->datadir;
-	PGAlignedBlock buf;
+	PGIOAlignedBlock buf;
 	char		srcpath[MAXPGPATH];
 	int			srcfd;
 	off_t		begin = off;

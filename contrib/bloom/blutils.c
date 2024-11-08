@@ -3,7 +3,7 @@
  * blutils.c
  *		Bloom index utilities.
  *
- * Portions Copyright (c) 2016-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2016-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1990-1993, Regents of the University of California
  *
  * IDENTIFICATION
@@ -17,14 +17,11 @@
 #include "access/generic_xlog.h"
 #include "access/reloptions.h"
 #include "bloom.h"
-#include "catalog/index.h"
 #include "commands/vacuum.h"
-#include "miscadmin.h"
 #include "storage/bufmgr.h"
-#include "storage/freespace.h"
 #include "storage/indexfsm.h"
-#include "storage/lmgr.h"
 #include "utils/memutils.h"
+#include "varatt.h"
 
 /* Signature dealing macros - note i is assumed to be of type int */
 #define GETWORD(x,i) ( *( (BloomSignatureWord *)(x) + ( (i) / SIGNWORDBITS ) ) )
@@ -122,6 +119,7 @@ blhandler(PG_FUNCTION_ARGS)
 	amroutine->amclusterable = false;
 	amroutine->ampredlocks = false;
 	amroutine->amcanparallel = false;
+	amroutine->amcanbuildparallel = false;
 	amroutine->amcaninclude = false;
 	amroutine->amusemaintenanceworkmem = false;
 	amroutine->amparallelvacuumoptions =
@@ -131,10 +129,12 @@ blhandler(PG_FUNCTION_ARGS)
 	amroutine->ambuild = blbuild;
 	amroutine->ambuildempty = blbuildempty;
 	amroutine->aminsert = blinsert;
+	amroutine->aminsertcleanup = NULL;
 	amroutine->ambulkdelete = blbulkdelete;
 	amroutine->amvacuumcleanup = blvacuumcleanup;
 	amroutine->amcanreturn = NULL;
 	amroutine->amcostestimate = blcostestimate;
+	amroutine->amgettreeheight = NULL;
 	amroutine->amoptions = bloptions;
 	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = NULL;
@@ -353,7 +353,6 @@ Buffer
 BloomNewBuffer(Relation index)
 {
 	Buffer		buffer;
-	bool		needLock;
 
 	/* First, try to get a page from FSM */
 	for (;;)
@@ -387,15 +386,8 @@ BloomNewBuffer(Relation index)
 	}
 
 	/* Must extend the file */
-	needLock = !RELATION_IS_LOCAL(index);
-	if (needLock)
-		LockRelationForExtension(index, ExclusiveLock);
-
-	buffer = ReadBuffer(index, P_NEW);
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-
-	if (needLock)
-		UnlockRelationForExtension(index, ExclusiveLock);
+	buffer = ExtendBufferedRel(BMR_REL(index), MAIN_FORKNUM, NULL,
+							   EB_LOCK_FIRST);
 
 	return buffer;
 }
@@ -451,7 +443,7 @@ BloomFillMetapage(Relation index, Page metaPage)
  * Initialize metapage for bloom index.
  */
 void
-BloomInitMetapage(Relation index)
+BloomInitMetapage(Relation index, ForkNumber forknum)
 {
 	Buffer		metaBuffer;
 	Page		metaPage;
@@ -459,9 +451,11 @@ BloomInitMetapage(Relation index)
 
 	/*
 	 * Make a new page; since it is first page it should be associated with
-	 * block number 0 (BLOOM_METAPAGE_BLKNO).
+	 * block number 0 (BLOOM_METAPAGE_BLKNO).  No need to hold the extension
+	 * lock because there cannot be concurrent inserters yet.
 	 */
-	metaBuffer = BloomNewBuffer(index);
+	metaBuffer = ReadBufferExtended(index, forknum, P_NEW, RBM_NORMAL, NULL);
+	LockBuffer(metaBuffer, BUFFER_LOCK_EXCLUSIVE);
 	Assert(BufferGetBlockNumber(metaBuffer) == BLOOM_METAPAGE_BLKNO);
 
 	/* Initialize contents of meta page */

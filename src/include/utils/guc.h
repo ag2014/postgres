@@ -3,7 +3,7 @@
  *
  * External declarations pertaining to Grand Unified Configuration.
  *
- * Copyright (c) 2000-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2024, PostgreSQL Global Development Group
  * Written by Peter Eisentraut <peter_e@gmx.net>.
  *
  * src/include/utils/guc.h
@@ -72,7 +72,7 @@ typedef enum
 	PGC_SU_BACKEND,
 	PGC_BACKEND,
 	PGC_SUSET,
-	PGC_USERSET
+	PGC_USERSET,
 } GucContext;
 
 /*
@@ -119,7 +119,7 @@ typedef enum
 	PGC_S_OVERRIDE,				/* special case to forcibly set default */
 	PGC_S_INTERACTIVE,			/* dividing line for error reporting */
 	PGC_S_TEST,					/* test per-database or per-user setting */
-	PGC_S_SESSION				/* SET command */
+	PGC_S_SESSION,				/* SET command */
 } GucSource;
 
 /*
@@ -143,6 +143,8 @@ typedef struct ConfigVariable
 	bool		applied;
 	struct ConfigVariable *next;
 } ConfigVariable;
+
+typedef struct config_generic config_handle;
 
 extern bool ParseConfigFile(const char *config_file, bool strict,
 							const char *calling_file, int calling_lineno,
@@ -196,7 +198,7 @@ typedef enum
 	/* Types of set_config_option actions */
 	GUC_ACTION_SET,				/* regular SET command */
 	GUC_ACTION_LOCAL,			/* SET LOCAL command */
-	GUC_ACTION_SAVE				/* function SET option, or temp assignment */
+	GUC_ACTION_SAVE,			/* function SET option, or temp assignment */
 } GucAction;
 
 #define GUC_QUALIFIER_SEPARATOR '.'
@@ -221,6 +223,7 @@ typedef enum
 #define GUC_DISALLOW_IN_AUTO_FILE \
 							   0x002000 /* can't set in PG_AUTOCONF_FILENAME */
 #define GUC_RUNTIME_COMPUTED   0x004000 /* delay processing in 'postgres -C' */
+#define GUC_ALLOW_IN_PARALLEL  0x008000 /* allow setting in parallel mode */
 
 #define GUC_UNIT_KB			 0x01000000 /* value is in kilobytes */
 #define GUC_UNIT_BLOCKS		 0x02000000 /* value is in blocks */
@@ -243,15 +246,23 @@ extern PGDLLIMPORT bool Debug_print_parse;
 extern PGDLLIMPORT bool Debug_print_rewritten;
 extern PGDLLIMPORT bool Debug_pretty_print;
 
+#ifdef DEBUG_NODE_TESTS_ENABLED
+extern PGDLLIMPORT bool Debug_copy_parse_plan_trees;
+extern PGDLLIMPORT bool Debug_write_read_parse_plan_trees;
+extern PGDLLIMPORT bool Debug_raw_expression_coverage_test;
+#endif
+
 extern PGDLLIMPORT bool log_parser_stats;
 extern PGDLLIMPORT bool log_planner_stats;
 extern PGDLLIMPORT bool log_executor_stats;
 extern PGDLLIMPORT bool log_statement_stats;
 extern PGDLLIMPORT bool log_btree_build_stats;
+extern PGDLLIMPORT char *event_source;
 
 extern PGDLLIMPORT bool check_function_bodies;
-extern PGDLLIMPORT bool session_auth_is_superuser;
+extern PGDLLIMPORT bool current_role_is_superuser;
 
+extern PGDLLIMPORT bool AllowAlterSystem;
 extern PGDLLIMPORT bool log_duration;
 extern PGDLLIMPORT int log_parameter_max_length;
 extern PGDLLIMPORT int log_parameter_max_length_on_error;
@@ -282,9 +293,30 @@ extern PGDLLIMPORT int tcp_keepalives_interval;
 extern PGDLLIMPORT int tcp_keepalives_count;
 extern PGDLLIMPORT int tcp_user_timeout;
 
-#ifdef TRACE_SORT
+extern PGDLLIMPORT char *role_string;
+extern PGDLLIMPORT bool in_hot_standby_guc;
 extern PGDLLIMPORT bool trace_sort;
+
+#ifdef DEBUG_BOUNDED_SORT
+extern PGDLLIMPORT bool optimize_bounded_sort;
 #endif
+
+/*
+ * Declarations for options for enum values
+ *
+ * For most parameters, these are defined statically inside guc_tables.c.  But
+ * for some parameters, the definitions require symbols that are not easily
+ * available inside guc_tables.c, so they are instead defined in their home
+ * modules.  For those, we keep the extern declarations here.  (An alternative
+ * would be to put the extern declarations in the modules' header files, but
+ * that would then require including the definition of struct
+ * config_enum_entry into those header files.)
+ */
+extern PGDLLIMPORT const struct config_enum_entry archive_mode_options[];
+extern PGDLLIMPORT const struct config_enum_entry dynamic_shared_memory_options[];
+extern PGDLLIMPORT const struct config_enum_entry recovery_target_action_options[];
+extern PGDLLIMPORT const struct config_enum_entry wal_level_options[];
+extern PGDLLIMPORT const struct config_enum_entry wal_sync_method_options[];
 
 /*
  * Functions exported by guc.c
@@ -363,12 +395,13 @@ extern const char *GetConfigOptionResetString(const char *name);
 extern int	GetConfigOptionFlags(const char *name, bool missing_ok);
 extern void ProcessConfigFile(GucContext context);
 extern char *convert_GUC_name_for_parameter_acl(const char *name);
-extern bool check_GUC_name_for_parameter_acl(const char *name);
+extern void check_GUC_name_for_parameter_acl(const char *name);
 extern void InitializeGUCOptions(void);
 extern bool SelectConfigFiles(const char *userDoption, const char *progname);
 extern void ResetAllOptions(void);
 extern void AtStart_GUC(void);
 extern int	NewGUCNestLevel(void);
+extern void RestrictSearchPath(void);
 extern void AtEOXact_GUC(bool isCommit, int nestLevel);
 extern void BeginReportingGUCOptions(void);
 extern void ReportChangedGUCOptions(void);
@@ -387,18 +420,24 @@ extern int	set_config_option_ext(const char *name, const char *value,
 								  Oid srole,
 								  GucAction action, bool changeVal, int elevel,
 								  bool is_reload);
+extern int	set_config_with_handle(const char *name, config_handle *handle,
+								   const char *value,
+								   GucContext context, GucSource source,
+								   Oid srole,
+								   GucAction action, bool changeVal,
+								   int elevel, bool is_reload);
+extern config_handle *get_config_handle(const char *name);
 extern void AlterSystemSetConfigFile(AlterSystemStmt *altersysstmt);
 extern char *GetConfigOptionByName(const char *name, const char **varname,
 								   bool missing_ok);
 
-extern void ProcessGUCArray(ArrayType *array, ArrayType *usersetArray,
+extern void TransformGUCArray(ArrayType *array, List **names,
+							  List **values);
+extern void ProcessGUCArray(ArrayType *array,
 							GucContext context, GucSource source, GucAction action);
-extern ArrayType *GUCArrayAdd(ArrayType *array, ArrayType **usersetArray,
-							  const char *name, const char *value,
-							  bool user_set);
-extern ArrayType *GUCArrayDelete(ArrayType *array, ArrayType **usersetArray,
-								 const char *name);
-extern ArrayType *GUCArrayReset(ArrayType *array, ArrayType **usersetArray);
+extern ArrayType *GUCArrayAdd(ArrayType *array, const char *name, const char *value);
+extern ArrayType *GUCArrayDelete(ArrayType *array, const char *name);
+extern ArrayType *GUCArrayReset(ArrayType *array);
 
 extern void *guc_malloc(int elevel, size_t size);
 extern pg_nodiscard void *guc_realloc(int elevel, void *old, size_t size);

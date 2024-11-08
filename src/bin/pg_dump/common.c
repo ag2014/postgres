@@ -4,7 +4,7 @@
  *	Catalog routines used by pg_dump; long ago these were shared
  *	by another dump tool, but not anymore.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,10 +24,9 @@
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_proc_d.h"
 #include "catalog/pg_publication_d.h"
+#include "catalog/pg_subscription_d.h"
 #include "catalog/pg_type_d.h"
 #include "common/hashfn.h"
-#include "fe_utils/string_utils.h"
-#include "pg_backup_archiver.h"
 #include "pg_backup_utils.h"
 #include "pg_dump.h"
 
@@ -46,6 +45,8 @@ static DumpId lastDumpId = 0;	/* Note: 0 is InvalidDumpId */
  * expects that it can move them around when resizing the table.  So we
  * cannot make the DumpableObjects be elements of the hash table directly;
  * instead, the hash table elements contain pointers to DumpableObjects.
+ * This does have the advantage of letting us map multiple CatalogIds
+ * to one DumpableObject, which is useful for blobs.
  *
  * It turns out to be convenient to also use this data structure to map
  * CatalogIds to owning extensions, if any.  Since extension membership
@@ -82,9 +83,7 @@ static catalogid_hash *catalogIdHash = NULL;
 static void flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
 						  InhInfo *inhinfo, int numInherits);
 static void flagInhIndexes(Archive *fout, TableInfo *tblinfo, int numTables);
-static void flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables);
-static void findParentsByOid(TableInfo *self,
-							 InhInfo *inhinfo, int numInherits);
+static void flagInhAttrs(Archive *fout, TableInfo *tblinfo, int numTables);
 static int	strInArray(const char *pattern, char **arr, int arr_size);
 static IndxInfo *findIndexByOid(Oid oid);
 
@@ -100,31 +99,8 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	ExtensionInfo *extinfo;
 	InhInfo    *inhinfo;
 	int			numTables;
-	int			numTypes;
-	int			numFuncs;
-	int			numOperators;
-	int			numCollations;
-	int			numNamespaces;
 	int			numExtensions;
-	int			numPublications;
-	int			numAggregates;
 	int			numInherits;
-	int			numRules;
-	int			numProcLangs;
-	int			numCasts;
-	int			numTransforms;
-	int			numAccessMethods;
-	int			numOpclasses;
-	int			numOpfamilies;
-	int			numConversions;
-	int			numTSParsers;
-	int			numTSTemplates;
-	int			numTSDicts;
-	int			numTSConfigs;
-	int			numForeignDataWrappers;
-	int			numForeignServers;
-	int			numDefaultACLs;
-	int			numEventTriggers;
 
 	/*
 	 * We must read extensions and extension membership info first, because
@@ -138,7 +114,7 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	getExtensionMembership(fout, extinfo, numExtensions);
 
 	pg_log_info("reading schemas");
-	(void) getNamespaces(fout, &numNamespaces);
+	getNamespaces(fout);
 
 	/*
 	 * getTables should be done as soon as possible, so as to minimize the
@@ -152,69 +128,69 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	getOwnedSeqs(fout, tblinfo, numTables);
 
 	pg_log_info("reading user-defined functions");
-	(void) getFuncs(fout, &numFuncs);
+	getFuncs(fout);
 
 	/* this must be after getTables and getFuncs */
 	pg_log_info("reading user-defined types");
-	(void) getTypes(fout, &numTypes);
+	getTypes(fout);
 
 	/* this must be after getFuncs, too */
 	pg_log_info("reading procedural languages");
-	getProcLangs(fout, &numProcLangs);
+	getProcLangs(fout);
 
 	pg_log_info("reading user-defined aggregate functions");
-	getAggregates(fout, &numAggregates);
+	getAggregates(fout);
 
 	pg_log_info("reading user-defined operators");
-	(void) getOperators(fout, &numOperators);
+	getOperators(fout);
 
 	pg_log_info("reading user-defined access methods");
-	getAccessMethods(fout, &numAccessMethods);
+	getAccessMethods(fout);
 
 	pg_log_info("reading user-defined operator classes");
-	getOpclasses(fout, &numOpclasses);
+	getOpclasses(fout);
 
 	pg_log_info("reading user-defined operator families");
-	getOpfamilies(fout, &numOpfamilies);
+	getOpfamilies(fout);
 
 	pg_log_info("reading user-defined text search parsers");
-	getTSParsers(fout, &numTSParsers);
+	getTSParsers(fout);
 
 	pg_log_info("reading user-defined text search templates");
-	getTSTemplates(fout, &numTSTemplates);
+	getTSTemplates(fout);
 
 	pg_log_info("reading user-defined text search dictionaries");
-	getTSDictionaries(fout, &numTSDicts);
+	getTSDictionaries(fout);
 
 	pg_log_info("reading user-defined text search configurations");
-	getTSConfigurations(fout, &numTSConfigs);
+	getTSConfigurations(fout);
 
 	pg_log_info("reading user-defined foreign-data wrappers");
-	getForeignDataWrappers(fout, &numForeignDataWrappers);
+	getForeignDataWrappers(fout);
 
 	pg_log_info("reading user-defined foreign servers");
-	getForeignServers(fout, &numForeignServers);
+	getForeignServers(fout);
 
 	pg_log_info("reading default privileges");
-	getDefaultACLs(fout, &numDefaultACLs);
+	getDefaultACLs(fout);
 
 	pg_log_info("reading user-defined collations");
-	(void) getCollations(fout, &numCollations);
+	getCollations(fout);
 
 	pg_log_info("reading user-defined conversions");
-	getConversions(fout, &numConversions);
+	getConversions(fout);
 
 	pg_log_info("reading type casts");
-	getCasts(fout, &numCasts);
+	getCasts(fout);
 
 	pg_log_info("reading transforms");
-	getTransforms(fout, &numTransforms);
+	getTransforms(fout);
 
 	pg_log_info("reading table inheritance information");
 	inhinfo = getInherits(fout, &numInherits);
 
 	pg_log_info("reading event triggers");
-	getEventTriggers(fout, &numEventTriggers);
+	getEventTriggers(fout);
 
 	/* Identify extension configuration tables that should be dumped */
 	pg_log_info("finding extension tables");
@@ -228,7 +204,10 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	getTableAttrs(fout, tblinfo, numTables);
 
 	pg_log_info("flagging inherited columns in subtables");
-	flagInhAttrs(fout->dopt, tblinfo, numTables);
+	flagInhAttrs(fout, tblinfo, numTables);
+
+	pg_log_info("reading partitioning data");
+	getPartitioningInfo(fout);
 
 	pg_log_info("reading indexes");
 	getIndexes(fout, tblinfo, numTables);
@@ -246,13 +225,13 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	getTriggers(fout, tblinfo, numTables);
 
 	pg_log_info("reading rewrite rules");
-	getRules(fout, &numRules);
+	getRules(fout);
 
 	pg_log_info("reading policies");
 	getPolicies(fout, tblinfo, numTables);
 
 	pg_log_info("reading publications");
-	(void) getPublications(fout, &numPublications);
+	getPublications(fout);
 
 	pg_log_info("reading publication membership of tables");
 	getPublicationTables(fout, tblinfo, numTables);
@@ -262,6 +241,9 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 
 	pg_log_info("reading subscriptions");
 	getSubscriptions(fout);
+
+	pg_log_info("reading subscription membership of tables");
+	getSubscriptionTables(fout);
 
 	free(inhinfo);				/* not needed any longer */
 
@@ -285,46 +267,70 @@ static void
 flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
 			  InhInfo *inhinfo, int numInherits)
 {
-	DumpOptions *dopt = fout->dopt;
+	TableInfo  *child = NULL;
+	TableInfo  *parent = NULL;
 	int			i,
 				j;
 
+	/*
+	 * Set up links from child tables to their parents.
+	 *
+	 * We used to attempt to skip this work for tables that are not to be
+	 * dumped; but the optimizable cases are rare in practice, and setting up
+	 * these links in bulk is cheaper than the old way.  (Note in particular
+	 * that it's very rare for a child to have more than one parent.)
+	 */
+	for (i = 0; i < numInherits; i++)
+	{
+		/*
+		 * Skip a hashtable lookup if it's same table as last time.  This is
+		 * unlikely for the child, but less so for the parent.  (Maybe we
+		 * should ask the backend for a sorted array to make it more likely?
+		 * Not clear the sorting effort would be repaid, though.)
+		 */
+		if (child == NULL ||
+			child->dobj.catId.oid != inhinfo[i].inhrelid)
+		{
+			child = findTableByOid(inhinfo[i].inhrelid);
+
+			/*
+			 * If we find no TableInfo, assume the pg_inherits entry is for a
+			 * partitioned index, which we don't need to track.
+			 */
+			if (child == NULL)
+				continue;
+		}
+		if (parent == NULL ||
+			parent->dobj.catId.oid != inhinfo[i].inhparent)
+		{
+			parent = findTableByOid(inhinfo[i].inhparent);
+			if (parent == NULL)
+				pg_fatal("failed sanity check, parent OID %u of table \"%s\" (OID %u) not found",
+						 inhinfo[i].inhparent,
+						 child->dobj.name,
+						 child->dobj.catId.oid);
+		}
+		/* Add this parent to the child's list of parents. */
+		if (child->numParents > 0)
+			child->parents = pg_realloc_array(child->parents,
+											  TableInfo *,
+											  child->numParents + 1);
+		else
+			child->parents = pg_malloc_array(TableInfo *, 1);
+		child->parents[child->numParents++] = parent;
+	}
+
+	/*
+	 * Now consider all child tables and mark parents interesting as needed.
+	 */
 	for (i = 0; i < numTables; i++)
 	{
-		bool		find_parents = true;
-		bool		mark_parents = true;
-
-		/* Some kinds never have parents */
-		if (tblinfo[i].relkind == RELKIND_SEQUENCE ||
-			tblinfo[i].relkind == RELKIND_VIEW ||
-			tblinfo[i].relkind == RELKIND_MATVIEW)
-			continue;
-
-		/*
-		 * Normally, we don't bother computing anything for non-target tables,
-		 * but if load-via-partition-root is specified, we gather information
-		 * on every partition in the system so that getRootTableInfo can trace
-		 * from any given to leaf partition all the way up to the root.  (We
-		 * don't need to mark them as interesting for getTableAttrs, though.)
-		 */
-		if (!tblinfo[i].dobj.dump)
-		{
-			mark_parents = false;
-
-			if (!dopt->load_via_partition_root ||
-				!tblinfo[i].ispartition)
-				find_parents = false;
-		}
-
-		/* If needed, find all the immediate parent tables. */
-		if (find_parents)
-			findParentsByOid(&tblinfo[i], inhinfo, numInherits);
-
 		/*
 		 * If needed, mark the parents as interesting for getTableAttrs and
-		 * getIndexes.
+		 * getIndexes.  We only need this for direct parents of dumpable
+		 * tables.
 		 */
-		if (mark_parents)
+		if (tblinfo[i].dobj.dump)
 		{
 			int			numParents = tblinfo[i].numParents;
 			TableInfo **parents = tblinfo[i].parents;
@@ -334,7 +340,8 @@ flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
 		}
 
 		/* Create TableAttachInfo object if needed */
-		if (tblinfo[i].dobj.dump && tblinfo[i].ispartition)
+		if ((tblinfo[i].dobj.dump & DUMP_COMPONENT_DEFINITION) &&
+			tblinfo[i].ispartition)
 		{
 			TableAttachInfo *attachinfo;
 
@@ -465,8 +472,9 @@ flagInhIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
  * modifies tblinfo
  */
 static void
-flagInhAttrs(DumpOptions *dopt, TableInfo *tblinfo, int numTables)
+flagInhAttrs(Archive *fout, TableInfo *tblinfo, int numTables)
 {
+	DumpOptions *dopt = fout->dopt;
 	int			i,
 				j,
 				k;
@@ -664,6 +672,30 @@ AssignDumpId(DumpableObject *dobj)
 		Assert(entry->dobj == NULL);
 		entry->dobj = dobj;
 	}
+}
+
+/*
+ * recordAdditionalCatalogID
+ *	  Record an additional catalog ID for the given DumpableObject
+ */
+void
+recordAdditionalCatalogID(CatalogId catId, DumpableObject *dobj)
+{
+	CatalogIdMapEntry *entry;
+	bool		found;
+
+	/* CatalogId hash table must exist, if we have a DumpableObject */
+	Assert(catalogIdHash != NULL);
+
+	/* Add reference to CatalogId hash */
+	entry = catalogid_insert(catalogIdHash, catId, &found);
+	if (!found)
+	{
+		entry->dobj = NULL;
+		entry->ext = NULL;
+	}
+	Assert(entry->dobj == NULL);
+	entry->dobj = dobj;
 }
 
 /*
@@ -948,6 +980,24 @@ findPublicationByOid(Oid oid)
 	return (PublicationInfo *) dobj;
 }
 
+/*
+ * findSubscriptionByOid
+ *	  finds the DumpableObject for the subscription with the given oid
+ *	  returns NULL if not found
+ */
+SubscriptionInfo *
+findSubscriptionByOid(Oid oid)
+{
+	CatalogId	catId;
+	DumpableObject *dobj;
+
+	catId.tableoid = SubscriptionRelationId;
+	catId.oid = oid;
+	dobj = findObjectByCatalogId(catId);
+	Assert(dobj == NULL || dobj->objType == DO_SUBSCRIPTION);
+	return (SubscriptionInfo *) dobj;
+}
+
 
 /*
  * recordExtensionMembership
@@ -992,52 +1042,6 @@ findOwningExtension(CatalogId catalogId)
 	return entry->ext;
 }
 
-
-/*
- * findParentsByOid
- *	  find a table's parents in tblinfo[]
- */
-static void
-findParentsByOid(TableInfo *self,
-				 InhInfo *inhinfo, int numInherits)
-{
-	Oid			oid = self->dobj.catId.oid;
-	int			i,
-				j;
-	int			numParents;
-
-	numParents = 0;
-	for (i = 0; i < numInherits; i++)
-	{
-		if (inhinfo[i].inhrelid == oid)
-			numParents++;
-	}
-
-	self->numParents = numParents;
-
-	if (numParents > 0)
-	{
-		self->parents = pg_malloc_array(TableInfo *, numParents);
-		j = 0;
-		for (i = 0; i < numInherits; i++)
-		{
-			if (inhinfo[i].inhrelid == oid)
-			{
-				TableInfo  *parent;
-
-				parent = findTableByOid(inhinfo[i].inhparent);
-				if (parent == NULL)
-					pg_fatal("failed sanity check, parent OID %u of table \"%s\" (OID %u) not found",
-							 inhinfo[i].inhparent,
-							 self->dobj.name,
-							 oid);
-				self->parents[j++] = parent;
-			}
-		}
-	}
-	else
-		self->parents = NULL;
-}
 
 /*
  * parseOidArray

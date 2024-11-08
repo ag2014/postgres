@@ -8,7 +8,7 @@
  * or call fmgr-callable functions.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/fmgr.h
@@ -425,14 +425,13 @@ extern int no_such_variable
 
 
 /*
- * Declare _PG_init/_PG_fini centrally. Historically each shared library had
- * its own declaration; but now that we want to mark these PGDLLEXPORT, using
- * central declarations avoids each extension having to add that.  Any
- * existing declarations in extensions will continue to work if fmgr.h is
- * included before them, otherwise compilation for Windows will fail.
+ * Declare _PG_init centrally. Historically each shared library had its own
+ * declaration; but now that we want to mark these PGDLLEXPORT, using central
+ * declarations avoids each extension having to add that.  Any existing
+ * declarations in extensions will continue to work if fmgr.h is included
+ * before them, otherwise compilation for Windows will fail.
  */
 extern PGDLLEXPORT void _PG_init(void);
-extern PGDLLEXPORT void _PG_fini(void);
 
 
 /*-------------------------------------------------------------------------
@@ -783,7 +782,7 @@ typedef enum FmgrHookEventType
 {
 	FHET_START,
 	FHET_END,
-	FHET_ABORT
+	FHET_ABORT,
 } FmgrHookEventType;
 
 typedef bool (*needs_fmgr_hook_type) (Oid fn_oid);

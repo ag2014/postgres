@@ -3,7 +3,7 @@
  * spell.c
  *		Normalizing word with ISpell
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * Ispell dictionary
  * -----------------
@@ -191,7 +191,7 @@ lowerstr_ctx(IspellDict *Conf, const char *src)
 #define GETWCHAR(W,L,N,T) ( ((const uint8*)(W))[ ((T)==FF_PREFIX) ? (N) : ( (L) - 1 - (N) ) ] )
 #define GETCHAR(A,N,T)	  GETWCHAR( (A)->repl, (A)->replen, N, T )
 
-static char *VoidString = "";
+static const char *VoidString = "";
 
 static int
 cmpspell(const void *s1, const void *s2)
@@ -346,11 +346,11 @@ cmpaffix(const void *s1, const void *s2)
  * sflag: returns an affix flag from sflagset.
  */
 static void
-getNextFlagFromString(IspellDict *Conf, char **sflagset, char *sflag)
+getNextFlagFromString(IspellDict *Conf, const char **sflagset, char *sflag)
 {
 	int32		s;
-	char	   *next,
-			   *sbuf = *sflagset;
+	char	   *next;
+	const char *sbuf = *sflagset;
 	int			maxstep;
 	bool		stop = false;
 	bool		met_comma = false;
@@ -453,7 +453,7 @@ getNextFlagFromString(IspellDict *Conf, char **sflagset, char *sflag)
 static bool
 IsAffixFlagInUse(IspellDict *Conf, int affix, const char *affixflag)
 {
-	char	   *flagcur;
+	const char *flagcur;
 	char		flag[BUFSIZ];
 
 	if (*affixflag == 0)
@@ -656,17 +656,6 @@ FindWord(IspellDict *Conf, const char *word, const char *affixflag, int flag)
 }
 
 /*
- * Context reset/delete callback for a regular expression used in an affix
- */
-static void
-regex_affix_deletion_callback(void *arg)
-{
-	aff_regex_struct *pregex = (aff_regex_struct *) arg;
-
-	pg_regfree(&(pregex->regex));
-}
-
-/*
  * Adds a new affix rule to the Affix field.
  *
  * Conf: current dictionary.
@@ -728,7 +717,6 @@ NIAddAffix(IspellDict *Conf, const char *flag, char flagflags, const char *mask,
 		int			err;
 		pg_wchar   *wmask;
 		char	   *tmask;
-		aff_regex_struct *pregex;
 
 		Affix->issimple = 0;
 		Affix->isregis = 0;
@@ -743,31 +731,23 @@ NIAddAffix(IspellDict *Conf, const char *flag, char flagflags, const char *mask,
 		wmasklen = pg_mb2wchar_with_len(tmask, wmask, masklen);
 
 		/*
-		 * The regex engine stores its stuff using malloc not palloc, so we
-		 * must arrange to explicitly clean up the regex when the dictionary's
-		 * context is cleared.  That means the regex_t has to stay in a fixed
-		 * location within the context; we can't keep it directly in the AFFIX
-		 * struct, since we may sort and resize the array of AFFIXes.
+		 * The regex and all internal state created by pg_regcomp are
+		 * allocated in the dictionary's memory context, and will be freed
+		 * automatically when it is destroyed.
 		 */
-		Affix->reg.pregex = pregex = palloc(sizeof(aff_regex_struct));
-
-		err = pg_regcomp(&(pregex->regex), wmask, wmasklen,
+		Affix->reg.pregex = palloc(sizeof(regex_t));
+		err = pg_regcomp(Affix->reg.pregex, wmask, wmasklen,
 						 REG_ADVANCED | REG_NOSUB,
 						 DEFAULT_COLLATION_OID);
 		if (err)
 		{
 			char		errstr[100];
 
-			pg_regerror(err, &(pregex->regex), errstr, sizeof(errstr));
+			pg_regerror(err, Affix->reg.pregex, errstr, sizeof(errstr));
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_REGULAR_EXPRESSION),
 					 errmsg("invalid regular expression: %s", errstr)));
 		}
-
-		pregex->mcallback.func = regex_affix_deletion_callback;
-		pregex->mcallback.arg = (void *) pregex;
-		MemoryContextRegisterResetCallback(CurrentMemoryContext,
-										   &pregex->mcallback);
 	}
 
 	Affix->flagflags = flagflags;
@@ -1140,13 +1120,13 @@ addCompoundAffixFlagValue(IspellDict *Conf, char *s, uint32 val)
  * flags s.
  */
 static int
-getCompoundAffixFlagValue(IspellDict *Conf, char *s)
+getCompoundAffixFlagValue(IspellDict *Conf, const char *s)
 {
 	uint32		flag = 0;
 	CompoundAffixFlag *found,
 				key;
 	char		sflag[BUFSIZ];
-	char	   *flagcur;
+	const char *flagcur;
 
 	if (Conf->nCompoundAffixFlag == 0)
 		return 0;
@@ -1175,7 +1155,7 @@ getCompoundAffixFlagValue(IspellDict *Conf, char *s)
  * Conf->AffixData array and function returns its entry.
  * Else function returns the s parameter.
  */
-static char *
+static const char *
 getAffixFlagSet(IspellDict *Conf, char *s)
 {
 	if (Conf->useFlagAliases && *s != '\0')
@@ -1343,7 +1323,7 @@ NIImportOOAffixes(IspellDict *Conf, const char *filename)
 				/* Also reserve place for empty flag set */
 				naffix++;
 
-				Conf->AffixData = (char **) palloc0(naffix * sizeof(char *));
+				Conf->AffixData = (const char **) palloc0(naffix * sizeof(char *));
 				Conf->lenAffixData = Conf->nAffixData = naffix;
 
 				/* Add empty flag set into AffixData */
@@ -1591,7 +1571,7 @@ isnewformat:
 static int
 MergeAffix(IspellDict *Conf, int a1, int a2)
 {
-	char	  **ptr;
+	const char **ptr;
 
 	Assert(a1 < Conf->nAffixData && a2 < Conf->nAffixData);
 
@@ -1605,24 +1585,28 @@ MergeAffix(IspellDict *Conf, int a1, int a2)
 	if (Conf->nAffixData + 1 >= Conf->lenAffixData)
 	{
 		Conf->lenAffixData *= 2;
-		Conf->AffixData = (char **) repalloc(Conf->AffixData,
-											 sizeof(char *) * Conf->lenAffixData);
+		Conf->AffixData = (const char **) repalloc(Conf->AffixData,
+												   sizeof(char *) * Conf->lenAffixData);
 	}
 
 	ptr = Conf->AffixData + Conf->nAffixData;
 	if (Conf->flagMode == FM_NUM)
 	{
-		*ptr = cpalloc(strlen(Conf->AffixData[a1]) +
-					   strlen(Conf->AffixData[a2]) +
-					   1 /* comma */ + 1 /* \0 */ );
-		sprintf(*ptr, "%s,%s", Conf->AffixData[a1], Conf->AffixData[a2]);
+		char	   *p = cpalloc(strlen(Conf->AffixData[a1]) +
+								strlen(Conf->AffixData[a2]) +
+								1 /* comma */ + 1 /* \0 */ );
+
+		sprintf(p, "%s,%s", Conf->AffixData[a1], Conf->AffixData[a2]);
+		*ptr = p;
 	}
 	else
 	{
-		*ptr = cpalloc(strlen(Conf->AffixData[a1]) +
-					   strlen(Conf->AffixData[a2]) +
-					   1 /* \0 */ );
-		sprintf(*ptr, "%s%s", Conf->AffixData[a1], Conf->AffixData[a2]);
+		char	   *p = cpalloc(strlen(Conf->AffixData[a1]) +
+								strlen(Conf->AffixData[a2]) +
+								1 /* \0 */ );
+
+		sprintf(p, "%s%s", Conf->AffixData[a1], Conf->AffixData[a2]);
+		*ptr = p;
 	}
 	ptr++;
 	*ptr = NULL;
@@ -1805,7 +1789,7 @@ NISortDictionary(IspellDict *Conf)
 		 * dictionary. Replace textual flag-field of Conf->Spell entries with
 		 * indexes into Conf->AffixData array.
 		 */
-		Conf->AffixData = (char **) palloc0(naffix * sizeof(char *));
+		Conf->AffixData = (const char **) palloc0(naffix * sizeof(const char *));
 
 		curaffix = -1;
 		for (i = 0; i < Conf->nspell; i++)
@@ -1974,7 +1958,7 @@ mkVoidAffix(IspellDict *Conf, bool issuffix, int startsuffix)
  * returns false.
  */
 static bool
-isAffixInUse(IspellDict *Conf, char *affixflag)
+isAffixInUse(IspellDict *Conf, const char *affixflag)
 {
 	int			i;
 
@@ -2161,7 +2145,7 @@ CheckAffix(const char *word, size_t len, AFFIX *Affix, int flagflags, char *neww
 		data = (pg_wchar *) palloc((newword_len + 1) * sizeof(pg_wchar));
 		data_len = pg_mb2wchar_with_len(newword, data, newword_len);
 
-		if (pg_regexec(&(Affix->reg.pregex->regex), data, data_len,
+		if (pg_regexec(Affix->reg.pregex, data, data_len,
 					   0, NULL, 0, NULL, 0) == REG_OKAY)
 		{
 			pfree(data);
@@ -2189,7 +2173,7 @@ addToResult(char **forms, char **cur, char *word)
 }
 
 static char **
-NormalizeSubWord(IspellDict *Conf, char *word, int flag)
+NormalizeSubWord(IspellDict *Conf, const char *word, int flag)
 {
 	AffixNodeData *suffix = NULL,
 			   *prefix = NULL;
@@ -2275,8 +2259,8 @@ NormalizeSubWord(IspellDict *Conf, char *word, int flag)
 						if (CheckAffix(newword, swrdlen, prefix->aff[j], flag, pnewword, &baselen))
 						{
 							/* prefix success */
-							char	   *ff = (prefix->aff[j]->flagflags & suffix->aff[i]->flagflags & FF_CROSSPRODUCT) ?
-							VoidString : prefix->aff[j]->flag;
+							const char *ff = (prefix->aff[j]->flagflags & suffix->aff[i]->flagflags & FF_CROSSPRODUCT) ?
+								VoidString : prefix->aff[j]->flag;
 
 							if (FindWord(Conf, pnewword, ff, flag))
 								cur += addToResult(forms, cur, pnewword);
@@ -2307,7 +2291,7 @@ typedef struct SplitVar
 } SplitVar;
 
 static int
-CheckCompoundAffixes(CMPDAffix **ptr, char *word, int len, bool CheckInPlace)
+CheckCompoundAffixes(CMPDAffix **ptr, const char *word, int len, bool CheckInPlace)
 {
 	bool		issuffix;
 
@@ -2387,7 +2371,7 @@ AddStem(SplitVar *v, char *word)
 }
 
 static SplitVar *
-SplitToVariants(IspellDict *Conf, SPNode *snode, SplitVar *orig, char *word, int wordlen, int startpos, int minpos)
+SplitToVariants(IspellDict *Conf, SPNode *snode, SplitVar *orig, const char *word, int wordlen, int startpos, int minpos)
 {
 	SplitVar   *var = NULL;
 	SPNodeData *StopLow,
@@ -2553,7 +2537,7 @@ addNorm(TSLexeme **lres, TSLexeme **lcur, char *word, int flags, uint16 NVariant
 }
 
 TSLexeme *
-NINormalizeWord(IspellDict *Conf, char *word)
+NINormalizeWord(IspellDict *Conf, const char *word)
 {
 	char	  **res;
 	TSLexeme   *lcur = NULL,

@@ -3,7 +3,7 @@
  * jsonb.h
  *	  Declarations for jsonb data type support.
  *
- * Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * src/include/utils/jsonb.h
  *
@@ -26,7 +26,7 @@ typedef enum
 	WJB_BEGIN_ARRAY,
 	WJB_END_ARRAY,
 	WJB_BEGIN_OBJECT,
-	WJB_END_OBJECT
+	WJB_END_OBJECT,
 } JsonbIteratorToken;
 
 /* Strategy numbers for GIN index opclasses */
@@ -321,6 +321,8 @@ typedef struct JsonbParseState
 	JsonbValue	contVal;
 	Size		size;
 	struct JsonbParseState *next;
+	bool		unique_keys;	/* Check object key uniqueness */
+	bool		skip_nulls;		/* Skip null object fields */
 } JsonbParseState;
 
 /*
@@ -333,7 +335,7 @@ typedef enum
 	JBI_ARRAY_ELEM,
 	JBI_OBJECT_START,
 	JBI_OBJECT_KEY,
-	JBI_OBJECT_VALUE
+	JBI_OBJECT_VALUE,
 } JsonbIterState;
 
 typedef struct JsonbIterator
@@ -420,6 +422,7 @@ extern char *JsonbToCString(StringInfo out, JsonbContainer *in,
 							int estimated_len);
 extern char *JsonbToCStringIndent(StringInfo out, JsonbContainer *in,
 								  int estimated_len);
+extern char *JsonbUnquote(Jsonb *jb);
 extern bool JsonbExtractScalar(JsonbContainer *jbc, JsonbValue *res);
 extern const char *JsonbTypeName(JsonbValue *val);
 
@@ -427,4 +430,11 @@ extern Datum jsonb_set_element(Jsonb *jb, Datum *path, int path_len,
 							   JsonbValue *newval);
 extern Datum jsonb_get_element(Jsonb *jb, Datum *path, int npath,
 							   bool *isnull, bool as_text);
+extern bool to_jsonb_is_immutable(Oid typoid);
+extern Datum jsonb_build_object_worker(int nargs, const Datum *args, const bool *nulls,
+									   const Oid *types, bool absent_on_null,
+									   bool unique_keys);
+extern Datum jsonb_build_array_worker(int nargs, const Datum *args, const bool *nulls,
+									  const Oid *types, bool absent_on_null);
+
 #endif							/* __JSONB_H__ */

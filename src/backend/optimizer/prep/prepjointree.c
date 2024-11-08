@@ -14,7 +14,7 @@
  *		remove_useless_result_rtes
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -153,9 +153,14 @@ transform_MERGE_to_join(Query *parse)
 {
 	RangeTblEntry *joinrte;
 	JoinExpr   *joinexpr;
+	bool		have_action[NUM_MERGE_MATCH_KINDS];
 	JoinType	jointype;
 	int			joinrti;
 	List	   *vars;
+	RangeTblRef *rtr;
+	FromExpr   *target;
+	Node	   *source;
+	int			sourcerti;
 
 	if (parse->commandType != CMD_MERGE)
 		return;
@@ -164,11 +169,27 @@ transform_MERGE_to_join(Query *parse)
 	vars = NIL;
 
 	/*
-	 * When any WHEN NOT MATCHED THEN INSERT clauses exist, we need to use an
-	 * outer join so that we process all unmatched tuples from the source
-	 * relation.  If none exist, we can use an inner join.
+	 * Work out what kind of join is required.  If there any WHEN NOT MATCHED
+	 * BY SOURCE/TARGET actions, an outer join is required so that we process
+	 * all unmatched tuples from the source and/or target relations.
+	 * Otherwise, we can use an inner join.
 	 */
-	if (parse->mergeUseOuterJoin)
+	have_action[MERGE_WHEN_MATCHED] = false;
+	have_action[MERGE_WHEN_NOT_MATCHED_BY_SOURCE] = false;
+	have_action[MERGE_WHEN_NOT_MATCHED_BY_TARGET] = false;
+
+	foreach_node(MergeAction, action, parse->mergeActionList)
+	{
+		if (action->commandType != CMD_NOTHING)
+			have_action[action->matchKind] = true;
+	}
+
+	if (have_action[MERGE_WHEN_NOT_MATCHED_BY_SOURCE] &&
+		have_action[MERGE_WHEN_NOT_MATCHED_BY_TARGET])
+		jointype = JOIN_FULL;
+	else if (have_action[MERGE_WHEN_NOT_MATCHED_BY_SOURCE])
+		jointype = JOIN_LEFT;
+	else if (have_action[MERGE_WHEN_NOT_MATCHED_BY_TARGET])
 		jointype = JOIN_RIGHT;
 	else
 		jointype = JOIN_INNER;
@@ -198,23 +219,146 @@ transform_MERGE_to_join(Query *parse)
 
 	/*
 	 * Create a JOIN between the target and the source relation.
+	 *
+	 * Here the target is identified by parse->mergeTargetRelation.  For a
+	 * regular table, this will equal parse->resultRelation, but for a
+	 * trigger-updatable view, it will be the expanded view subquery that we
+	 * need to pull data from.
+	 *
+	 * The source relation is in parse->jointree->fromlist, but any quals in
+	 * parse->jointree->quals are restrictions on the target relation (if the
+	 * target relation is an auto-updatable view).
 	 */
+	/* target rel, with any quals */
+	rtr = makeNode(RangeTblRef);
+	rtr->rtindex = parse->mergeTargetRelation;
+	target = makeFromExpr(list_make1(rtr), parse->jointree->quals);
+
+	/* source rel (expect exactly one -- see transformMergeStmt()) */
+	Assert(list_length(parse->jointree->fromlist) == 1);
+	source = linitial(parse->jointree->fromlist);
+
+	/*
+	 * index of source rel (expect either a RangeTblRef or a JoinExpr -- see
+	 * transformFromClauseItem()).
+	 */
+	if (IsA(source, RangeTblRef))
+		sourcerti = ((RangeTblRef *) source)->rtindex;
+	else if (IsA(source, JoinExpr))
+		sourcerti = ((JoinExpr *) source)->rtindex;
+	else
+	{
+		elog(ERROR, "unrecognized source node type: %d",
+			 (int) nodeTag(source));
+		sourcerti = 0;			/* keep compiler quiet */
+	}
+
+	/* Join the source and target */
 	joinexpr = makeNode(JoinExpr);
 	joinexpr->jointype = jointype;
 	joinexpr->isNatural = false;
-	joinexpr->larg = (Node *) makeNode(RangeTblRef);
-	((RangeTblRef *) joinexpr->larg)->rtindex = parse->resultRelation;
-	joinexpr->rarg = linitial(parse->jointree->fromlist);	/* original join */
+	joinexpr->larg = (Node *) target;
+	joinexpr->rarg = source;
 	joinexpr->usingClause = NIL;
 	joinexpr->join_using_alias = NULL;
-	/* The quals are removed from the jointree and into this specific join */
-	joinexpr->quals = parse->jointree->quals;
+	joinexpr->quals = parse->mergeJoinCondition;
 	joinexpr->alias = NULL;
 	joinexpr->rtindex = joinrti;
 
 	/* Make the new join be the sole entry in the query's jointree */
 	parse->jointree->fromlist = list_make1(joinexpr);
 	parse->jointree->quals = NULL;
+
+	/*
+	 * If necessary, mark parse->targetlist entries that refer to the target
+	 * as nullable by the join.  Normally the targetlist will be empty for a
+	 * MERGE, but if the target is a trigger-updatable view, it will contain a
+	 * whole-row Var referring to the expanded view query.
+	 */
+	if (parse->targetList != NIL &&
+		(jointype == JOIN_RIGHT || jointype == JOIN_FULL))
+		parse->targetList = (List *)
+			add_nulling_relids((Node *) parse->targetList,
+							   bms_make_singleton(parse->mergeTargetRelation),
+							   bms_make_singleton(joinrti));
+
+	/*
+	 * If the source relation is on the outer side of the join, mark any
+	 * source relation Vars in the join condition, actions, and RETURNING list
+	 * as nullable by the join.  These Vars will be added to the targetlist by
+	 * preprocess_targetlist(), so it's important to mark them correctly here.
+	 *
+	 * It might seem that this is not necessary for Vars in the join
+	 * condition, since it is inside the join, but it is also needed above the
+	 * join (in the ModifyTable node) to distinguish between the MATCHED and
+	 * NOT MATCHED BY SOURCE cases -- see ExecMergeMatched().  Note that this
+	 * creates a modified copy of the join condition, for use above the join,
+	 * without modifying the original join condition, inside the join.
+	 */
+	if (jointype == JOIN_LEFT || jointype == JOIN_FULL)
+	{
+		parse->mergeJoinCondition =
+			add_nulling_relids(parse->mergeJoinCondition,
+							   bms_make_singleton(sourcerti),
+							   bms_make_singleton(joinrti));
+
+		foreach_node(MergeAction, action, parse->mergeActionList)
+		{
+			action->qual =
+				add_nulling_relids(action->qual,
+								   bms_make_singleton(sourcerti),
+								   bms_make_singleton(joinrti));
+
+			action->targetList = (List *)
+				add_nulling_relids((Node *) action->targetList,
+								   bms_make_singleton(sourcerti),
+								   bms_make_singleton(joinrti));
+		}
+
+		parse->returningList = (List *)
+			add_nulling_relids((Node *) parse->returningList,
+							   bms_make_singleton(sourcerti),
+							   bms_make_singleton(joinrti));
+	}
+
+	/*
+	 * If there are any WHEN NOT MATCHED BY SOURCE actions, the executor will
+	 * use the join condition to distinguish between MATCHED and NOT MATCHED
+	 * BY SOURCE cases.  Otherwise, it's no longer needed, and we set it to
+	 * NULL, saving cycles during planning and execution.
+	 *
+	 * We need to be careful though: the executor evaluates this condition
+	 * using the output of the join subplan node, which nulls the output from
+	 * the source relation when the join condition doesn't match.  That risks
+	 * producing incorrect results when rechecking using a "non-strict" join
+	 * condition, such as "src.col IS NOT DISTINCT FROM tgt.col".  To guard
+	 * against that, we add an additional "src IS NOT NULL" check to the join
+	 * condition, so that it does the right thing when performing a recheck
+	 * based on the output of the join subplan.
+	 */
+	if (have_action[MERGE_WHEN_NOT_MATCHED_BY_SOURCE])
+	{
+		Var		   *var;
+		NullTest   *ntest;
+
+		/* source wholerow Var (nullable by the new join) */
+		var = makeWholeRowVar(rt_fetch(sourcerti, parse->rtable),
+							  sourcerti, 0, false);
+		var->varnullingrels = bms_make_singleton(joinrti);
+
+		/* "src IS NOT NULL" check */
+		ntest = makeNode(NullTest);
+		ntest->arg = (Expr *) var;
+		ntest->nulltesttype = IS_NOT_NULL;
+		ntest->argisrow = false;
+		ntest->location = -1;
+
+		/* combine it with the original join condition */
+		parse->mergeJoinCondition =
+			(Node *) make_and_qual((Node *) ntest, parse->mergeJoinCondition);
+	}
+	else
+		parse->mergeJoinCondition = NULL;	/* join condition not needed */
 }
 
 /*
@@ -406,8 +550,8 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 		 * point of the available_rels machinations is to ensure that we only
 		 * pull up quals for which that's okay.
 		 *
-		 * We don't expect to see any pre-existing JOIN_SEMI or JOIN_ANTI
-		 * nodes here.
+		 * We don't expect to see any pre-existing JOIN_SEMI, JOIN_ANTI,
+		 * JOIN_RIGHT_SEMI, or JOIN_RIGHT_ANTI jointypes here.
 		 */
 		switch (j->jointype)
 		{
@@ -1186,6 +1330,7 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 				case RTE_CTE:
 				case RTE_NAMEDTUPLESTORE:
 				case RTE_RESULT:
+				case RTE_GROUP:
 					/* these can't contain any lateral references */
 					break;
 			}
@@ -1805,6 +1950,10 @@ pull_up_constant_function(PlannerInfo *root, Node *jtnode,
 	if (rtf->funccolcount != 1)
 		return jtnode;			/* definitely composite */
 
+	/* If it has a coldeflist, it certainly returns RECORD */
+	if (rtf->funccolnames != NIL)
+		return jtnode;			/* must be a one-column RECORD type */
+
 	functypclass = get_expr_result_type(rtf->funcexpr,
 										&funcrettype,
 										&tupdesc);
@@ -2122,14 +2271,6 @@ perform_pullup_replace_vars(PlannerInfo *root,
 	parse->returningList = (List *)
 		pullup_replace_vars((Node *) parse->returningList, rvcontext);
 
-	foreach(lc, parse->windowClause)
-	{
-		WindowClause *wc = lfirst_node(WindowClause, lc);
-
-		if (wc->runCondition != NIL)
-			wc->runCondition = (List *)
-				pullup_replace_vars((Node *) wc->runCondition, rvcontext);
-	}
 	if (parse->onConflict)
 	{
 		parse->onConflict->onConflictSet = (List *)
@@ -2155,6 +2296,8 @@ perform_pullup_replace_vars(PlannerInfo *root,
 				pullup_replace_vars((Node *) action->targetList, rvcontext);
 		}
 	}
+	parse->mergeJoinCondition = pullup_replace_vars(parse->mergeJoinCondition,
+													rvcontext);
 	replace_vars_in_jointree((Node *) parse->jointree, rvcontext);
 	Assert(parse->setOperations == NULL);
 	parse->havingQual = pullup_replace_vars(parse->havingQual, rvcontext);
@@ -2171,7 +2314,8 @@ perform_pullup_replace_vars(PlannerInfo *root,
 	}
 
 	/*
-	 * Replace references in the joinaliasvars lists of join RTEs.
+	 * Replace references in the joinaliasvars lists of join RTEs and the
+	 * groupexprs list of group RTE.
 	 */
 	foreach(lc, parse->rtable)
 	{
@@ -2180,6 +2324,10 @@ perform_pullup_replace_vars(PlannerInfo *root,
 		if (otherrte->rtekind == RTE_JOIN)
 			otherrte->joinaliasvars = (List *)
 				pullup_replace_vars((Node *) otherrte->joinaliasvars,
+									rvcontext);
+		else if (otherrte->rtekind == RTE_GROUP)
+			otherrte->groupexprs = (List *)
+				pullup_replace_vars((Node *) otherrte->groupexprs,
 									rvcontext);
 	}
 }
@@ -2246,6 +2394,7 @@ replace_vars_in_jointree(Node *jtnode,
 					case RTE_CTE:
 					case RTE_NAMEDTUPLESTORE:
 					case RTE_RESULT:
+					case RTE_GROUP:
 						/* these shouldn't be marked LATERAL */
 						Assert(false);
 						break;
@@ -2435,17 +2584,56 @@ pullup_replace_vars_callback(Var *var,
 			else if (newnode && IsA(newnode, PlaceHolderVar) &&
 					 ((PlaceHolderVar *) newnode)->phlevelsup == 0)
 			{
-				/* No need to wrap a PlaceHolderVar with another one, either */
-				wrap = false;
+				/* The same rules apply for a PlaceHolderVar */
+				if (rcon->target_rte->lateral &&
+					!bms_is_subset(((PlaceHolderVar *) newnode)->phrels,
+								   rcon->relids))
+					wrap = true;
+				else
+					wrap = false;
+			}
+			else if (rcon->wrap_non_vars)
+			{
+				/* Caller told us to wrap all non-Vars in a PlaceHolderVar */
+				wrap = true;
 			}
 			else
 			{
 				/*
-				 * Must wrap, either because we need a place to insert
-				 * varnullingrels or because caller told us to wrap
-				 * everything.
+				 * If the node contains Var(s) or PlaceHolderVar(s) of the
+				 * subquery being pulled up, and does not contain any
+				 * non-strict constructs, then instead of adding a PHV on top
+				 * we can add the required nullingrels to those Vars/PHVs.
+				 * (This is fundamentally a generalization of the above cases
+				 * for bare Vars and PHVs.)
+				 *
+				 * This test is somewhat expensive, but it avoids pessimizing
+				 * the plan in cases where the nullingrels get removed again
+				 * later by outer join reduction.
+				 *
+				 * This analysis could be tighter: in particular, a non-strict
+				 * construct hidden within a lower-level PlaceHolderVar is not
+				 * reason to add another PHV.  But for now it doesn't seem
+				 * worth the code to be more exact.
+				 *
+				 * For a LATERAL subquery, we have to check the actual var
+				 * membership of the node, but if it's non-lateral then any
+				 * level-zero var must belong to the subquery.
 				 */
-				wrap = true;
+				if ((rcon->target_rte->lateral ?
+					 bms_overlap(pull_varnos(rcon->root, newnode),
+								 rcon->relids) :
+					 contain_vars_of_level(newnode, 0)) &&
+					!contain_nonstrict_functions(newnode))
+				{
+					/* No wrap needed */
+					wrap = false;
+				}
+				else
+				{
+					/* Else wrap it in a PlaceHolderVar */
+					wrap = true;
+				}
 			}
 
 			if (wrap)
@@ -2466,18 +2654,14 @@ pullup_replace_vars_callback(Var *var,
 		}
 	}
 
-	/* Must adjust varlevelsup if replaced Var is within a subquery */
-	if (var->varlevelsup > 0)
-		IncrementVarSublevelsUp(newnode, var->varlevelsup, 0);
-
-	/* Propagate any varnullingrels into the replacement Var or PHV */
+	/* Propagate any varnullingrels into the replacement expression */
 	if (var->varnullingrels != NULL)
 	{
 		if (IsA(newnode, Var))
 		{
 			Var		   *newvar = (Var *) newnode;
 
-			Assert(newvar->varlevelsup == var->varlevelsup);
+			Assert(newvar->varlevelsup == 0);
 			newvar->varnullingrels = bms_add_members(newvar->varnullingrels,
 													 var->varnullingrels);
 		}
@@ -2485,13 +2669,25 @@ pullup_replace_vars_callback(Var *var,
 		{
 			PlaceHolderVar *newphv = (PlaceHolderVar *) newnode;
 
-			Assert(newphv->phlevelsup == var->varlevelsup);
+			Assert(newphv->phlevelsup == 0);
 			newphv->phnullingrels = bms_add_members(newphv->phnullingrels,
 													var->varnullingrels);
 		}
 		else
-			elog(ERROR, "failed to wrap a non-Var");
+		{
+			/* There should be lower-level Vars/PHVs we can modify */
+			newnode = add_nulling_relids(newnode,
+										 NULL,	/* modify all Vars/PHVs */
+										 var->varnullingrels);
+			/* Assert we did put the varnullingrels into the expression */
+			Assert(bms_is_subset(var->varnullingrels,
+								 pull_varnos(rcon->root, newnode)));
+		}
 	}
+
+	/* Must adjust varlevelsup if replaced Var is within a subquery */
+	if (var->varlevelsup > 0)
+		IncrementVarSublevelsUp(newnode, var->varlevelsup, 0);
 
 	return newnode;
 }
@@ -2640,9 +2836,10 @@ flatten_simple_union_all(PlannerInfo *root)
  * distribute_qual_to_rels to get rid of such clauses.
  *
  * Also, we get rid of JOIN_RIGHT cases by flipping them around to become
- * JOIN_LEFT.  This saves some code here and in some later planner routines,
- * but the main reason to do it is to not need to invent a JOIN_REVERSE_ANTI
- * join type.
+ * JOIN_LEFT.  This saves some code here and in some later planner routines;
+ * the main benefit is to reduce the number of jointypes that can appear in
+ * SpecialJoinInfo nodes.  Note that we can still generate Paths and Plans
+ * that use JOIN_RIGHT (or JOIN_RIGHT_ANTI) by switching the inputs again.
  *
  * To ease recognition of strict qual clauses, we require this routine to be
  * run after expression preprocessing (i.e., qual canonicalization and JOIN
@@ -2896,7 +3093,8 @@ reduce_outer_joins_pass2(Node *jtnode,
 				/*
 				 * These could only have been introduced by pull_up_sublinks,
 				 * so there's no way that upper quals could refer to their
-				 * righthand sides, and no point in checking.
+				 * righthand sides, and no point in checking.  We don't expect
+				 * to see JOIN_RIGHT_SEMI or JOIN_RIGHT_ANTI yet.
 				 */
 				break;
 			default:
@@ -3211,6 +3409,8 @@ remove_useless_result_rtes(PlannerInfo *root)
  * jtnode is the current jointree node.  If it could be valid to merge
  * its quals into those of the parent node, parent_quals should point to
  * the parent's quals list; otherwise, pass NULL for parent_quals.
+ * (Note that in some cases, parent_quals points to the quals of a parent
+ * more than one level up in the tree.)
  */
 static Node *
 remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
@@ -3314,13 +3514,22 @@ remove_useless_results_recurse(PlannerInfo *root, Node *jtnode,
 		int			varno;
 
 		/*
-		 * First, recurse.  We can accept pushed-up FromExpr quals from either
-		 * child if the jointype is INNER, and we can accept them from the RHS
-		 * child if the jointype is LEFT.
+		 * First, recurse.  We can absorb pushed-up FromExpr quals from either
+		 * child into this node if the jointype is INNER, since then this is
+		 * equivalent to a FromExpr.  When the jointype is LEFT, we can absorb
+		 * quals from the RHS child into the current node, as they're
+		 * essentially degenerate quals of the outer join.  Moreover, if we've
+		 * been passed down a parent_quals pointer then we can allow quals of
+		 * the LHS child to be absorbed into the parent.  (This is important
+		 * to ensure we remove single-child FromExprs immediately below
+		 * commutable left joins.)  For other jointypes, we can't move child
+		 * quals up, or at least there's no particular reason to.
 		 */
 		j->larg = remove_useless_results_recurse(root, j->larg,
 												 (j->jointype == JOIN_INNER) ?
-												 &j->quals : NULL,
+												 &j->quals :
+												 (j->jointype == JOIN_LEFT) ?
+												 parent_quals : NULL,
 												 dropped_outer_joins);
 		j->rarg = remove_useless_results_recurse(root, j->rarg,
 												 (j->jointype == JOIN_INNER ||

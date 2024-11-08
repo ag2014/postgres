@@ -3,7 +3,7 @@
  * lock.c
  *	  POSTGRES primary lock mechanism
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -35,20 +35,17 @@
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/twophase_rmgr.h"
-#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlogutils.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
-#include "pgstat.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
-#include "storage/sinvaladt.h"
 #include "storage/spin.h"
 #include "storage/standby.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
-#include "utils/resowner_private.h"
+#include "utils/resowner.h"
 
 
 /* This configuration variable is used to set the lock table size */
@@ -168,8 +165,13 @@ typedef struct TwoPhaseLockRecord
  * might be higher than the real number if another backend has transferred
  * our locks to the primary lock table, but it can never be lower than the
  * real value, since only we can acquire locks on our own behalf.
+ *
+ * XXX Allocate a static array of the maximum size. We could use a pointer
+ * and then allocate just the right size to save a couple kB, but then we
+ * would have to initialize that, while for the static array that happens
+ * automatically. Doesn't seem worth the extra complexity.
  */
-static int	FastPathLocalUseCount = 0;
+static int	FastPathLocalUseCounts[FP_LOCK_GROUPS_PER_BACKEND_MAX];
 
 /*
  * Flag to indicate if the relation extension lock is held by this backend.
@@ -187,34 +189,67 @@ static int	FastPathLocalUseCount = 0;
 static bool IsRelationExtensionLockHeld PG_USED_FOR_ASSERTS_ONLY = false;
 
 /*
- * Flag to indicate if the page lock is held by this backend.  We don't
- * acquire any other heavyweight lock while holding the page lock except for
- * relation extension.  However, these locks are never taken in reverse order
- * which implies that page locks will also never participate in the deadlock
- * cycle.
+ * Number of fast-path locks per backend - size of the arrays in PGPROC.
+ * This is set only once during start, before initializing shared memory,
+ * and remains constant after that.
  *
- * Similar to relation extension, page locks are also held for a short
- * duration, so imposing such a restriction won't hurt.
+ * We set the limit based on max_locks_per_transaction GUC, because that's
+ * the best information about expected number of locks per backend we have.
+ * See InitializeFastPathLocks() for details.
  */
-static bool IsPageLockHeld PG_USED_FOR_ASSERTS_ONLY = false;
+int			FastPathLockGroupsPerBackend = 0;
+
+/*
+ * Macros to calculate the fast-path group and index for a relation.
+ *
+ * The formula is a simple hash function, designed to spread the OIDs a bit,
+ * so that even contiguous values end up in different groups. In most cases
+ * there will be gaps anyway, but the multiplication should help a bit.
+ *
+ * The selected constant (49157) is a prime not too close to 2^k, and it's
+ * small enough to not cause overflows (in 64-bit).
+ */
+#define FAST_PATH_REL_GROUP(rel) \
+	(((uint64) (rel) * 49157) % FastPathLockGroupsPerBackend)
+
+/*
+ * Given the group/slot indexes, calculate the slot index in the whole array
+ * of fast-path lock slots.
+ */
+#define FAST_PATH_SLOT(group, index) \
+	(AssertMacro((uint32) (group) < FastPathLockGroupsPerBackend), \
+	 AssertMacro((uint32) (index) < FP_LOCK_SLOTS_PER_GROUP), \
+	 ((group) * FP_LOCK_SLOTS_PER_GROUP + (index)))
+
+/*
+ * Given a slot index (into the whole per-backend array), calculated using
+ * the FAST_PATH_SLOT macro, split it into group and index (in the group).
+ */
+#define FAST_PATH_GROUP(index)	\
+	(AssertMacro((uint32) (index) < FP_LOCK_SLOTS_PER_BACKEND), \
+	 ((index) / FP_LOCK_SLOTS_PER_GROUP))
+#define FAST_PATH_INDEX(index)	\
+	(AssertMacro((uint32) (index) < FP_LOCK_SLOTS_PER_BACKEND), \
+	 ((index) % FP_LOCK_SLOTS_PER_GROUP))
 
 /* Macros for manipulating proc->fpLockBits */
 #define FAST_PATH_BITS_PER_SLOT			3
 #define FAST_PATH_LOCKNUMBER_OFFSET		1
 #define FAST_PATH_MASK					((1 << FAST_PATH_BITS_PER_SLOT) - 1)
+#define FAST_PATH_BITS(proc, n)			(proc)->fpLockBits[FAST_PATH_GROUP(n)]
 #define FAST_PATH_GET_BITS(proc, n) \
-	(((proc)->fpLockBits >> (FAST_PATH_BITS_PER_SLOT * n)) & FAST_PATH_MASK)
+	((FAST_PATH_BITS(proc, n) >> (FAST_PATH_BITS_PER_SLOT * FAST_PATH_INDEX(n))) & FAST_PATH_MASK)
 #define FAST_PATH_BIT_POSITION(n, l) \
 	(AssertMacro((l) >= FAST_PATH_LOCKNUMBER_OFFSET), \
 	 AssertMacro((l) < FAST_PATH_BITS_PER_SLOT+FAST_PATH_LOCKNUMBER_OFFSET), \
 	 AssertMacro((n) < FP_LOCK_SLOTS_PER_BACKEND), \
-	 ((l) - FAST_PATH_LOCKNUMBER_OFFSET + FAST_PATH_BITS_PER_SLOT * (n)))
+	 ((l) - FAST_PATH_LOCKNUMBER_OFFSET + FAST_PATH_BITS_PER_SLOT * (FAST_PATH_INDEX(n))))
 #define FAST_PATH_SET_LOCKMODE(proc, n, l) \
-	 (proc)->fpLockBits |= UINT64CONST(1) << FAST_PATH_BIT_POSITION(n, l)
+	 FAST_PATH_BITS(proc, n) |= UINT64CONST(1) << FAST_PATH_BIT_POSITION(n, l)
 #define FAST_PATH_CLEAR_LOCKMODE(proc, n, l) \
-	 (proc)->fpLockBits &= ~(UINT64CONST(1) << FAST_PATH_BIT_POSITION(n, l))
+	 FAST_PATH_BITS(proc, n) &= ~(UINT64CONST(1) << FAST_PATH_BIT_POSITION(n, l))
 #define FAST_PATH_CHECK_LOCKMODE(proc, n, l) \
-	 ((proc)->fpLockBits & (UINT64CONST(1) << FAST_PATH_BIT_POSITION(n, l)))
+	 (FAST_PATH_BITS(proc, n) & (UINT64CONST(1) << FAST_PATH_BIT_POSITION(n, l)))
 
 /*
  * The fast-path lock mechanism is concerned only with relation locks on
@@ -374,7 +409,7 @@ static PROCLOCK *SetupLockInTable(LockMethod lockMethodTable, PGPROC *proc,
 static void GrantLockLocal(LOCALLOCK *locallock, ResourceOwner owner);
 static void BeginStrongLockAcquire(LOCALLOCK *locallock, uint32 fasthashcode);
 static void FinishStrongLockAcquire(void);
-static void WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner);
+static ProcWaitStatus WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner);
 static void ReleaseLockIfHeld(LOCALLOCK *locallock, bool sessionLock);
 static void LockReassignOwner(LOCALLOCK *locallock, ResourceOwner parent);
 static bool UnGrantLock(LOCK *lock, LOCKMODE lockmode,
@@ -390,19 +425,17 @@ static void GetSingleProcBlockerStatusData(PGPROC *blocked_proc,
 
 
 /*
- * InitLocks -- Initialize the lock manager's data structures.
+ * Initialize the lock manager's shmem data structures.
  *
- * This is called from CreateSharedMemoryAndSemaphores(), which see for
- * more comments.  In the normal postmaster case, the shared hash tables
- * are created here, as well as a locallock hash table that will remain
- * unused and empty in the postmaster itself.  Backends inherit the pointers
- * to the shared tables via fork(), and also inherit an image of the locallock
- * hash table, which they proceed to use.  In the EXEC_BACKEND case, each
- * backend re-executes this code to obtain pointers to the already existing
- * shared hash tables and to create its locallock hash table.
+ * This is called from CreateSharedMemoryAndSemaphores(), which see for more
+ * comments.  In the normal postmaster case, the shared hash tables are
+ * created here, and backends inherit pointers to them via fork().  In the
+ * EXEC_BACKEND case, each backend re-executes this code to obtain pointers to
+ * the already existing shared hash tables.  In either case, each backend must
+ * also call InitLockManagerAccess() to create the locallock hash table.
  */
 void
-InitLocks(void)
+LockManagerShmemInit(void)
 {
 	HASHCTL		info;
 	long		init_table_size,
@@ -411,7 +444,7 @@ InitLocks(void)
 
 	/*
 	 * Compute init/max size to request for lock hashtables.  Note these
-	 * calculations must agree with LockShmemSize!
+	 * calculations must agree with LockManagerShmemSize!
 	 */
 	max_table_size = NLOCKENTS();
 	init_table_size = max_table_size / 2;
@@ -457,18 +490,19 @@ InitLocks(void)
 						sizeof(FastPathStrongRelationLockData), &found);
 	if (!found)
 		SpinLockInit(&FastPathStrongRelationLocks->mutex);
+}
 
+/*
+ * Initialize the lock manager's backend-private data structures.
+ */
+void
+InitLockManagerAccess(void)
+{
 	/*
 	 * Allocate non-shared hash table for LOCALLOCK structs.  This stores lock
 	 * counts and resource owner information.
-	 *
-	 * The non-shared table could already exist in this process (this occurs
-	 * when the postmaster is recreating shared memory after a backend crash).
-	 * If so, delete and recreate it.  (We could simply leave it, since it
-	 * ought to be empty in the postmaster, but for safety let's zap it.)
 	 */
-	if (LockMethodLocalHash)
-		hash_destroy(LockMethodLocalHash);
+	HASHCTL		info;
 
 	info.keysize = sizeof(LOCALLOCKTAG);
 	info.entrysize = sizeof(LOCALLOCK);
@@ -591,11 +625,17 @@ DoLockModesConflict(LOCKMODE mode1, LOCKMODE mode2)
 }
 
 /*
- * LockHeldByMe -- test whether lock 'locktag' is held with mode 'lockmode'
- *		by the current transaction
+ * LockHeldByMe -- test whether lock 'locktag' is held by the current
+ *		transaction
+ *
+ * Returns true if current transaction holds a lock on 'tag' of mode
+ * 'lockmode'.  If 'orstronger' is true, a stronger lockmode is also OK.
+ * ("Stronger" is defined as "numerically higher", which is a bit
+ * semantically dubious but is OK for the purposes we use this for.)
  */
 bool
-LockHeldByMe(const LOCKTAG *locktag, LOCKMODE lockmode)
+LockHeldByMe(const LOCKTAG *locktag,
+			 LOCKMODE lockmode, bool orstronger)
 {
 	LOCALLOCKTAG localtag;
 	LOCALLOCK  *locallock;
@@ -611,7 +651,23 @@ LockHeldByMe(const LOCKTAG *locktag, LOCKMODE lockmode)
 										  &localtag,
 										  HASH_FIND, NULL);
 
-	return (locallock && locallock->nLocks > 0);
+	if (locallock && locallock->nLocks > 0)
+		return true;
+
+	if (orstronger)
+	{
+		LOCKMODE	slockmode;
+
+		for (slockmode = lockmode + 1;
+			 slockmode <= MaxLockMode;
+			 slockmode++)
+		{
+			if (LockHeldByMe(locktag, slockmode, false))
+				return true;
+		}
+	}
+
+	return false;
 }
 
 #ifdef USE_ASSERT_CHECKING
@@ -786,6 +842,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	uint32		hashcode;
 	LWLock	   *partitionLock;
 	bool		found_conflict;
+	ProcWaitStatus waitResult;
 	bool		log_lock = false;
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
@@ -887,13 +944,6 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	Assert(!IsRelationExtensionLockHeld);
 
 	/*
-	 * We don't acquire any other heavyweight lock while holding the page lock
-	 * except for relation extension.
-	 */
-	Assert(!IsPageLockHeld ||
-		   (locktag->locktag_type == LOCKTAG_RELATION_EXTEND));
-
-	/*
 	 * Prepare to emit a WAL record if acquisition of this lock needs to be
 	 * replayed in a standby server.
 	 *
@@ -925,7 +975,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	 * for now we don't worry about that case either.
 	 */
 	if (EligibleForRelationFastPath(locktag, lockmode) &&
-		FastPathLocalUseCount < FP_LOCK_SLOTS_PER_BACKEND)
+		FastPathLocalUseCounts[FAST_PATH_REL_GROUP(locktag->locktag_field2)] < FP_LOCK_SLOTS_PER_GROUP)
 	{
 		uint32		fasthashcode = FastPathStrongLockHashPartition(hashcode);
 		bool		acquired;
@@ -980,7 +1030,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 				ereport(ERROR,
 						(errcode(ERRCODE_OUT_OF_MEMORY),
 						 errmsg("out of shared memory"),
-						 errhint("You might need to increase max_locks_per_transaction.")));
+						 errhint("You might need to increase \"%s\".", "max_locks_per_transaction")));
 			else
 				return LOCKACQUIRE_NOT_AVAIL;
 		}
@@ -1018,7 +1068,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("out of shared memory"),
-					 errhint("You might need to increase max_locks_per_transaction.")));
+					 errhint("You might need to increase \"%s\".", "max_locks_per_transaction")));
 		else
 			return LOCKACQUIRE_NOT_AVAIL;
 	}
@@ -1041,71 +1091,83 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	{
 		/* No conflict with held or previously requested locks */
 		GrantLock(lock, proclock, lockmode);
-		GrantLockLocal(locallock, owner);
+		waitResult = PROC_WAIT_STATUS_OK;
 	}
 	else
 	{
 		/*
-		 * We can't acquire the lock immediately.  If caller specified no
-		 * blocking, remove useless table entries and return
-		 * LOCKACQUIRE_NOT_AVAIL without waiting.
+		 * Join the lock's wait queue.  We call this even in the dontWait
+		 * case, because JoinWaitQueue() may discover that we can acquire the
+		 * lock immediately after all.
 		 */
+		waitResult = JoinWaitQueue(locallock, lockMethodTable, dontWait);
+	}
+
+	if (waitResult == PROC_WAIT_STATUS_ERROR)
+	{
+		/*
+		 * We're not getting the lock because a deadlock was detected already
+		 * while trying to join the wait queue, or because we would have to
+		 * wait but the caller requested no blocking.
+		 *
+		 * Undo the changes to shared entries before releasing the partition
+		 * lock.
+		 */
+		AbortStrongLockAcquire();
+
+		if (proclock->holdMask == 0)
+		{
+			uint32		proclock_hashcode;
+
+			proclock_hashcode = ProcLockHashCode(&proclock->tag,
+												 hashcode);
+			dlist_delete(&proclock->lockLink);
+			dlist_delete(&proclock->procLink);
+			if (!hash_search_with_hash_value(LockMethodProcLockHash,
+											 &(proclock->tag),
+											 proclock_hashcode,
+											 HASH_REMOVE,
+											 NULL))
+				elog(PANIC, "proclock table corrupted");
+		}
+		else
+			PROCLOCK_PRINT("LockAcquire: did not join wait queue", proclock);
+		lock->nRequested--;
+		lock->requested[lockmode]--;
+		LOCK_PRINT("LockAcquire: did not join wait queue",
+				   lock, lockmode);
+		Assert((lock->nRequested > 0) &&
+			   (lock->requested[lockmode] >= 0));
+		Assert(lock->nGranted <= lock->nRequested);
+		LWLockRelease(partitionLock);
+		if (locallock->nLocks == 0)
+			RemoveLocalLock(locallock);
+
 		if (dontWait)
 		{
-			AbortStrongLockAcquire();
-			if (proclock->holdMask == 0)
-			{
-				uint32		proclock_hashcode;
-
-				proclock_hashcode = ProcLockHashCode(&proclock->tag, hashcode);
-				dlist_delete(&proclock->lockLink);
-				dlist_delete(&proclock->procLink);
-				if (!hash_search_with_hash_value(LockMethodProcLockHash,
-												 &(proclock->tag),
-												 proclock_hashcode,
-												 HASH_REMOVE,
-												 NULL))
-					elog(PANIC, "proclock table corrupted");
-			}
-			else
-				PROCLOCK_PRINT("LockAcquire: NOWAIT", proclock);
-			lock->nRequested--;
-			lock->requested[lockmode]--;
-			LOCK_PRINT("LockAcquire: conditional lock failed", lock, lockmode);
-			Assert((lock->nRequested > 0) && (lock->requested[lockmode] >= 0));
-			Assert(lock->nGranted <= lock->nRequested);
-			LWLockRelease(partitionLock);
-			if (locallock->nLocks == 0)
-				RemoveLocalLock(locallock);
 			if (locallockp)
 				*locallockp = NULL;
 			return LOCKACQUIRE_NOT_AVAIL;
 		}
+		else
+		{
+			DeadLockReport();
+			/* DeadLockReport() will not return */
+		}
+	}
 
-		/*
-		 * Set bitmask of locks this process already holds on this object.
-		 */
-		MyProc->heldLocks = proclock->holdMask;
+	/*
+	 * We are now in the lock queue, or the lock was already granted.  If
+	 * queued, go to sleep.
+	 */
+	if (waitResult == PROC_WAIT_STATUS_WAITING)
+	{
+		Assert(!dontWait);
+		PROCLOCK_PRINT("LockAcquire: sleeping on lock", proclock);
+		LOCK_PRINT("LockAcquire: sleeping on lock", lock, lockmode);
+		LWLockRelease(partitionLock);
 
-		/*
-		 * Sleep till someone wakes me up.
-		 */
-
-		TRACE_POSTGRESQL_LOCK_WAIT_START(locktag->locktag_field1,
-										 locktag->locktag_field2,
-										 locktag->locktag_field3,
-										 locktag->locktag_field4,
-										 locktag->locktag_type,
-										 lockmode);
-
-		WaitOnLock(locallock, owner);
-
-		TRACE_POSTGRESQL_LOCK_WAIT_DONE(locktag->locktag_field1,
-										locktag->locktag_field2,
-										locktag->locktag_field3,
-										locktag->locktag_field4,
-										locktag->locktag_type,
-										lockmode);
+		waitResult = WaitOnLock(locallock, owner);
 
 		/*
 		 * NOTE: do not do any material change of state between here and
@@ -1113,30 +1175,30 @@ LockAcquireExtended(const LOCKTAG *locktag,
 		 * done when the lock was granted to us --- see notes in WaitOnLock.
 		 */
 
-		/*
-		 * Check the proclock entry status, in case something in the ipc
-		 * communication doesn't work correctly.
-		 */
-		if (!(proclock->holdMask & LOCKBIT_ON(lockmode)))
+		if (waitResult == PROC_WAIT_STATUS_ERROR)
 		{
-			AbortStrongLockAcquire();
-			PROCLOCK_PRINT("LockAcquire: INCONSISTENT", proclock);
-			LOCK_PRINT("LockAcquire: INCONSISTENT", lock, lockmode);
-			/* Should we retry ? */
-			LWLockRelease(partitionLock);
-			elog(ERROR, "LockAcquire failed");
+			/*
+			 * We failed as a result of a deadlock, see CheckDeadLock(). Quit
+			 * now.
+			 */
+			Assert(!dontWait);
+			DeadLockReport();
+			/* DeadLockReport() will not return */
 		}
-		PROCLOCK_PRINT("LockAcquire: granted", proclock);
-		LOCK_PRINT("LockAcquire: granted", lock, lockmode);
 	}
+	else
+		LWLockRelease(partitionLock);
+	Assert(waitResult == PROC_WAIT_STATUS_OK);
+
+	/* The lock was granted to us.  Update the local lock entry accordingly */
+	Assert((proclock->holdMask & LOCKBIT_ON(lockmode)) != 0);
+	GrantLockLocal(locallock, owner);
 
 	/*
 	 * Lock state is fully up-to-date now; if we error out after this, no
 	 * special error cleanup is required.
 	 */
 	FinishStrongLockAcquire();
-
-	LWLockRelease(partitionLock);
 
 	/*
 	 * Emit a WAL record if acquisition of this lock needs to be replayed in a
@@ -1340,10 +1402,10 @@ SetupLockInTable(LockMethod lockMethodTable, PGPROC *proc,
 }
 
 /*
- * Check and set/reset the flag that we hold the relation extension/page lock.
+ * Check and set/reset the flag that we hold the relation extension lock.
  *
  * It is callers responsibility that this function is called after
- * acquiring/releasing the relation extension/page lock.
+ * acquiring/releasing the relation extension lock.
  *
  * Pass acquired as true if lock is acquired, false otherwise.
  */
@@ -1353,9 +1415,6 @@ CheckAndSetLockHeld(LOCALLOCK *locallock, bool acquired)
 #ifdef USE_ASSERT_CHECKING
 	if (LOCALLOCK_LOCKTAG(*locallock) == LOCKTAG_RELATION_EXTEND)
 		IsRelationExtensionLockHeld = acquired;
-	else if (LOCALLOCK_LOCKTAG(*locallock) == LOCKTAG_PAGE)
-		IsPageLockHeld = acquired;
-
 #endif
 }
 
@@ -1480,11 +1539,9 @@ LockCheckConflicts(LockMethod lockMethodTable,
 	}
 
 	/*
-	 * The relation extension or page lock conflict even between the group
-	 * members.
+	 * The relation extension lock conflict even between the group members.
 	 */
-	if (LOCK_LOCKTAG(*lock) == LOCKTAG_RELATION_EXTEND ||
-		(LOCK_LOCKTAG(*lock) == LOCKTAG_PAGE))
+	if (LOCK_LOCKTAG(*lock) == LOCKTAG_RELATION_EXTEND)
 	{
 		PROCLOCK_PRINT("LockCheckConflicts: conflicting (group)",
 					   proclock);
@@ -1784,6 +1841,15 @@ GrantAwaitedLock(void)
 }
 
 /*
+ * GetAwaitedLock -- Return the lock we're currently doing WaitOnLock on.
+ */
+LOCALLOCK *
+GetAwaitedLock(void)
+{
+	return awaitedLock;
+}
+
+/*
  * MarkLockClear -- mark an acquired lock as "clear"
  *
  * This means that we know we have absorbed all sinval messages that other
@@ -1800,23 +1866,27 @@ MarkLockClear(LOCALLOCK *locallock)
 /*
  * WaitOnLock -- wait to acquire a lock
  *
- * Caller must have set MyProc->heldLocks to reflect locks already held
- * on the lockable object by this process.
- *
- * The appropriate partition lock must be held at entry.
+ * This is a wrapper around ProcSleep, with extra tracing and bookkeeping.
  */
-static void
+static ProcWaitStatus
 WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner)
 {
-	LOCKMETHODID lockmethodid = LOCALLOCK_LOCKMETHOD(*locallock);
-	LockMethod	lockMethodTable = LockMethods[lockmethodid];
+	ProcWaitStatus result;
 
-	LOCK_PRINT("WaitOnLock: sleeping on lock",
-			   locallock->lock, locallock->tag.mode);
+	TRACE_POSTGRESQL_LOCK_WAIT_START(locallock->tag.lock.locktag_field1,
+									 locallock->tag.lock.locktag_field2,
+									 locallock->tag.lock.locktag_field3,
+									 locallock->tag.lock.locktag_field4,
+									 locallock->tag.lock.locktag_type,
+									 locallock->tag.mode);
 
 	/* adjust the process title to indicate that it's waiting */
 	set_ps_display_suffix("waiting");
 
+	/*
+	 * Record the fact that we are waiting for a lock, so that
+	 * LockErrorCleanup will clean up if cancel/die happens.
+	 */
 	awaitedLock = locallock;
 	awaitedOwner = owner;
 
@@ -1839,24 +1909,7 @@ WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner)
 	 */
 	PG_TRY();
 	{
-		if (ProcSleep(locallock, lockMethodTable) != PROC_WAIT_STATUS_OK)
-		{
-			/*
-			 * We failed as a result of a deadlock, see CheckDeadLock(). Quit
-			 * now.
-			 */
-			awaitedLock = NULL;
-			LOCK_PRINT("WaitOnLock: aborting on lock",
-					   locallock->lock, locallock->tag.mode);
-			LWLockRelease(LockHashPartitionLock(locallock->hashcode));
-
-			/*
-			 * Now that we aren't holding the partition lock, we can give an
-			 * error report including details about the detected deadlock.
-			 */
-			DeadLockReport();
-			/* not reached */
-		}
+		result = ProcSleep(locallock);
 	}
 	PG_CATCH();
 	{
@@ -1870,13 +1923,22 @@ WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner)
 	}
 	PG_END_TRY();
 
+	/*
+	 * We no longer want LockErrorCleanup to do anything.
+	 */
 	awaitedLock = NULL;
 
 	/* reset ps display to remove the suffix */
 	set_ps_display_remove_suffix();
 
-	LOCK_PRINT("WaitOnLock: wakeup on lock",
-			   locallock->lock, locallock->tag.mode);
+	TRACE_POSTGRESQL_LOCK_WAIT_DONE(locallock->tag.lock.locktag_field1,
+									locallock->tag.lock.locktag_field2,
+									locallock->tag.lock.locktag_field3,
+									locallock->tag.lock.locktag_field4,
+									locallock->tag.lock.locktag_type,
+									locallock->tag.mode);
+
+	return result;
 }
 
 /*
@@ -1905,7 +1967,7 @@ RemoveFromWaitQueue(PGPROC *proc, uint32 hashcode)
 	Assert(0 < lockmethodid && lockmethodid < lengthof(LockMethods));
 
 	/* Remove proc from lock's wait queue */
-	dclist_delete_from(&waitLock->waitProcs, &proc->links);
+	dclist_delete_from_thoroughly(&waitLock->waitProcs, &proc->links);
 
 	/* Undo increments of request counts by waiting process */
 	Assert(waitLock->nRequested > 0);
@@ -2051,7 +2113,7 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 
 	/* Attempt fast release of any lock eligible for the fast path. */
 	if (EligibleForRelationFastPath(locktag, lockmode) &&
-		FastPathLocalUseCount > 0)
+		FastPathLocalUseCounts[FAST_PATH_REL_GROUP(locktag->locktag_field2)] > 0)
 	{
 		bool		released;
 
@@ -2195,9 +2257,8 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 	while ((locallock = (LOCALLOCK *) hash_seq_search(&status)) != NULL)
 	{
 		/*
-		 * If the LOCALLOCK entry is unused, we must've run out of shared
-		 * memory while trying to set up this lock.  Just forget the local
-		 * entry.
+		 * If the LOCALLOCK entry is unused, something must've gone wrong
+		 * while trying to acquire this lock.  Just forget the local entry.
 		 */
 		if (locallock->nLocks == 0)
 		{
@@ -2240,6 +2301,16 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 			else
 				locallock->numLockOwners = 0;
 		}
+
+#ifdef USE_ASSERT_CHECKING
+
+		/*
+		 * Tuple locks are currently held only for short durations within a
+		 * transaction. Check that we didn't forget to release one.
+		 */
+		if (LOCALLOCK_LOCKTAG(*locallock) == LOCKTAG_TUPLE && !allLocks)
+			elog(WARNING, "tuple lock held at commit");
+#endif
 
 		/*
 		 * If the lock or proclock pointers are NULL, this lock was taken via
@@ -2619,12 +2690,18 @@ LockReassignOwner(LOCALLOCK *locallock, ResourceOwner parent)
 static bool
 FastPathGrantRelationLock(Oid relid, LOCKMODE lockmode)
 {
-	uint32		f;
+	uint32		i;
 	uint32		unused_slot = FP_LOCK_SLOTS_PER_BACKEND;
 
+	/* fast-path group the lock belongs to */
+	uint32		group = FAST_PATH_REL_GROUP(relid);
+
 	/* Scan for existing entry for this relid, remembering empty slot. */
-	for (f = 0; f < FP_LOCK_SLOTS_PER_BACKEND; f++)
+	for (i = 0; i < FP_LOCK_SLOTS_PER_GROUP; i++)
 	{
+		/* index into the whole per-backend array */
+		uint32		f = FAST_PATH_SLOT(group, i);
+
 		if (FAST_PATH_GET_BITS(MyProc, f) == 0)
 			unused_slot = f;
 		else if (MyProc->fpRelId[f] == relid)
@@ -2640,7 +2717,7 @@ FastPathGrantRelationLock(Oid relid, LOCKMODE lockmode)
 	{
 		MyProc->fpRelId[unused_slot] = relid;
 		FAST_PATH_SET_LOCKMODE(MyProc, unused_slot, lockmode);
-		++FastPathLocalUseCount;
+		++FastPathLocalUseCounts[group];
 		return true;
 	}
 
@@ -2656,12 +2733,18 @@ FastPathGrantRelationLock(Oid relid, LOCKMODE lockmode)
 static bool
 FastPathUnGrantRelationLock(Oid relid, LOCKMODE lockmode)
 {
-	uint32		f;
+	uint32		i;
 	bool		result = false;
 
-	FastPathLocalUseCount = 0;
-	for (f = 0; f < FP_LOCK_SLOTS_PER_BACKEND; f++)
+	/* fast-path group the lock belongs to */
+	uint32		group = FAST_PATH_REL_GROUP(relid);
+
+	FastPathLocalUseCounts[group] = 0;
+	for (i = 0; i < FP_LOCK_SLOTS_PER_GROUP; i++)
 	{
+		/* index into the whole per-backend array */
+		uint32		f = FAST_PATH_SLOT(group, i);
+
 		if (MyProc->fpRelId[f] == relid
 			&& FAST_PATH_CHECK_LOCKMODE(MyProc, f, lockmode))
 		{
@@ -2671,7 +2754,7 @@ FastPathUnGrantRelationLock(Oid relid, LOCKMODE lockmode)
 			/* we continue iterating so as to update FastPathLocalUseCount */
 		}
 		if (FAST_PATH_GET_BITS(MyProc, f) != 0)
-			++FastPathLocalUseCount;
+			++FastPathLocalUseCounts[group];
 	}
 	return result;
 }
@@ -2700,7 +2783,8 @@ FastPathTransferRelationLocks(LockMethod lockMethodTable, const LOCKTAG *locktag
 	for (i = 0; i < ProcGlobal->allProcCount; i++)
 	{
 		PGPROC	   *proc = &ProcGlobal->allProcs[i];
-		uint32		f;
+		uint32		j,
+					group;
 
 		LWLockAcquire(&proc->fpInfoLock, LW_EXCLUSIVE);
 
@@ -2725,9 +2809,15 @@ FastPathTransferRelationLocks(LockMethod lockMethodTable, const LOCKTAG *locktag
 			continue;
 		}
 
-		for (f = 0; f < FP_LOCK_SLOTS_PER_BACKEND; f++)
+		/* fast-path group the lock belongs to */
+		group = FAST_PATH_REL_GROUP(relid);
+
+		for (j = 0; j < FP_LOCK_SLOTS_PER_GROUP; j++)
 		{
 			uint32		lockmode;
+
+			/* index into the whole per-backend array */
+			uint32		f = FAST_PATH_SLOT(group, j);
 
 			/* Look for an allocated slot matching the given relid. */
 			if (relid != proc->fpRelId[f] || FAST_PATH_GET_BITS(proc, f) == 0)
@@ -2779,13 +2869,20 @@ FastPathGetRelationLockEntry(LOCALLOCK *locallock)
 	PROCLOCK   *proclock = NULL;
 	LWLock	   *partitionLock = LockHashPartitionLock(locallock->hashcode);
 	Oid			relid = locktag->locktag_field2;
-	uint32		f;
+	uint32		i,
+				group;
+
+	/* fast-path group the lock belongs to */
+	group = FAST_PATH_REL_GROUP(relid);
 
 	LWLockAcquire(&MyProc->fpInfoLock, LW_EXCLUSIVE);
 
-	for (f = 0; f < FP_LOCK_SLOTS_PER_BACKEND; f++)
+	for (i = 0; i < FP_LOCK_SLOTS_PER_GROUP; i++)
 	{
 		uint32		lockmode;
+
+		/* index into the whole per-backend array */
+		uint32		f = FAST_PATH_SLOT(group, i);
 
 		/* Look for an allocated slot matching the given relid. */
 		if (relid != MyProc->fpRelId[f] || FAST_PATH_GET_BITS(MyProc, f) == 0)
@@ -2808,7 +2905,7 @@ FastPathGetRelationLockEntry(LOCALLOCK *locallock)
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("out of shared memory"),
-					 errhint("You might need to increase max_locks_per_transaction.")));
+					 errhint("You might need to increase \"%s\".", "max_locks_per_transaction")));
 		}
 		GrantLock(proclock->tag.myLock, proclock, lockmode);
 		FAST_PATH_CLEAR_LOCKMODE(MyProc, f, lockmode);
@@ -2943,7 +3040,8 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 		for (i = 0; i < ProcGlobal->allProcCount; i++)
 		{
 			PGPROC	   *proc = &ProcGlobal->allProcs[i];
-			uint32		f;
+			uint32		j,
+						group;
 
 			/* A backend never blocks itself */
 			if (proc == MyProc)
@@ -2965,9 +3063,15 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 				continue;
 			}
 
-			for (f = 0; f < FP_LOCK_SLOTS_PER_BACKEND; f++)
+			/* fast-path group the lock belongs to */
+			group = FAST_PATH_REL_GROUP(relid);
+
+			for (j = 0; j < FP_LOCK_SLOTS_PER_GROUP; j++)
 			{
 				uint32		lockmask;
+
+				/* index into the whole per-backend array */
+				uint32		f = FAST_PATH_SLOT(group, j);
 
 				/* Look for an allocated slot matching the given relid. */
 				if (relid != proc->fpRelId[f])
@@ -3019,7 +3123,7 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 		 * on this lockable object.
 		 */
 		LWLockRelease(partitionLock);
-		vxids[count].backendId = InvalidBackendId;
+		vxids[count].procNumber = INVALID_PROC_NUMBER;
 		vxids[count].localTransactionId = InvalidLocalTransactionId;
 		if (countp)
 			*countp = count;
@@ -3065,7 +3169,7 @@ GetLockConflicts(const LOCKTAG *locktag, LOCKMODE lockmode, int *countp)
 	if (count > MaxBackends + max_prepared_xacts)	/* should never happen */
 		elog(PANIC, "too many conflicting locks found");
 
-	vxids[count].backendId = InvalidBackendId;
+	vxids[count].procNumber = INVALID_PROC_NUMBER;
 	vxids[count].localTransactionId = InvalidLocalTransactionId;
 	if (countp)
 		*countp = count;
@@ -3556,7 +3660,7 @@ PostPrepare_Locks(TransactionId xid)
  * Estimate shared-memory space used for lock tables
  */
 Size
-LockShmemSize(void)
+LockManagerShmemSize(void)
 {
 	Size		size = 0;
 	long		max_table_size;
@@ -3624,44 +3728,55 @@ GetLockStatusData(void)
 	for (i = 0; i < ProcGlobal->allProcCount; ++i)
 	{
 		PGPROC	   *proc = &ProcGlobal->allProcs[i];
-		uint32		f;
+
+		/* Skip backends with pid=0, as they don't hold fast-path locks */
+		if (proc->pid == 0)
+			continue;
 
 		LWLockAcquire(&proc->fpInfoLock, LW_SHARED);
 
-		for (f = 0; f < FP_LOCK_SLOTS_PER_BACKEND; ++f)
+		for (uint32 g = 0; g < FastPathLockGroupsPerBackend; g++)
 		{
-			LockInstanceData *instance;
-			uint32		lockbits = FAST_PATH_GET_BITS(proc, f);
-
-			/* Skip unallocated slots. */
-			if (!lockbits)
+			/* Skip groups without registered fast-path locks */
+			if (proc->fpLockBits[g] == 0)
 				continue;
 
-			if (el >= els)
+			for (int j = 0; j < FP_LOCK_SLOTS_PER_GROUP; j++)
 			{
-				els += MaxBackends;
-				data->locks = (LockInstanceData *)
-					repalloc(data->locks, sizeof(LockInstanceData) * els);
+				LockInstanceData *instance;
+				uint32		f = FAST_PATH_SLOT(g, j);
+				uint32		lockbits = FAST_PATH_GET_BITS(proc, f);
+
+				/* Skip unallocated slots */
+				if (!lockbits)
+					continue;
+
+				if (el >= els)
+				{
+					els += MaxBackends;
+					data->locks = (LockInstanceData *)
+						repalloc(data->locks, sizeof(LockInstanceData) * els);
+				}
+
+				instance = &data->locks[el];
+				SET_LOCKTAG_RELATION(instance->locktag, proc->databaseId,
+									 proc->fpRelId[f]);
+				instance->holdMask = lockbits << FAST_PATH_LOCKNUMBER_OFFSET;
+				instance->waitLockMode = NoLock;
+				instance->vxid.procNumber = proc->vxid.procNumber;
+				instance->vxid.localTransactionId = proc->vxid.lxid;
+				instance->pid = proc->pid;
+				instance->leaderPid = proc->pid;
+				instance->fastpath = true;
+
+				/*
+				 * Successfully taking fast path lock means there were no
+				 * conflicting locks.
+				 */
+				instance->waitStart = 0;
+
+				el++;
 			}
-
-			instance = &data->locks[el];
-			SET_LOCKTAG_RELATION(instance->locktag, proc->databaseId,
-								 proc->fpRelId[f]);
-			instance->holdMask = lockbits << FAST_PATH_LOCKNUMBER_OFFSET;
-			instance->waitLockMode = NoLock;
-			instance->backend = proc->backendId;
-			instance->lxid = proc->lxid;
-			instance->pid = proc->pid;
-			instance->leaderPid = proc->pid;
-			instance->fastpath = true;
-
-			/*
-			 * Successfully taking fast path lock means there were no
-			 * conflicting locks.
-			 */
-			instance->waitStart = 0;
-
-			el++;
 		}
 
 		if (proc->fpVXIDLock)
@@ -3676,15 +3791,15 @@ GetLockStatusData(void)
 					repalloc(data->locks, sizeof(LockInstanceData) * els);
 			}
 
-			vxid.backendId = proc->backendId;
+			vxid.procNumber = proc->vxid.procNumber;
 			vxid.localTransactionId = proc->fpLocalTransactionId;
 
 			instance = &data->locks[el];
 			SET_LOCKTAG_VIRTUALTRANSACTION(instance->locktag, vxid);
 			instance->holdMask = LOCKBIT_ON(ExclusiveLock);
 			instance->waitLockMode = NoLock;
-			instance->backend = proc->backendId;
-			instance->lxid = proc->lxid;
+			instance->vxid.procNumber = proc->vxid.procNumber;
+			instance->vxid.localTransactionId = proc->vxid.lxid;
 			instance->pid = proc->pid;
 			instance->leaderPid = proc->pid;
 			instance->fastpath = true;
@@ -3736,8 +3851,8 @@ GetLockStatusData(void)
 			instance->waitLockMode = proc->waitLockMode;
 		else
 			instance->waitLockMode = NoLock;
-		instance->backend = proc->backendId;
-		instance->lxid = proc->lxid;
+		instance->vxid.procNumber = proc->vxid.procNumber;
+		instance->vxid.localTransactionId = proc->vxid.lxid;
 		instance->pid = proc->pid;
 		instance->leaderPid = proclock->groupLeader->pid;
 		instance->fastpath = false;
@@ -3912,8 +4027,8 @@ GetSingleProcBlockerStatusData(PGPROC *blocked_proc, BlockedProcsData *data)
 			instance->waitLockMode = proc->waitLockMode;
 		else
 			instance->waitLockMode = NoLock;
-		instance->backend = proc->backendId;
-		instance->lxid = proc->lxid;
+		instance->vxid.procNumber = proc->vxid.procNumber;
+		instance->vxid.localTransactionId = proc->vxid.lxid;
 		instance->pid = proc->pid;
 		instance->leaderPid = proclock->groupLeader->pid;
 		instance->fastpath = false;
@@ -3936,6 +4051,7 @@ GetSingleProcBlockerStatusData(PGPROC *blocked_proc, BlockedProcsData *data)
 	dclist_foreach(proc_iter, waitQueue)
 	{
 		PGPROC	   *queued_proc = dlist_container(PGPROC, links, proc_iter.cur);
+
 		if (queued_proc == blocked_proc)
 			break;
 		data->waiter_pids[data->npids++] = queued_proc->pid;
@@ -4192,7 +4308,7 @@ lock_twophase_recover(TransactionId xid, uint16 info,
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of shared memory"),
-				 errhint("You might need to increase max_locks_per_transaction.")));
+				 errhint("You might need to increase \"%s\".", "max_locks_per_transaction")));
 	}
 
 	/*
@@ -4257,7 +4373,7 @@ lock_twophase_recover(TransactionId xid, uint16 info,
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of shared memory"),
-				 errhint("You might need to increase max_locks_per_transaction.")));
+				 errhint("You might need to increase \"%s\".", "max_locks_per_transaction")));
 	}
 
 	/*
@@ -4397,8 +4513,8 @@ lock_twophase_postabort(TransactionId xid, uint16 info,
  *		lockers, as we haven't advertised this vxid via the ProcArray yet.
  *
  *		Since MyProc->fpLocalTransactionId will normally contain the same data
- *		as MyProc->lxid, you might wonder if we really need both.  The
- *		difference is that MyProc->lxid is set and cleared unlocked, and
+ *		as MyProc->vxid.lxid, you might wonder if we really need both.  The
+ *		difference is that MyProc->vxid.lxid is set and cleared unlocked, and
  *		examined by procarray.c, while fpLocalTransactionId is protected by
  *		fpInfoLock and is used only by the locking subsystem.  Doing it this
  *		way makes it easier to verify that there are no funny race conditions.
@@ -4414,7 +4530,7 @@ VirtualXactLockTableInsert(VirtualTransactionId vxid)
 
 	LWLockAcquire(&MyProc->fpInfoLock, LW_EXCLUSIVE);
 
-	Assert(MyProc->backendId == vxid.backendId);
+	Assert(MyProc->vxid.procNumber == vxid.procNumber);
 	Assert(MyProc->fpLocalTransactionId == InvalidLocalTransactionId);
 	Assert(MyProc->fpVXIDLock == false);
 
@@ -4436,7 +4552,7 @@ VirtualXactLockTableCleanup(void)
 	bool		fastpath;
 	LocalTransactionId lxid;
 
-	Assert(MyProc->backendId != InvalidBackendId);
+	Assert(MyProc->vxid.procNumber != INVALID_PROC_NUMBER);
 
 	/*
 	 * Clean up shared memory state.
@@ -4459,7 +4575,7 @@ VirtualXactLockTableCleanup(void)
 		VirtualTransactionId vxid;
 		LOCKTAG		locktag;
 
-		vxid.backendId = MyBackendId;
+		vxid.procNumber = MyProcNumber;
 		vxid.localTransactionId = lxid;
 		SET_LOCKTAG_VIRTUALTRANSACTION(locktag, vxid);
 
@@ -4553,18 +4669,18 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 	 * relevant lxid is no longer running here, that's enough to prove that
 	 * it's no longer running anywhere.
 	 */
-	proc = BackendIdGetProc(vxid.backendId);
+	proc = ProcNumberGetProc(vxid.procNumber);
 	if (proc == NULL)
 		return XactLockForVirtualXact(vxid, InvalidTransactionId, wait);
 
 	/*
-	 * We must acquire this lock before checking the backendId and lxid
+	 * We must acquire this lock before checking the procNumber and lxid
 	 * against the ones we're waiting for.  The target backend will only set
 	 * or clear lxid while holding this lock.
 	 */
 	LWLockAcquire(&proc->fpInfoLock, LW_EXCLUSIVE);
 
-	if (proc->backendId != vxid.backendId
+	if (proc->vxid.procNumber != vxid.procNumber
 		|| proc->fpLocalTransactionId != vxid.localTransactionId)
 	{
 		/* VXID ended */
@@ -4607,7 +4723,7 @@ VirtualXactLock(VirtualTransactionId vxid, bool wait)
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("out of shared memory"),
-					 errhint("You might need to increase max_locks_per_transaction.")));
+					 errhint("You might need to increase \"%s\".", "max_locks_per_transaction")));
 		}
 		GrantLock(proclock->tag.myLock, proclock, ExclusiveLock);
 

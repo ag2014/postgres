@@ -62,7 +62,7 @@ void		sql_exec_dumpalltbspc(PGconn *conn, struct options *opts);
 void
 get_opts(int argc, char **argv, struct options *my_opts)
 {
-	static struct option long_options[] = {
+	static const struct option long_options[] = {
 		{"dbname", required_argument, NULL, 'd'},
 		{"host", required_argument, NULL, 'h'},
 		{"host", required_argument, NULL, 'H'}, /* deprecated */
@@ -217,7 +217,7 @@ help(const char *progname)
 		   "\nConnection options:\n"
 		   "  -d, --dbname=DBNAME        database to connect to\n"
 		   "  -h, --host=HOSTNAME        database server host or socket directory\n"
-		   "  -H                         same as -h, deprecated option\n"
+		   "  -H                         (same as -h, deprecated)\n"
 		   "  -p, --port=PORT            database server port number\n"
 		   "  -U, --username=USERNAME    connect as specified database user\n"
 		   "\nThe default action is to show all database OIDs.\n\n"
@@ -353,7 +353,7 @@ sql_conn(struct options *my_opts)
 	res = PQexec(conn, ALWAYS_SECURE_SEARCH_PATH_SQL);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
-		pg_log_error("could not clear search_path: %s",
+		pg_log_error("could not clear \"search_path\": %s",
 					 PQerrorMessage(conn));
 		PQclear(res);
 		PQfinish(conn);

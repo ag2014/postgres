@@ -3,7 +3,7 @@
  * array_userfuncs.c
  *	  Misc user-visible array support functions
  *
- * Copyright (c) 2003-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/adt/array_userfuncs.c
@@ -13,12 +13,13 @@
 #include "postgres.h"
 
 #include "catalog/pg_type.h"
-#include "libpq/pqformat.h"
 #include "common/int.h"
+#include "common/pg_prng.h"
+#include "libpq/pqformat.h"
 #include "port/pg_bitutils.h"
 #include "utils/array.h"
-#include "utils/datum.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
@@ -722,12 +723,11 @@ array_agg_deserialize(PG_FUNCTION_ARGS)
 	sstate = PG_GETARG_BYTEA_PP(0);
 
 	/*
-	 * Copy the bytea into a StringInfo so that we can "receive" it using the
-	 * standard recv-function infrastructure.
+	 * Initialize a StringInfo so that we can "receive" it using the standard
+	 * recv-function infrastructure.
 	 */
-	initStringInfo(&buf);
-	appendBinaryStringInfo(&buf,
-						   VARDATA_ANY(sstate), VARSIZE_ANY_EXHDR(sstate));
+	initReadOnlyStringInfo(&buf, VARDATA_ANY(sstate),
+						   VARSIZE_ANY_EXHDR(sstate));
 
 	/* element_type */
 	element_type = pq_getmsgint(&buf, 4);
@@ -783,7 +783,6 @@ array_agg_deserialize(PG_FUNCTION_ARGS)
 		{
 			int			itemlen;
 			StringInfoData elem_buf;
-			char		csave;
 
 			if (result->dnulls[i])
 			{
@@ -798,33 +797,23 @@ array_agg_deserialize(PG_FUNCTION_ARGS)
 						 errmsg("insufficient data left in message")));
 
 			/*
-			 * Rather than copying data around, we just set up a phony
-			 * StringInfo pointing to the correct portion of the input buffer.
-			 * We assume we can scribble on the input buffer so as to maintain
-			 * the convention that StringInfos have a trailing null.
+			 * Rather than copying data around, we just initialize a
+			 * StringInfo pointing to the correct portion of the message
+			 * buffer.
 			 */
-			elem_buf.data = &buf.data[buf.cursor];
-			elem_buf.maxlen = itemlen + 1;
-			elem_buf.len = itemlen;
-			elem_buf.cursor = 0;
+			initReadOnlyStringInfo(&elem_buf, &buf.data[buf.cursor], itemlen);
 
 			buf.cursor += itemlen;
-
-			csave = buf.data[buf.cursor];
-			buf.data[buf.cursor] = '\0';
 
 			/* Now call the element's receiveproc */
 			result->dvalues[i] = ReceiveFunctionCall(&iodata->typreceive,
 													 &elem_buf,
 													 iodata->typioparam,
 													 -1);
-
-			buf.data[buf.cursor] = csave;
 		}
 	}
 
 	pq_getmsgend(&buf);
-	pfree(buf.data);
 
 	PG_RETURN_POINTER(result);
 }
@@ -1042,7 +1031,7 @@ array_agg_array_combine(PG_FUNCTION_ARGS)
 		state1->nitems += state2->nitems;
 
 		state1->dims[0] += state2->dims[0];
-		/* remaing dims already match, per test above */
+		/* remaining dims already match, per test above */
 
 		Assert(state1->array_type == state2->array_type);
 		Assert(state1->element_type == state2->element_type);
@@ -1133,12 +1122,11 @@ array_agg_array_deserialize(PG_FUNCTION_ARGS)
 	sstate = PG_GETARG_BYTEA_PP(0);
 
 	/*
-	 * Copy the bytea into a StringInfo so that we can "receive" it using the
-	 * standard recv-function infrastructure.
+	 * Initialize a StringInfo so that we can "receive" it using the standard
+	 * recv-function infrastructure.
 	 */
-	initStringInfo(&buf);
-	appendBinaryStringInfo(&buf,
-						   VARDATA_ANY(sstate), VARSIZE_ANY_EXHDR(sstate));
+	initReadOnlyStringInfo(&buf, VARDATA_ANY(sstate),
+						   VARSIZE_ANY_EXHDR(sstate));
 
 	/* element_type */
 	element_type = pq_getmsgint(&buf, 4);
@@ -1196,7 +1184,6 @@ array_agg_array_deserialize(PG_FUNCTION_ARGS)
 	memcpy(result->lbs, temp, sizeof(result->lbs));
 
 	pq_getmsgend(&buf);
-	pfree(buf.data);
 
 	PG_RETURN_POINTER(result);
 }
@@ -1274,7 +1261,6 @@ array_position_common(FunctionCallInfo fcinfo)
 		PG_RETURN_NULL();
 
 	array = PG_GETARG_ARRAYTYPE_P(0);
-	element_type = ARR_ELEMTYPE(array);
 
 	/*
 	 * We refuse to search for elements in multi-dimensional arrays, since we
@@ -1284,6 +1270,10 @@ array_position_common(FunctionCallInfo fcinfo)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("searching for elements in multidimensional arrays is not supported")));
+
+	/* Searching in an empty array is well-defined, though: it always fails */
+	if (ARR_NDIM(array) < 1)
+		PG_RETURN_NULL();
 
 	if (PG_ARGISNULL(1))
 	{
@@ -1299,6 +1289,7 @@ array_position_common(FunctionCallInfo fcinfo)
 		null_search = false;
 	}
 
+	element_type = ARR_ELEMTYPE(array);
 	position = (ARR_LBOUND(array))[0] - 1;
 
 	/* figure out where to start */
@@ -1424,9 +1415,6 @@ array_positions(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 
 	array = PG_GETARG_ARRAYTYPE_P(0);
-	element_type = ARR_ELEMTYPE(array);
-
-	position = (ARR_LBOUND(array))[0] - 1;
 
 	/*
 	 * We refuse to search for elements in multi-dimensional arrays, since we
@@ -1438,6 +1426,10 @@ array_positions(PG_FUNCTION_ARGS)
 				 errmsg("searching for elements in multidimensional arrays is not supported")));
 
 	astate = initArrayResult(INT4OID, CurrentMemoryContext, false);
+
+	/* Searching in an empty array is well-defined, though: it always fails */
+	if (ARR_NDIM(array) < 1)
+		PG_RETURN_DATUM(makeArrayResult(astate, CurrentMemoryContext));
 
 	if (PG_ARGISNULL(1))
 	{
@@ -1452,6 +1444,9 @@ array_positions(PG_FUNCTION_ARGS)
 		searched_element = PG_GETARG_DATUM(1);
 		null_search = false;
 	}
+
+	element_type = ARR_ELEMTYPE(array);
+	position = (ARR_LBOUND(array))[0] - 1;
 
 	/*
 	 * We arrange to look up type info for array_create_iterator only once per
@@ -1524,4 +1519,281 @@ array_positions(PG_FUNCTION_ARGS)
 	PG_FREE_IF_COPY(array, 0);
 
 	PG_RETURN_DATUM(makeArrayResult(astate, CurrentMemoryContext));
+}
+
+/*
+ * array_shuffle_n
+ *		Return a copy of array with n randomly chosen items.
+ *
+ * The number of items must not exceed the size of the first dimension of the
+ * array.  We preserve the first dimension's lower bound if keep_lb,
+ * else it's set to 1.  Lower-order dimensions are preserved in any case.
+ *
+ * NOTE: it would be cleaner to look up the elmlen/elmbval/elmalign info
+ * from the system catalogs, given only the elmtyp. However, the caller is
+ * in a better position to cache this info across multiple calls.
+ */
+static ArrayType *
+array_shuffle_n(ArrayType *array, int n, bool keep_lb,
+				Oid elmtyp, TypeCacheEntry *typentry)
+{
+	ArrayType  *result;
+	int			ndim,
+			   *dims,
+			   *lbs,
+				nelm,
+				nitem,
+				rdims[MAXDIM],
+				rlbs[MAXDIM];
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elms,
+			   *ielms;
+	bool	   *nuls,
+			   *inuls;
+
+	ndim = ARR_NDIM(array);
+	dims = ARR_DIMS(array);
+	lbs = ARR_LBOUND(array);
+
+	elmlen = typentry->typlen;
+	elmbyval = typentry->typbyval;
+	elmalign = typentry->typalign;
+
+	/* If the target array is empty, exit fast */
+	if (ndim < 1 || dims[0] < 1 || n < 1)
+		return construct_empty_array(elmtyp);
+
+	deconstruct_array(array, elmtyp, elmlen, elmbyval, elmalign,
+					  &elms, &nuls, &nelm);
+
+	nitem = dims[0];			/* total number of items */
+	nelm /= nitem;				/* number of elements per item */
+
+	Assert(n <= nitem);			/* else it's caller error */
+
+	/*
+	 * Shuffle array using Fisher-Yates algorithm.  Scan the array and swap
+	 * current item (nelm datums starting at ielms) with a randomly chosen
+	 * later item (nelm datums starting at jelms) in each iteration.  We can
+	 * stop once we've done n iterations; then first n items are the result.
+	 */
+	ielms = elms;
+	inuls = nuls;
+	for (int i = 0; i < n; i++)
+	{
+		int			j = (int) pg_prng_uint64_range(&pg_global_prng_state, i, nitem - 1) * nelm;
+		Datum	   *jelms = elms + j;
+		bool	   *jnuls = nuls + j;
+
+		/* Swap i'th and j'th items; advance ielms/inuls to next item */
+		for (int k = 0; k < nelm; k++)
+		{
+			Datum		elm = *ielms;
+			bool		nul = *inuls;
+
+			*ielms++ = *jelms;
+			*inuls++ = *jnuls;
+			*jelms++ = elm;
+			*jnuls++ = nul;
+		}
+	}
+
+	/* Set up dimensions of the result */
+	memcpy(rdims, dims, ndim * sizeof(int));
+	memcpy(rlbs, lbs, ndim * sizeof(int));
+	rdims[0] = n;
+	if (!keep_lb)
+		rlbs[0] = 1;
+
+	result = construct_md_array(elms, nuls, ndim, rdims, rlbs,
+								elmtyp, elmlen, elmbyval, elmalign);
+
+	pfree(elms);
+	pfree(nuls);
+
+	return result;
+}
+
+/*
+ * array_shuffle
+ *
+ * Returns an array with the same dimensions as the input array, with its
+ * first-dimension elements in random order.
+ */
+Datum
+array_shuffle(PG_FUNCTION_ARGS)
+{
+	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(0);
+	ArrayType  *result;
+	Oid			elmtyp;
+	TypeCacheEntry *typentry;
+
+	/*
+	 * There is no point in shuffling empty arrays or arrays with less than
+	 * two items.
+	 */
+	if (ARR_NDIM(array) < 1 || ARR_DIMS(array)[0] < 2)
+		PG_RETURN_ARRAYTYPE_P(array);
+
+	elmtyp = ARR_ELEMTYPE(array);
+	typentry = (TypeCacheEntry *) fcinfo->flinfo->fn_extra;
+	if (typentry == NULL || typentry->type_id != elmtyp)
+	{
+		typentry = lookup_type_cache(elmtyp, 0);
+		fcinfo->flinfo->fn_extra = (void *) typentry;
+	}
+
+	result = array_shuffle_n(array, ARR_DIMS(array)[0], true, elmtyp, typentry);
+
+	PG_RETURN_ARRAYTYPE_P(result);
+}
+
+/*
+ * array_sample
+ *
+ * Returns an array of n randomly chosen first-dimension elements
+ * from the input array.
+ */
+Datum
+array_sample(PG_FUNCTION_ARGS)
+{
+	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(0);
+	int			n = PG_GETARG_INT32(1);
+	ArrayType  *result;
+	Oid			elmtyp;
+	TypeCacheEntry *typentry;
+	int			nitem;
+
+	nitem = (ARR_NDIM(array) < 1) ? 0 : ARR_DIMS(array)[0];
+
+	if (n < 0 || n > nitem)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("sample size must be between 0 and %d", nitem)));
+
+	elmtyp = ARR_ELEMTYPE(array);
+	typentry = (TypeCacheEntry *) fcinfo->flinfo->fn_extra;
+	if (typentry == NULL || typentry->type_id != elmtyp)
+	{
+		typentry = lookup_type_cache(elmtyp, 0);
+		fcinfo->flinfo->fn_extra = (void *) typentry;
+	}
+
+	result = array_shuffle_n(array, n, false, elmtyp, typentry);
+
+	PG_RETURN_ARRAYTYPE_P(result);
+}
+
+
+/*
+ * array_reverse_n
+ *		Return a copy of array with reversed items.
+ *
+ * NOTE: it would be cleaner to look up the elmlen/elmbval/elmalign info
+ * from the system catalogs, given only the elmtyp. However, the caller is
+ * in a better position to cache this info across multiple calls.
+ */
+static ArrayType *
+array_reverse_n(ArrayType *array, Oid elmtyp, TypeCacheEntry *typentry)
+{
+	ArrayType  *result;
+	int			ndim,
+			   *dims,
+			   *lbs,
+				nelm,
+				nitem,
+				rdims[MAXDIM],
+				rlbs[MAXDIM];
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elms,
+			   *ielms;
+	bool	   *nuls,
+			   *inuls;
+
+	ndim = ARR_NDIM(array);
+	dims = ARR_DIMS(array);
+	lbs = ARR_LBOUND(array);
+
+	elmlen = typentry->typlen;
+	elmbyval = typentry->typbyval;
+	elmalign = typentry->typalign;
+
+	deconstruct_array(array, elmtyp, elmlen, elmbyval, elmalign,
+					  &elms, &nuls, &nelm);
+
+	nitem = dims[0];			/* total number of items */
+	nelm /= nitem;				/* number of elements per item */
+
+	/* Reverse the array */
+	ielms = elms;
+	inuls = nuls;
+	for (int i = 0; i < nitem / 2; i++)
+	{
+		int			j = (nitem - i - 1) * nelm;
+		Datum	   *jelms = elms + j;
+		bool	   *jnuls = nuls + j;
+
+		/* Swap i'th and j'th items; advance ielms/inuls to next item */
+		for (int k = 0; k < nelm; k++)
+		{
+			Datum		elm = *ielms;
+			bool		nul = *inuls;
+
+			*ielms++ = *jelms;
+			*inuls++ = *jnuls;
+			*jelms++ = elm;
+			*jnuls++ = nul;
+		}
+	}
+
+	/* Set up dimensions of the result */
+	memcpy(rdims, dims, ndim * sizeof(int));
+	memcpy(rlbs, lbs, ndim * sizeof(int));
+	rdims[0] = nitem;
+
+	result = construct_md_array(elms, nuls, ndim, rdims, rlbs,
+								elmtyp, elmlen, elmbyval, elmalign);
+
+	pfree(elms);
+	pfree(nuls);
+
+	return result;
+}
+
+/*
+ * array_reverse
+ *
+ * Returns an array with the same dimensions as the input array, with its
+ * first-dimension elements in reverse order.
+ */
+Datum
+array_reverse(PG_FUNCTION_ARGS)
+{
+	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(0);
+	ArrayType  *result;
+	Oid			elmtyp;
+	TypeCacheEntry *typentry;
+
+	/*
+	 * There is no point in reversing empty arrays or arrays with less than
+	 * two items.
+	 */
+	if (ARR_NDIM(array) < 1 || ARR_DIMS(array)[0] < 2)
+		PG_RETURN_ARRAYTYPE_P(array);
+
+	elmtyp = ARR_ELEMTYPE(array);
+	typentry = (TypeCacheEntry *) fcinfo->flinfo->fn_extra;
+	if (typentry == NULL || typentry->type_id != elmtyp)
+	{
+		typentry = lookup_type_cache(elmtyp, 0);
+		fcinfo->flinfo->fn_extra = (void *) typentry;
+	}
+
+	result = array_reverse_n(array, elmtyp, typentry);
+
+	PG_RETURN_ARRAYTYPE_P(result);
 }

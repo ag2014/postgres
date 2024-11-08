@@ -3,7 +3,7 @@
  * dfmgr.c
  *	  Dynamic function manager code.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -33,6 +33,7 @@
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
 #include "storage/shmem.h"
 #include "utils/hsearch.h"
 
@@ -78,7 +79,6 @@ char	   *Dynamic_library_path;
 static void *internal_load_library(const char *libname);
 static void incompatible_module_error(const char *libname,
 									  const Pg_magic_struct *module_magic_data) pg_attribute_noreturn();
-static bool file_exists(const char *name);
 static char *expand_dynamic_library_name(const char *name);
 static void check_restricted_library_name(const char *name);
 static char *substitute_libpath_macro(const char *name);
@@ -358,8 +358,9 @@ incompatible_module_error(const char *libname,
 		if (details.len)
 			appendStringInfoChar(&details, '\n');
 		appendStringInfo(&details,
-						 _("Server has FUNC_MAX_ARGS = %d, library has %d."),
-						 magic_data.funcmaxargs,
+		/* translator: %s is a variable name and %d its values */
+						 _("Server has %s = %d, library has %d."),
+						 "FUNC_MAX_ARGS", magic_data.funcmaxargs,
 						 module_magic_data->funcmaxargs);
 	}
 	if (module_magic_data->indexmaxkeys != magic_data.indexmaxkeys)
@@ -367,8 +368,9 @@ incompatible_module_error(const char *libname,
 		if (details.len)
 			appendStringInfoChar(&details, '\n');
 		appendStringInfo(&details,
-						 _("Server has INDEX_MAX_KEYS = %d, library has %d."),
-						 magic_data.indexmaxkeys,
+		/* translator: %s is a variable name and %d its values */
+						 _("Server has %s = %d, library has %d."),
+						 "INDEX_MAX_KEYS", magic_data.indexmaxkeys,
 						 module_magic_data->indexmaxkeys);
 	}
 	if (module_magic_data->namedatalen != magic_data.namedatalen)
@@ -376,8 +378,9 @@ incompatible_module_error(const char *libname,
 		if (details.len)
 			appendStringInfoChar(&details, '\n');
 		appendStringInfo(&details,
-						 _("Server has NAMEDATALEN = %d, library has %d."),
-						 magic_data.namedatalen,
+		/* translator: %s is a variable name and %d its values */
+						 _("Server has %s = %d, library has %d."),
+						 "NAMEDATALEN", magic_data.namedatalen,
 						 module_magic_data->namedatalen);
 	}
 	if (module_magic_data->float8byval != magic_data.float8byval)
@@ -385,8 +388,9 @@ incompatible_module_error(const char *libname,
 		if (details.len)
 			appendStringInfoChar(&details, '\n');
 		appendStringInfo(&details,
-						 _("Server has FLOAT8PASSBYVAL = %s, library has %s."),
-						 magic_data.float8byval ? "true" : "false",
+		/* translator: %s is a variable name and %d its values */
+						 _("Server has %s = %s, library has %s."),
+						 "FLOAT8PASSBYVAL", magic_data.float8byval ? "true" : "false",
 						 module_magic_data->float8byval ? "true" : "false");
 	}
 
@@ -398,23 +402,6 @@ incompatible_module_error(const char *libname,
 			(errmsg("incompatible library \"%s\": magic block mismatch",
 					libname),
 			 errdetail_internal("%s", details.data)));
-}
-
-static bool
-file_exists(const char *name)
-{
-	struct stat st;
-
-	Assert(name != NULL);
-
-	if (stat(name, &st) == 0)
-		return !S_ISDIR(st.st_mode);
-	else if (!(errno == ENOENT || errno == ENOTDIR || errno == EACCES))
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not access file \"%s\": %m", name)));
-
-	return false;
 }
 
 
@@ -447,7 +434,7 @@ expand_dynamic_library_name(const char *name)
 	else
 	{
 		full = substitute_libpath_macro(name);
-		if (file_exists(full))
+		if (pg_file_exists(full))
 			return full;
 		pfree(full);
 	}
@@ -465,7 +452,7 @@ expand_dynamic_library_name(const char *name)
 	{
 		full = substitute_libpath_macro(new);
 		pfree(new);
-		if (file_exists(full))
+		if (pg_file_exists(full))
 			return full;
 		pfree(full);
 	}
@@ -582,7 +569,7 @@ find_in_dynamic_libpath(const char *basename)
 
 		elog(DEBUG3, "find_in_dynamic_libpath: trying \"%s\"", full);
 
-		if (file_exists(full))
+		if (pg_file_exists(full))
 			return full;
 
 		pfree(full);

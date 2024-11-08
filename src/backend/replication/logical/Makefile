@@ -16,6 +16,7 @@ override CPPFLAGS := -I$(srcdir) $(CPPFLAGS)
 
 OBJS = \
 	applyparallelworker.o \
+	conflict.o \
 	decode.o \
 	launcher.o \
 	logical.o \
@@ -25,6 +26,7 @@ OBJS = \
 	proto.o \
 	relation.o \
 	reorderbuffer.o \
+	slotsync.o \
 	snapbuild.o \
 	tablesync.o \
 	worker.o

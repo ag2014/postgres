@@ -4,7 +4,7 @@
  *	  per-process shared memory data structures
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/proc.h
@@ -21,6 +21,7 @@
 #include "storage/lock.h"
 #include "storage/pg_sema.h"
 #include "storage/proclist_types.h"
+#include "storage/procnumber.h"
 
 /*
  * Each backend advertises up to PGPROC_MAX_CACHED_SUBXIDS TransactionIds
@@ -77,18 +78,17 @@ struct XidCache
 #define		PROC_XMIN_FLAGS (PROC_IN_VACUUM | PROC_IN_SAFE_IC)
 
 /*
- * We allow a small number of "weak" relation locks (AccessShareLock,
+ * We allow a limited number of "weak" relation locks (AccessShareLock,
  * RowShareLock, RowExclusiveLock) to be recorded in the PGPROC structure
- * rather than the main lock table.  This eases contention on the lock
- * manager LWLocks.  See storage/lmgr/README for additional details.
+ * (or rather in shared memory referenced from PGPROC) rather than the main
+ * lock table.  This eases contention on the lock manager LWLocks.  See
+ * storage/lmgr/README for additional details.
  */
-#define		FP_LOCK_SLOTS_PER_BACKEND 16
+extern PGDLLIMPORT int FastPathLockGroupsPerBackend;
 
-/*
- * An invalid pgprocno.  Must be larger than the maximum number of PGPROC
- * structures we could possibly have.  See comments for MAX_BACKENDS.
- */
-#define INVALID_PGPROCNO		PG_INT32_MAX
+#define		FP_LOCK_GROUPS_PER_BACKEND_MAX	1024
+#define		FP_LOCK_SLOTS_PER_GROUP		16	/* don't change */
+#define		FP_LOCK_SLOTS_PER_BACKEND	(FP_LOCK_SLOTS_PER_GROUP * FastPathLockGroupsPerBackend)
 
 /*
  * Flags for PGPROC.delayChkptFlags
@@ -166,7 +166,6 @@ typedef enum
  */
 struct PGPROC
 {
-	/* proc->links MUST BE FIRST IN STRUCT (see ProcSleep,ProcWakeup,etc) */
 	dlist_node	links;			/* list link if process is in a list */
 	dlist_head *procgloballist; /* procglobal list that owns this PGPROC */
 
@@ -186,21 +185,31 @@ struct PGPROC
 								 * vacuum must not remove tuples deleted by
 								 * xid >= xmin ! */
 
-	LocalTransactionId lxid;	/* local id of top-level transaction currently
-								 * being executed by this proc, if running;
-								 * else InvalidLocalTransactionId */
 	int			pid;			/* Backend's process ID; 0 if prepared xact */
 
 	int			pgxactoff;		/* offset into various ProcGlobal->arrays with
 								 * data mirrored from this PGPROC */
 
-	int			pgprocno;		/* Number of this PGPROC in
-								 * ProcGlobal->allProcs array. This is set
-								 * once by InitProcGlobal().
-								 * ProcGlobal->allProcs[n].pgprocno == n */
+	/*
+	 * Currently running top-level transaction's virtual xid. Together these
+	 * form a VirtualTransactionId, but we don't use that struct because this
+	 * is not atomically assignable as whole, and we want to enforce code to
+	 * consider both parts separately.  See comments at VirtualTransactionId.
+	 */
+	struct
+	{
+		ProcNumber	procNumber; /* For regular backends, equal to
+								 * GetNumberFromPGProc(proc).  For prepared
+								 * xacts, ID of the original backend that
+								 * processed the transaction. For unused
+								 * PGPROC entries, INVALID_PROC_NUMBER. */
+		LocalTransactionId lxid;	/* local id of top-level transaction
+									 * currently * being executed by this
+									 * proc, if running; else
+									 * InvalidLocalTransactionId */
+	}			vxid;
 
 	/* These fields are zero while a backend is still starting up: */
-	BackendId	backendId;		/* This backend's backend ID (if assigned) */
 	Oid			databaseId;		/* OID of database this backend is using */
 	Oid			roleId;			/* OID of role using this backend */
 
@@ -281,15 +290,15 @@ struct PGPROC
 	TransactionId clogGroupMemberXid;	/* transaction id of clog group member */
 	XidStatus	clogGroupMemberXidStatus;	/* transaction status of clog
 											 * group member */
-	int			clogGroupMemberPage;	/* clog page corresponding to
+	int64		clogGroupMemberPage;	/* clog page corresponding to
 										 * transaction id of clog group member */
 	XLogRecPtr	clogGroupMemberLsn; /* WAL location of commit record for clog
 									 * group member */
 
 	/* Lock manager data, recording fast-path locks taken by this backend. */
 	LWLock		fpInfoLock;		/* protects per-backend fast-path state */
-	uint64		fpLockBits;		/* lock modes held for each fast-path slot */
-	Oid			fpRelId[FP_LOCK_SLOTS_PER_BACKEND]; /* slots for rel oids */
+	uint64	   *fpLockBits;		/* lock modes held for each fast-path slot */
+	Oid		   *fpRelId;		/* slots for rel oids */
 	bool		fpVXIDLock;		/* are we holding a fast-path VXID lock? */
 	LocalTransactionId fpLocalTransactionId;	/* lxid for fast-path VXID
 												 * lock */
@@ -307,6 +316,19 @@ struct PGPROC
 
 
 extern PGDLLIMPORT PGPROC *MyProc;
+
+/* Proc number of this backend. Equal to GetNumberFromPGProc(MyProc). */
+extern PGDLLIMPORT ProcNumber MyProcNumber;
+
+/* Our parallel session leader, or INVALID_PROC_NUMBER if none */
+extern PGDLLIMPORT ProcNumber ParallelLeaderProcNumber;
+
+/*
+ * The proc number to use for our session's temp relations is normally our own,
+ * but parallel workers should use their leader's ID.
+ */
+#define ProcNumberForTempRelations() \
+	(ParallelLeaderProcNumber == INVALID_PROC_NUMBER ? MyProcNumber : ParallelLeaderProcNumber)
 
 /*
  * There is one ProcGlobal struct for the whole database cluster.
@@ -387,19 +409,23 @@ typedef struct PROC_HDR
 	/* Head of list of free PGPROC structures */
 	dlist_head	freeProcs;
 	/* Head of list of autovacuum's free PGPROC structures */
-	dlist_head autovacFreeProcs;
+	dlist_head	autovacFreeProcs;
 	/* Head of list of bgworker free PGPROC structures */
-	dlist_head bgworkerFreeProcs;
+	dlist_head	bgworkerFreeProcs;
 	/* Head of list of walsender free PGPROC structures */
-	dlist_head walsenderFreeProcs;
+	dlist_head	walsenderFreeProcs;
 	/* First pgproc waiting for group XID clear */
 	pg_atomic_uint32 procArrayGroupFirst;
 	/* First pgproc waiting for group transaction status update */
 	pg_atomic_uint32 clogGroupFirst;
-	/* WALWriter process's latch */
-	Latch	   *walwriterLatch;
-	/* Checkpointer process's latch */
-	Latch	   *checkpointerLatch;
+
+	/*
+	 * Current slot numbers of some auxiliary processes. There can be only one
+	 * of each of these running at a time.
+	 */
+	ProcNumber	walwriterProc;
+	ProcNumber	checkpointerProc;
+
 	/* Current shared estimate of appropriate spins_per_delay value */
 	int			spins_per_delay;
 	/* Buffer id of the buffer that Startup process waits for pin on, or -1 */
@@ -410,26 +436,36 @@ extern PGDLLIMPORT PROC_HDR *ProcGlobal;
 
 extern PGDLLIMPORT PGPROC *PreparedXactProcs;
 
-/* Accessor for PGPROC given a pgprocno. */
+/*
+ * Accessors for getting PGPROC given a ProcNumber and vice versa.
+ */
 #define GetPGProcByNumber(n) (&ProcGlobal->allProcs[(n)])
+#define GetNumberFromPGProc(proc) ((proc) - &ProcGlobal->allProcs[0])
 
 /*
  * We set aside some extra PGPROC structures for auxiliary processes,
  * ie things that aren't full-fledged backends but need shmem access.
  *
- * Background writer, checkpointer, WAL writer and archiver run during normal
- * operation.  Startup process and WAL receiver also consume 2 slots, but WAL
- * writer is launched only after startup has exited, so we only need 5 slots.
+ * Background writer, checkpointer, WAL writer, WAL summarizer, and archiver
+ * run during normal operation.  Startup process and WAL receiver also consume
+ * 2 slots, but WAL writer is launched only after startup has exited, so we
+ * only need 6 slots.
  */
-#define NUM_AUXILIARY_PROCS		5
+#define NUM_AUXILIARY_PROCS		6
 
 /* configurable options */
 extern PGDLLIMPORT int DeadlockTimeout;
 extern PGDLLIMPORT int StatementTimeout;
 extern PGDLLIMPORT int LockTimeout;
 extern PGDLLIMPORT int IdleInTransactionSessionTimeout;
+extern PGDLLIMPORT int TransactionTimeout;
 extern PGDLLIMPORT int IdleSessionTimeout;
 extern PGDLLIMPORT bool log_lock_waits;
+
+#ifdef EXEC_BACKEND
+extern PGDLLIMPORT slock_t *ProcStructLock;
+extern PGDLLIMPORT PGPROC *AuxiliaryProcs;
+#endif
 
 
 /*
@@ -448,15 +484,16 @@ extern int	GetStartupBufferPinWaitBufId(void);
 extern bool HaveNFreeProcs(int n, int *nfree);
 extern void ProcReleaseLocks(bool isCommit);
 
-extern ProcWaitStatus ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable);
+extern ProcWaitStatus JoinWaitQueue(LOCALLOCK *locallock,
+									LockMethod lockMethodTable, bool dontWait);
+extern ProcWaitStatus ProcSleep(LOCALLOCK *locallock);
 extern void ProcWakeup(PGPROC *proc, ProcWaitStatus waitStatus);
 extern void ProcLockWakeup(LockMethod lockMethodTable, LOCK *lock);
 extern void CheckDeadLockAlert(void);
-extern bool IsWaitingForLock(void);
 extern void LockErrorCleanup(void);
 
 extern void ProcWaitForSignal(uint32 wait_event_info);
-extern void ProcSendSignal(int pgprocno);
+extern void ProcSendSignal(ProcNumber procNumber);
 
 extern PGPROC *AuxiliaryPidGetProc(int pid);
 

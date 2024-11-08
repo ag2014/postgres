@@ -8,7 +8,7 @@
  * operations such as pfree() and repalloc() to work correctly on a memory
  * chunk that was allocated by palloc_aligned().
  *
- * Portions Copyright (c) 2022-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2022-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/mmgr/alignedalloc.c
@@ -30,6 +30,8 @@ AlignedAllocFree(void *pointer)
 {
 	MemoryChunk *chunk = PointerGetMemoryChunk(pointer);
 	void	   *unaligned;
+
+	VALGRIND_MAKE_MEM_DEFINED(chunk, sizeof(MemoryChunk));
 
 	Assert(!MemoryChunkIsExternal(chunk));
 
@@ -55,14 +57,19 @@ AlignedAllocFree(void *pointer)
  *		memory will be uninitialized.
  */
 void *
-AlignedAllocRealloc(void *pointer, Size size)
+AlignedAllocRealloc(void *pointer, Size size, int flags)
 {
 	MemoryChunk *redirchunk = PointerGetMemoryChunk(pointer);
-	Size		alignto = MemoryChunkGetValue(redirchunk);
-	void	   *unaligned = MemoryChunkGetBlock(redirchunk);
+	Size		alignto;
+	void	   *unaligned;
 	MemoryContext ctx;
 	Size		old_size;
 	void	   *newptr;
+
+	VALGRIND_MAKE_MEM_DEFINED(redirchunk, sizeof(MemoryChunk));
+
+	alignto = MemoryChunkGetValue(redirchunk);
+	unaligned = MemoryChunkGetBlock(redirchunk);
 
 	/* sanity check this is a power of 2 value */
 	Assert((alignto & (alignto - 1)) == 0);
@@ -90,14 +97,17 @@ AlignedAllocRealloc(void *pointer, Size size)
 #endif
 
 	ctx = GetMemoryChunkContext(unaligned);
-	newptr = MemoryContextAllocAligned(ctx, size, alignto, 0);
+	newptr = MemoryContextAllocAligned(ctx, size, alignto, flags);
 
 	/*
 	 * We may memcpy beyond the end of the original allocation request size,
 	 * so we must mark the entire allocation as defined.
 	 */
-	VALGRIND_MAKE_MEM_DEFINED(pointer, old_size);
-	memcpy(newptr, pointer, Min(size, old_size));
+	if (likely(newptr != NULL))
+	{
+		VALGRIND_MAKE_MEM_DEFINED(pointer, old_size);
+		memcpy(newptr, pointer, Min(size, old_size));
+	}
 	pfree(unaligned);
 
 	return newptr;
@@ -110,11 +120,18 @@ AlignedAllocRealloc(void *pointer, Size size)
 MemoryContext
 AlignedAllocGetChunkContext(void *pointer)
 {
-	MemoryChunk *chunk = PointerGetMemoryChunk(pointer);
+	MemoryChunk *redirchunk = PointerGetMemoryChunk(pointer);
+	MemoryContext cxt;
 
-	Assert(!MemoryChunkIsExternal(chunk));
+	VALGRIND_MAKE_MEM_DEFINED(redirchunk, sizeof(MemoryChunk));
 
-	return GetMemoryChunkContext(MemoryChunkGetBlock(chunk));
+	Assert(!MemoryChunkIsExternal(redirchunk));
+
+	cxt = GetMemoryChunkContext(MemoryChunkGetBlock(redirchunk));
+
+	VALGRIND_MAKE_MEM_NOACCESS(redirchunk, sizeof(MemoryChunk));
+
+	return cxt;
 }
 
 /*
@@ -126,7 +143,15 @@ Size
 AlignedAllocGetChunkSpace(void *pointer)
 {
 	MemoryChunk *redirchunk = PointerGetMemoryChunk(pointer);
-	void	   *unaligned = MemoryChunkGetBlock(redirchunk);
+	void	   *unaligned;
+	Size		space;
 
-	return GetMemoryChunkSpace(unaligned);
+	VALGRIND_MAKE_MEM_DEFINED(redirchunk, sizeof(MemoryChunk));
+
+	unaligned = MemoryChunkGetBlock(redirchunk);
+	space = GetMemoryChunkSpace(unaligned);
+
+	VALGRIND_MAKE_MEM_NOACCESS(redirchunk, sizeof(MemoryChunk));
+
+	return space;
 }

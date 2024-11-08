@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2023, PostgreSQL Global Development Group
+# Copyright (c) 2022-2024, PostgreSQL Global Development Group
 
 tests += {
   'name': 'unsafe_tests',
@@ -10,5 +10,6 @@ tests += {
       'alter_system_table',
       'guc_privs',
     ],
+    'runningcheck': false,
   },
 }

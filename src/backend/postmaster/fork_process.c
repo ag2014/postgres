@@ -4,7 +4,7 @@
  *	 EXEC_BACKEND case; it might be extended to do so, but it would be
  *	 considerably more complex.
  *
- * Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/postmaster/fork_process.c
@@ -58,8 +58,8 @@ fork_process(void)
 	/*
 	 * We start postmaster children with signals blocked.  This allows them to
 	 * install their own handlers before unblocking, to avoid races where they
-	 * might run the postmaster's handler and miss an important control signal.
-	 * With more analysis this could potentially be relaxed.
+	 * might run the postmaster's handler and miss an important control
+	 * signal. With more analysis this could potentially be relaxed.
 	 */
 	sigprocmask(SIG_SETMASK, &BlockSig, &save_mask);
 	result = fork();

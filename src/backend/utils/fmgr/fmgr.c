@@ -3,7 +3,7 @@
  * fmgr.c
  *	  The Postgres function manager.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -151,7 +151,6 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 	HeapTuple	procedureTuple;
 	Form_pg_proc procedureStruct;
 	Datum		prosrcdatum;
-	bool		isnull;
 	char	   *prosrc;
 
 	/*
@@ -227,10 +226,8 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 			 * internal function is stored in prosrc (it doesn't have to be
 			 * the same as the name of the alias!)
 			 */
-			prosrcdatum = SysCacheGetAttr(PROCOID, procedureTuple,
-										  Anum_pg_proc_prosrc, &isnull);
-			if (isnull)
-				elog(ERROR, "null prosrc");
+			prosrcdatum = SysCacheGetAttrNotNull(PROCOID, procedureTuple,
+												 Anum_pg_proc_prosrc);
 			prosrc = TextDatumGetCString(prosrcdatum);
 			fbp = fmgr_lookupByName(prosrc);
 			if (fbp == NULL)
@@ -285,7 +282,6 @@ fmgr_symbol(Oid functionId, char **mod, char **fn)
 {
 	HeapTuple	procedureTuple;
 	Form_pg_proc procedureStruct;
-	bool		isnull;
 	Datum		prosrcattr;
 	Datum		probinattr;
 
@@ -308,25 +304,19 @@ fmgr_symbol(Oid functionId, char **mod, char **fn)
 	switch (procedureStruct->prolang)
 	{
 		case INTERNALlanguageId:
-			prosrcattr = SysCacheGetAttr(PROCOID, procedureTuple,
-										 Anum_pg_proc_prosrc, &isnull);
-			if (isnull)
-				elog(ERROR, "null prosrc");
+			prosrcattr = SysCacheGetAttrNotNull(PROCOID, procedureTuple,
+												Anum_pg_proc_prosrc);
 
 			*mod = NULL;		/* core binary */
 			*fn = TextDatumGetCString(prosrcattr);
 			break;
 
 		case ClanguageId:
-			prosrcattr = SysCacheGetAttr(PROCOID, procedureTuple,
-										 Anum_pg_proc_prosrc, &isnull);
-			if (isnull)
-				elog(ERROR, "null prosrc for C function %u", functionId);
+			prosrcattr = SysCacheGetAttrNotNull(PROCOID, procedureTuple,
+												Anum_pg_proc_prosrc);
 
-			probinattr = SysCacheGetAttr(PROCOID, procedureTuple,
-										 Anum_pg_proc_probin, &isnull);
-			if (isnull)
-				elog(ERROR, "null probin for C function %u", functionId);
+			probinattr = SysCacheGetAttrNotNull(PROCOID, procedureTuple,
+												Anum_pg_proc_probin);
 
 			/*
 			 * No need to check symbol presence / API version here, already
@@ -361,7 +351,6 @@ fmgr_info_C_lang(Oid functionId, FmgrInfo *finfo, HeapTuple procedureTuple)
 	CFuncHashTabEntry *hashentry;
 	PGFunction	user_fn;
 	const Pg_finfo_record *inforec;
-	bool		isnull;
 
 	/*
 	 * See if we have the function address cached already
@@ -385,16 +374,12 @@ fmgr_info_C_lang(Oid functionId, FmgrInfo *finfo, HeapTuple procedureTuple)
 		 * While in general these columns might be null, that's not allowed
 		 * for C-language functions.
 		 */
-		prosrcattr = SysCacheGetAttr(PROCOID, procedureTuple,
-									 Anum_pg_proc_prosrc, &isnull);
-		if (isnull)
-			elog(ERROR, "null prosrc for C function %u", functionId);
+		prosrcattr = SysCacheGetAttrNotNull(PROCOID, procedureTuple,
+											Anum_pg_proc_prosrc);
 		prosrcstring = TextDatumGetCString(prosrcattr);
 
-		probinattr = SysCacheGetAttr(PROCOID, procedureTuple,
-									 Anum_pg_proc_probin, &isnull);
-		if (isnull)
-			elog(ERROR, "null probin for C function %u", functionId);
+		probinattr = SysCacheGetAttrNotNull(PROCOID, procedureTuple,
+											Anum_pg_proc_probin);
 		probinstring = TextDatumGetCString(probinattr);
 
 		/* Look up the function itself */
@@ -627,7 +612,9 @@ struct fmgr_security_definer_cache
 {
 	FmgrInfo	flinfo;			/* lookup info for target function */
 	Oid			userid;			/* userid to set, or InvalidOid */
-	ArrayType  *proconfig;		/* GUC values to set, or NULL */
+	List	   *configNames;	/* GUC names to set, or NIL */
+	List	   *configHandles;	/* GUC handles to set, or NIL */
+	List	   *configValues;	/* GUC values to set, or NIL */
 	Datum		arg;			/* passthrough argument for plugin modules */
 };
 
@@ -649,6 +636,9 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 	FmgrInfo   *save_flinfo;
 	Oid			save_userid;
 	int			save_sec_context;
+	ListCell   *lc1,
+			   *lc2,
+			   *lc3;
 	volatile int save_nestlevel;
 	PgStat_FunctionCallUsage fcusage;
 
@@ -681,8 +671,24 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 								&isnull);
 		if (!isnull)
 		{
+			ArrayType  *array;
+			ListCell   *lc;
+
 			oldcxt = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
-			fcache->proconfig = DatumGetArrayTypePCopy(datum);
+			array = DatumGetArrayTypeP(datum);
+			TransformGUCArray(array, &fcache->configNames,
+							  &fcache->configValues);
+
+			/* transform names to config handles to avoid lookup cost */
+			fcache->configHandles = NIL;
+			foreach(lc, fcache->configNames)
+			{
+				char	   *name = (char *) lfirst(lc);
+
+				fcache->configHandles = lappend(fcache->configHandles,
+												get_config_handle(name));
+			}
+
 			MemoryContextSwitchTo(oldcxt);
 		}
 
@@ -695,7 +701,7 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 
 	/* GetUserIdAndSecContext is cheap enough that no harm in a wasted call */
 	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	if (fcache->proconfig)		/* Need a new GUC nesting level */
+	if (fcache->configNames != NIL) /* Need a new GUC nesting level */
 		save_nestlevel = NewGUCNestLevel();
 	else
 		save_nestlevel = 0;		/* keep compiler quiet */
@@ -704,13 +710,20 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 		SetUserIdAndSecContext(fcache->userid,
 							   save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
 
-	if (fcache->proconfig)
+	forthree(lc1, fcache->configNames,
+			 lc2, fcache->configHandles,
+			 lc3, fcache->configValues)
 	{
-		ProcessGUCArray(fcache->proconfig,
-						NULL,
-						(superuser() ? PGC_SUSET : PGC_USERSET),
-						PGC_S_SESSION,
-						GUC_ACTION_SAVE);
+		GucContext	context = superuser() ? PGC_SUSET : PGC_USERSET;
+		GucSource	source = PGC_S_SESSION;
+		GucAction	action = GUC_ACTION_SAVE;
+		char	   *name = lfirst(lc1);
+		config_handle *handle = lfirst(lc2);
+		char	   *value = lfirst(lc3);
+
+		(void) set_config_with_handle(name, handle, value,
+									  context, source, GetUserId(),
+									  action, true, 0, false);
 	}
 
 	/* function manager hook */
@@ -753,7 +766,7 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 
 	fcinfo->flinfo = save_flinfo;
 
-	if (fcache->proconfig)
+	if (fcache->configNames != NIL)
 		AtEOXact_GUC(true, save_nestlevel);
 	if (OidIsValid(fcache->userid))
 		SetUserIdAndSecContext(save_userid, save_sec_context);
@@ -2166,7 +2179,7 @@ CheckFunctionValidatorAccess(Oid validatorOid, Oid functionOid)
 
 	/* first validate that we have permissions to use the language */
 	aclresult = object_aclcheck(LanguageRelationId, procStruct->prolang, GetUserId(),
-									 ACL_USAGE);
+								ACL_USAGE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_LANGUAGE,
 					   NameStr(langStruct->lanname));

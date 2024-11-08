@@ -376,6 +376,36 @@ COMMIT;
 SELECT seq_scan, :'test_last_seq' = last_seq_scan AS seq_ok, idx_scan, :'test_last_idx' < last_idx_scan AS idx_ok
 FROM pg_stat_all_tables WHERE relid = 'test_last_scan'::regclass;
 
+-----
+-- Test reset of some stats for shared table
+-----
+
+-- This updates the comment of the database currently in use in
+-- pg_shdescription with a fake value, then sets it back to its
+-- original value.
+SELECT shobj_description(d.oid, 'pg_database') as description_before
+  FROM pg_database d WHERE datname = current_database() \gset
+
+-- force some stats in pg_shdescription.
+BEGIN;
+SELECT current_database() as datname \gset
+COMMENT ON DATABASE :"datname" IS 'This is a test comment';
+SELECT pg_stat_force_next_flush();
+COMMIT;
+
+-- check that the stats are reset.
+SELECT (n_tup_ins + n_tup_upd) > 0 AS has_data FROM pg_stat_all_tables
+  WHERE relid = 'pg_shdescription'::regclass;
+SELECT pg_stat_reset_single_table_counters('pg_shdescription'::regclass);
+SELECT (n_tup_ins + n_tup_upd) > 0 AS has_data FROM pg_stat_all_tables
+  WHERE relid = 'pg_shdescription'::regclass;
+
+-- set back comment
+\if :{?description_before}
+  COMMENT ON DATABASE :"datname" IS :'description_before';
+\else
+  COMMENT ON DATABASE :"datname" IS NULL;
+\endif
 
 -----
 -- Test that various stats views are being properly populated
@@ -387,8 +417,8 @@ SELECT sessions AS db_stat_sessions FROM pg_stat_database WHERE datname = (SELEC
 SELECT pg_stat_force_next_flush();
 SELECT sessions > :db_stat_sessions FROM pg_stat_database WHERE datname = (SELECT current_database());
 
--- Test pg_stat_bgwriter checkpointer-related stats, together with pg_stat_wal
-SELECT checkpoints_req AS rqst_ckpts_before FROM pg_stat_bgwriter \gset
+-- Test pg_stat_checkpointer checkpointer-related stats, together with pg_stat_wal
+SELECT num_requested AS rqst_ckpts_before FROM pg_stat_checkpointer \gset
 
 -- Test pg_stat_wal (and make a temp table so our temp schema exists)
 SELECT wal_bytes AS wal_bytes_before FROM pg_stat_wal \gset
@@ -402,7 +432,7 @@ DROP TABLE test_stats_temp;
 CHECKPOINT;
 CHECKPOINT;
 
-SELECT checkpoints_req > :rqst_ckpts_before FROM pg_stat_bgwriter;
+SELECT num_requested > :rqst_ckpts_before FROM pg_stat_checkpointer;
 SELECT wal_bytes > :wal_bytes_before FROM pg_stat_wal;
 
 -- Test pg_stat_get_backend_idset() and some allied functions.
@@ -417,40 +447,49 @@ WHERE pg_stat_get_backend_pid(beid) = pg_backend_pid();
 -----
 
 -- Test that reset_slru with a specified SLRU works.
-SELECT stats_reset AS slru_commit_ts_reset_ts FROM pg_stat_slru WHERE name = 'CommitTs' \gset
-SELECT stats_reset AS slru_notify_reset_ts FROM pg_stat_slru WHERE name = 'Notify' \gset
-SELECT pg_stat_reset_slru('CommitTs');
-SELECT stats_reset > :'slru_commit_ts_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'CommitTs';
-SELECT stats_reset AS slru_commit_ts_reset_ts FROM pg_stat_slru WHERE name = 'CommitTs' \gset
+SELECT stats_reset AS slru_commit_ts_reset_ts FROM pg_stat_slru WHERE name = 'commit_timestamp' \gset
+SELECT stats_reset AS slru_notify_reset_ts FROM pg_stat_slru WHERE name = 'notify' \gset
+SELECT pg_stat_reset_slru('commit_timestamp');
+SELECT stats_reset > :'slru_commit_ts_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'commit_timestamp';
+SELECT stats_reset AS slru_commit_ts_reset_ts FROM pg_stat_slru WHERE name = 'commit_timestamp' \gset
 
 -- Test that multiple SLRUs are reset when no specific SLRU provided to reset function
-SELECT pg_stat_reset_slru(NULL);
-SELECT stats_reset > :'slru_commit_ts_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'CommitTs';
-SELECT stats_reset > :'slru_notify_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'Notify';
+SELECT pg_stat_reset_slru();
+SELECT stats_reset > :'slru_commit_ts_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'commit_timestamp';
+SELECT stats_reset > :'slru_notify_reset_ts'::timestamptz FROM pg_stat_slru WHERE name = 'notify';
 
 -- Test that reset_shared with archiver specified as the stats type works
 SELECT stats_reset AS archiver_reset_ts FROM pg_stat_archiver \gset
 SELECT pg_stat_reset_shared('archiver');
 SELECT stats_reset > :'archiver_reset_ts'::timestamptz FROM pg_stat_archiver;
-SELECT stats_reset AS archiver_reset_ts FROM pg_stat_archiver \gset
 
 -- Test that reset_shared with bgwriter specified as the stats type works
 SELECT stats_reset AS bgwriter_reset_ts FROM pg_stat_bgwriter \gset
 SELECT pg_stat_reset_shared('bgwriter');
 SELECT stats_reset > :'bgwriter_reset_ts'::timestamptz FROM pg_stat_bgwriter;
-SELECT stats_reset AS bgwriter_reset_ts FROM pg_stat_bgwriter \gset
+
+-- Test that reset_shared with checkpointer specified as the stats type works
+SELECT stats_reset AS checkpointer_reset_ts FROM pg_stat_checkpointer \gset
+SELECT pg_stat_reset_shared('checkpointer');
+SELECT stats_reset > :'checkpointer_reset_ts'::timestamptz FROM pg_stat_checkpointer;
+
+-- Test that reset_shared with recovery_prefetch specified as the stats type works
+SELECT stats_reset AS recovery_prefetch_reset_ts FROM pg_stat_recovery_prefetch \gset
+SELECT pg_stat_reset_shared('recovery_prefetch');
+SELECT stats_reset > :'recovery_prefetch_reset_ts'::timestamptz FROM pg_stat_recovery_prefetch;
+
+-- Test that reset_shared with slru specified as the stats type works
+SELECT max(stats_reset) AS slru_reset_ts FROM pg_stat_slru \gset
+SELECT pg_stat_reset_shared('slru');
+SELECT max(stats_reset) > :'slru_reset_ts'::timestamptz FROM pg_stat_slru;
 
 -- Test that reset_shared with wal specified as the stats type works
 SELECT stats_reset AS wal_reset_ts FROM pg_stat_wal \gset
 SELECT pg_stat_reset_shared('wal');
 SELECT stats_reset > :'wal_reset_ts'::timestamptz FROM pg_stat_wal;
-SELECT stats_reset AS wal_reset_ts FROM pg_stat_wal \gset
 
--- Test that reset_shared with no specified stats type doesn't reset anything
-SELECT pg_stat_reset_shared(NULL);
-SELECT stats_reset = :'archiver_reset_ts'::timestamptz FROM pg_stat_archiver;
-SELECT stats_reset = :'bgwriter_reset_ts'::timestamptz FROM pg_stat_bgwriter;
-SELECT stats_reset = :'wal_reset_ts'::timestamptz FROM pg_stat_wal;
+-- Test error case for reset_shared with unknown stats type
+SELECT pg_stat_reset_shared('unknown');
 
 -- Test that reset works for pg_stat_database
 
@@ -477,13 +516,33 @@ SELECT pg_stat_get_snapshot_timestamp();
 COMMIT;
 
 ----
+-- Changing stats_fetch_consistency in a transaction.
+----
+BEGIN;
+-- Stats filled under the cache mode
+SET LOCAL stats_fetch_consistency = cache;
+SELECT pg_stat_get_function_calls(0);
+SELECT pg_stat_get_snapshot_timestamp() IS NOT NULL AS snapshot_ok;
+-- Success in accessing pre-existing snapshot data.
+SET LOCAL stats_fetch_consistency = snapshot;
+SELECT pg_stat_get_snapshot_timestamp() IS NOT NULL AS snapshot_ok;
+SELECT pg_stat_get_function_calls(0);
+SELECT pg_stat_get_snapshot_timestamp() IS NOT NULL AS snapshot_ok;
+-- Snapshot cleared.
+SET LOCAL stats_fetch_consistency = none;
+SELECT pg_stat_get_snapshot_timestamp() IS NOT NULL AS snapshot_ok;
+SELECT pg_stat_get_function_calls(0);
+SELECT pg_stat_get_snapshot_timestamp() IS NOT NULL AS snapshot_ok;
+ROLLBACK;
+
+----
 -- pg_stat_have_stats behavior
 ----
 -- fixed-numbered stats exist
 SELECT pg_stat_have_stats('bgwriter', 0, 0);
 -- unknown stats kinds error out
 SELECT pg_stat_have_stats('zaphod', 0, 0);
--- db stats have objoid 0
+-- db stats have objid 0
 SELECT pg_stat_have_stats('database', :dboid, 1);
 SELECT pg_stat_have_stats('database', :dboid, 0);
 
@@ -541,6 +600,7 @@ SELECT pg_stat_get_subscription_stats(NULL);
 -- - writes of shared buffers to permanent storage
 -- - extends of relations using shared buffers
 -- - fsyncs done to ensure the durability of data dirtying shared buffers
+-- - shared buffer hits
 
 -- There is no test for blocks evicted from shared buffers, because we cannot
 -- be sure of the state of shared buffers at the point the test is run.
@@ -548,26 +608,25 @@ SELECT pg_stat_get_subscription_stats(NULL);
 -- Create a regular table and insert some data to generate IOCONTEXT_NORMAL
 -- extends.
 SELECT sum(extends) AS io_sum_shared_before_extends
-  FROM pg_stat_io WHERE io_context = 'normal' AND io_object = 'relation' \gset
+  FROM pg_stat_io WHERE context = 'normal' AND object = 'relation' \gset
+SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
+  FROM pg_stat_io
+  WHERE object = 'relation' \gset io_sum_shared_before_
 CREATE TABLE test_io_shared(a int);
 INSERT INTO test_io_shared SELECT i FROM generate_series(1,100)i;
 SELECT pg_stat_force_next_flush();
 SELECT sum(extends) AS io_sum_shared_after_extends
-  FROM pg_stat_io WHERE io_context = 'normal' AND io_object = 'relation' \gset
+  FROM pg_stat_io WHERE context = 'normal' AND object = 'relation' \gset
 SELECT :io_sum_shared_after_extends > :io_sum_shared_before_extends;
 
 -- After a checkpoint, there should be some additional IOCONTEXT_NORMAL writes
 -- and fsyncs.
-SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
-  FROM pg_stat_io
-  WHERE io_context = 'normal' AND io_object = 'relation' \gset io_sum_shared_before_
 -- See comment above for rationale for two explicit CHECKPOINTs.
 CHECKPOINT;
 CHECKPOINT;
 SELECT sum(writes) AS writes, sum(fsyncs) AS fsyncs
   FROM pg_stat_io
-  WHERE io_context = 'normal' AND io_object = 'relation' \gset io_sum_shared_after_
-
+  WHERE object = 'relation' \gset io_sum_shared_after_
 SELECT :io_sum_shared_after_writes > :io_sum_shared_before_writes;
 SELECT current_setting('fsync') = 'off'
   OR :io_sum_shared_after_fsyncs > :io_sum_shared_before_fsyncs;
@@ -575,15 +634,38 @@ SELECT current_setting('fsync') = 'off'
 -- Change the tablespace so that the table is rewritten directly, then SELECT
 -- from it to cause it to be read back into shared buffers.
 SELECT sum(reads) AS io_sum_shared_before_reads
-  FROM pg_stat_io WHERE io_context = 'normal' AND io_object = 'relation' \gset
+  FROM pg_stat_io WHERE context = 'normal' AND object = 'relation' \gset
+-- Do this in a transaction to prevent spurious failures due to concurrent accesses to our newly
+-- rewritten table, e.g. by autovacuum.
+BEGIN;
 ALTER TABLE test_io_shared SET TABLESPACE regress_tblspace;
 -- SELECT from the table so that the data is read into shared buffers and
--- io_context 'normal', io_object 'relation' reads are counted.
+-- context 'normal', object 'relation' reads are counted.
 SELECT COUNT(*) FROM test_io_shared;
+COMMIT;
 SELECT pg_stat_force_next_flush();
 SELECT sum(reads) AS io_sum_shared_after_reads
-  FROM pg_stat_io WHERE io_context = 'normal' AND io_object = 'relation'  \gset
+  FROM pg_stat_io WHERE context = 'normal' AND object = 'relation'  \gset
 SELECT :io_sum_shared_after_reads > :io_sum_shared_before_reads;
+
+SELECT sum(hits) AS io_sum_shared_before_hits
+  FROM pg_stat_io WHERE context = 'normal' AND object = 'relation' \gset
+-- Select from the table again to count hits.
+-- Ensure we generate hits by forcing a nested loop self-join with no
+-- materialize node. The outer side's buffer will stay pinned, preventing its
+-- eviction, while we loop through the inner side and generate hits.
+BEGIN;
+SET LOCAL enable_nestloop TO on; SET LOCAL enable_mergejoin TO off;
+SET LOCAL enable_hashjoin TO off; SET LOCAL enable_material TO off;
+-- ensure plan stays as we expect it to
+EXPLAIN (COSTS OFF) SELECT COUNT(*) FROM test_io_shared t1 INNER JOIN test_io_shared t2 USING (a);
+SELECT COUNT(*) FROM test_io_shared t1 INNER JOIN test_io_shared t2 USING (a);
+COMMIT;
+SELECT pg_stat_force_next_flush();
+SELECT sum(hits) AS io_sum_shared_after_hits
+  FROM pg_stat_io WHERE context = 'normal' AND object = 'relation' \gset
+SELECT :io_sum_shared_after_hits > :io_sum_shared_before_hits;
+
 DROP TABLE test_io_shared;
 
 -- Test that the follow IOCONTEXT_LOCAL IOOps are tracked in pg_stat_io:
@@ -600,7 +682,7 @@ SET temp_buffers TO 100;
 CREATE TEMPORARY TABLE test_io_local(a int, b TEXT);
 SELECT sum(extends) AS extends, sum(evictions) AS evictions, sum(writes) AS writes
   FROM pg_stat_io
-  WHERE io_context = 'normal' AND io_object = 'temp relation' \gset io_sum_local_before_
+  WHERE context = 'normal' AND object = 'temp relation' \gset io_sum_local_before_
 -- Insert tuples into the temporary table, generating extends in the stats.
 -- Insert enough values that we need to reuse and write out dirty local
 -- buffers, generating evictions and writes.
@@ -609,7 +691,7 @@ INSERT INTO test_io_local SELECT generate_series(1, 5000) as id, repeat('a', 200
 SELECT pg_relation_size('test_io_local') / current_setting('block_size')::int8 > 100;
 
 SELECT sum(reads) AS io_sum_local_before_reads
-  FROM pg_stat_io WHERE io_context = 'normal' AND io_object = 'temp relation' \gset
+  FROM pg_stat_io WHERE context = 'normal' AND object = 'temp relation' \gset
 -- Read in evicted buffers, generating reads.
 SELECT COUNT(*) FROM test_io_local;
 SELECT pg_stat_force_next_flush();
@@ -618,7 +700,7 @@ SELECT sum(evictions) AS evictions,
        sum(writes) AS writes,
        sum(extends) AS extends
   FROM pg_stat_io
-  WHERE io_context = 'normal' AND io_object = 'temp relation'  \gset io_sum_local_after_
+  WHERE context = 'normal' AND object = 'temp relation'  \gset io_sum_local_after_
 SELECT :io_sum_local_after_evictions > :io_sum_local_before_evictions,
        :io_sum_local_after_reads > :io_sum_local_before_reads,
        :io_sum_local_after_writes > :io_sum_local_before_writes,
@@ -630,12 +712,16 @@ SELECT :io_sum_local_after_evictions > :io_sum_local_before_evictions,
 ALTER TABLE test_io_local SET TABLESPACE regress_tblspace;
 SELECT pg_stat_force_next_flush();
 SELECT sum(writes) AS io_sum_local_new_tblspc_writes
-  FROM pg_stat_io WHERE io_context = 'normal' AND io_object = 'temp relation'  \gset
+  FROM pg_stat_io WHERE context = 'normal' AND object = 'temp relation'  \gset
 SELECT :io_sum_local_new_tblspc_writes > :io_sum_local_after_writes;
 RESET temp_buffers;
 
 -- Test that reuse of strategy buffers and reads of blocks into these reused
--- buffers while VACUUMing are tracked in pg_stat_io.
+-- buffers while VACUUMing are tracked in pg_stat_io. If there is sufficient
+-- demand for shared buffers from concurrent queries, some buffers may be
+-- pinned by other backends before they can be reused. In such cases, the
+-- backend will evict a buffer from outside the ring and add it to the
+-- ring. This is considered an eviction and not a reuse.
 
 -- Set wal_skip_threshold smaller than the expected size of
 -- test_io_vac_strategy so that, even if wal_level is minimal, VACUUM FULL will
@@ -644,38 +730,123 @@ RESET temp_buffers;
 -- shared buffers -- preventing us from testing BAS_VACUUM BufferAccessStrategy
 -- reads.
 SET wal_skip_threshold = '1 kB';
-SELECT sum(reuses) AS reuses, sum(reads) AS reads
-  FROM pg_stat_io WHERE io_context = 'vacuum' \gset io_sum_vac_strategy_before_
+SELECT sum(reuses) AS reuses, sum(reads) AS reads, sum(evictions) AS evictions
+  FROM pg_stat_io WHERE context = 'vacuum' \gset io_sum_vac_strategy_before_
 CREATE TABLE test_io_vac_strategy(a int, b int) WITH (autovacuum_enabled = 'false');
-INSERT INTO test_io_vac_strategy SELECT i, i from generate_series(1, 8000)i;
+INSERT INTO test_io_vac_strategy SELECT i, i from generate_series(1, 4500)i;
 -- Ensure that the next VACUUM will need to perform IO by rewriting the table
 -- first with VACUUM (FULL).
 VACUUM (FULL) test_io_vac_strategy;
-VACUUM (PARALLEL 0) test_io_vac_strategy;
+-- Use the minimum BUFFER_USAGE_LIMIT to cause reuses or evictions with the
+-- smallest table possible.
+VACUUM (PARALLEL 0, BUFFER_USAGE_LIMIT 128) test_io_vac_strategy;
 SELECT pg_stat_force_next_flush();
-SELECT sum(reuses) AS reuses, sum(reads) AS reads
-  FROM pg_stat_io WHERE io_context = 'vacuum' \gset io_sum_vac_strategy_after_
-SELECT :io_sum_vac_strategy_after_reads > :io_sum_vac_strategy_before_reads,
-       :io_sum_vac_strategy_after_reuses > :io_sum_vac_strategy_before_reuses;
+SELECT sum(reuses) AS reuses, sum(reads) AS reads, sum(evictions) AS evictions
+  FROM pg_stat_io WHERE context = 'vacuum' \gset io_sum_vac_strategy_after_
+SELECT :io_sum_vac_strategy_after_reads > :io_sum_vac_strategy_before_reads;
+SELECT (:io_sum_vac_strategy_after_reuses + :io_sum_vac_strategy_after_evictions) >
+  (:io_sum_vac_strategy_before_reuses + :io_sum_vac_strategy_before_evictions);
 RESET wal_skip_threshold;
 
 -- Test that extends done by a CTAS, which uses a BAS_BULKWRITE
 -- BufferAccessStrategy, are tracked in pg_stat_io.
 SELECT sum(extends) AS io_sum_bulkwrite_strategy_extends_before
-  FROM pg_stat_io WHERE io_context = 'bulkwrite' \gset
+  FROM pg_stat_io WHERE context = 'bulkwrite' \gset
 CREATE TABLE test_io_bulkwrite_strategy AS SELECT i FROM generate_series(1,100)i;
 SELECT pg_stat_force_next_flush();
 SELECT sum(extends) AS io_sum_bulkwrite_strategy_extends_after
-  FROM pg_stat_io WHERE io_context = 'bulkwrite' \gset
+  FROM pg_stat_io WHERE context = 'bulkwrite' \gset
 SELECT :io_sum_bulkwrite_strategy_extends_after > :io_sum_bulkwrite_strategy_extends_before;
 
 -- Test IO stats reset
 SELECT pg_stat_have_stats('io', 0, 0);
-SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) AS io_stats_pre_reset
+SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS io_stats_pre_reset
   FROM pg_stat_io \gset
 SELECT pg_stat_reset_shared('io');
-SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) AS io_stats_post_reset
+SELECT sum(evictions) + sum(reuses) + sum(extends) + sum(fsyncs) + sum(reads) + sum(writes) + sum(writebacks) + sum(hits) AS io_stats_post_reset
   FROM pg_stat_io \gset
 SELECT :io_stats_post_reset < :io_stats_pre_reset;
+
+
+-- test BRIN index doesn't block HOT update
+CREATE TABLE brin_hot (
+  id  integer PRIMARY KEY,
+  val integer NOT NULL
+) WITH (autovacuum_enabled = off, fillfactor = 70);
+
+INSERT INTO brin_hot SELECT *, 0 FROM generate_series(1, 235);
+CREATE INDEX val_brin ON brin_hot using brin(val);
+
+CREATE FUNCTION wait_for_hot_stats() RETURNS void AS $$
+DECLARE
+  start_time timestamptz := clock_timestamp();
+  updated bool;
+BEGIN
+  -- we don't want to wait forever; loop will exit after 30 seconds
+  FOR i IN 1 .. 300 LOOP
+    SELECT (pg_stat_get_tuples_hot_updated('brin_hot'::regclass::oid) > 0) INTO updated;
+    EXIT WHEN updated;
+
+    -- wait a little
+    PERFORM pg_sleep_for('100 milliseconds');
+    -- reset stats snapshot so we can test again
+    PERFORM pg_stat_clear_snapshot();
+  END LOOP;
+  -- report time waited in postmaster log (where it won't change test output)
+  RAISE log 'wait_for_hot_stats delayed % seconds',
+    EXTRACT(epoch FROM clock_timestamp() - start_time);
+END
+$$ LANGUAGE plpgsql;
+
+UPDATE brin_hot SET val = -3 WHERE id = 42;
+
+-- We can't just call wait_for_hot_stats() at this point, because we only
+-- transmit stats when the session goes idle, and we probably didn't
+-- transmit the last couple of counts yet thanks to the rate-limiting logic
+-- in pgstat_report_stat().  But instead of waiting for the rate limiter's
+-- timeout to elapse, let's just start a new session.  The old one will
+-- then send its stats before dying.
+\c -
+
+SELECT wait_for_hot_stats();
+SELECT pg_stat_get_tuples_hot_updated('brin_hot'::regclass::oid);
+
+DROP TABLE brin_hot;
+DROP FUNCTION wait_for_hot_stats();
+
+-- Test handling of index predicates - updating attributes in precicates
+-- should not block HOT when summarizing indexes are involved. We update
+-- a row that was not indexed due to the index predicate, and becomes
+-- indexable - the HOT-updated tuple is forwarded to the BRIN index.
+CREATE TABLE brin_hot_2 (a int, b int);
+INSERT INTO brin_hot_2 VALUES (1, 100);
+CREATE INDEX ON brin_hot_2 USING brin (b) WHERE a = 2;
+
+UPDATE brin_hot_2 SET a = 2;
+
+EXPLAIN (COSTS OFF) SELECT * FROM brin_hot_2 WHERE a = 2 AND b = 100;
+SELECT COUNT(*) FROM brin_hot_2 WHERE a = 2 AND b = 100;
+
+SET enable_seqscan = off;
+
+EXPLAIN (COSTS OFF) SELECT * FROM brin_hot_2 WHERE a = 2 AND b = 100;
+SELECT COUNT(*) FROM brin_hot_2 WHERE a = 2 AND b = 100;
+
+DROP TABLE brin_hot_2;
+
+-- Test that updates to indexed columns are still propagated to the
+-- BRIN column.
+-- https://postgr.es/m/05ebcb44-f383-86e3-4f31-0a97a55634cf@enterprisedb.com
+CREATE TABLE brin_hot_3 (a int, filler text) WITH (fillfactor = 10);
+INSERT INTO brin_hot_3 SELECT 1, repeat(' ', 500) FROM generate_series(1, 20);
+CREATE INDEX ON brin_hot_3 USING brin (a) WITH (pages_per_range = 1);
+UPDATE brin_hot_3 SET a = 2;
+
+EXPLAIN (COSTS OFF) SELECT * FROM brin_hot_3 WHERE a = 2;
+SELECT COUNT(*) FROM brin_hot_3 WHERE a = 2;
+
+DROP TABLE brin_hot_3;
+
+SET enable_seqscan = on;
 
 -- End of Stats Test

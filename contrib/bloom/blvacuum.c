@@ -3,7 +3,7 @@
  * blvacuum.c
  *		Bloom VACUUM functions.
  *
- * Copyright (c) 2016-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2024, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/bloom/blvacuum.c
@@ -14,13 +14,9 @@
 
 #include "access/genam.h"
 #include "bloom.h"
-#include "catalog/storage.h"
 #include "commands/vacuum.h"
-#include "miscadmin.h"
-#include "postmaster/autovacuum.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
-#include "storage/lmgr.h"
 
 
 /*

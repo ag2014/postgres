@@ -23,7 +23,7 @@
  * from LIKE to indexscan limits rather harder than one might think ...
  * but that's the basic idea.)
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,7 +37,6 @@
 #include <math.h>
 
 #include "access/htup_details.h"
-#include "access/stratnum.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
@@ -62,12 +61,12 @@ typedef enum
 	Pattern_Type_Like_IC,
 	Pattern_Type_Regex,
 	Pattern_Type_Regex_IC,
-	Pattern_Type_Prefix
+	Pattern_Type_Prefix,
 } Pattern_Type;
 
 typedef enum
 {
-	Pattern_Prefix_None, Pattern_Prefix_Partial, Pattern_Prefix_Exact
+	Pattern_Prefix_None, Pattern_Prefix_Partial, Pattern_Prefix_Exact,
 } Pattern_Prefix_Status;
 
 static Node *like_regex_support(Node *rawreq, Pattern_Type ptype);
@@ -101,7 +100,7 @@ static Selectivity regex_selectivity(const char *patt, int pattlen,
 									 bool case_insensitive,
 									 int fixed_prefix_len);
 static int	pattern_char_isalpha(char c, bool is_multibyte,
-								 pg_locale_t locale, bool locale_is_c);
+								 pg_locale_t locale);
 static Const *make_greater_string(const Const *str_const, FmgrInfo *ltproc,
 								  Oid collation);
 static Datum string_to_datum(const char *str, Oid datatype);
@@ -434,7 +433,7 @@ match_pattern_prefix(Node *leftop,
 	 * collation.
 	 */
 	if (collation_aware &&
-		!lc_collate_is_c(indexcollation))
+		!pg_newlocale_from_collation(indexcollation)->collate_is_c)
 		return NIL;
 
 	/*
@@ -1001,7 +1000,6 @@ like_fixed_prefix(Const *patt_const, bool case_insensitive, Oid collation,
 				match_pos;
 	bool		is_multibyte = (pg_database_encoding_max_length() > 1);
 	pg_locale_t locale = 0;
-	bool		locale_is_c = false;
 
 	/* the right-hand const is type text or bytea */
 	Assert(typeid == BYTEAOID || typeid == TEXTOID);
@@ -1025,11 +1023,7 @@ like_fixed_prefix(Const *patt_const, bool case_insensitive, Oid collation,
 					 errhint("Use the COLLATE clause to set the collation explicitly.")));
 		}
 
-		/* If case-insensitive, we need locale info */
-		if (lc_ctype_is_c(collation))
-			locale_is_c = true;
-		else
-			locale = pg_newlocale_from_collation(collation);
+		locale = pg_newlocale_from_collation(collation);
 	}
 
 	if (typeid != BYTEAOID)
@@ -1066,7 +1060,7 @@ like_fixed_prefix(Const *patt_const, bool case_insensitive, Oid collation,
 
 		/* Stop if case-varying character (it's sort of a wildcard) */
 		if (case_insensitive &&
-			pattern_char_isalpha(patt[pos], is_multibyte, locale, locale_is_c))
+			pattern_char_isalpha(patt[pos], is_multibyte, locale))
 			break;
 
 		match[match_pos++] = patt[pos];
@@ -1500,21 +1494,17 @@ regex_selectivity(const char *patt, int pattlen, bool case_insensitive,
  */
 static int
 pattern_char_isalpha(char c, bool is_multibyte,
-					 pg_locale_t locale, bool locale_is_c)
+					 pg_locale_t locale)
 {
-	if (locale_is_c)
+	if (locale->ctype_is_c)
 		return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 	else if (is_multibyte && IS_HIGHBIT_SET(c))
 		return true;
-	else if (locale && locale->provider == COLLPROVIDER_ICU)
+	else if (locale->provider != COLLPROVIDER_LIBC)
 		return IS_HIGHBIT_SET(c) ||
 			(c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
-#ifdef HAVE_LOCALE_T
-	else if (locale && locale->provider == COLLPROVIDER_LIBC)
-		return isalpha_l((unsigned char) c, locale->info.lt);
-#endif
 	else
-		return isalpha((unsigned char) c);
+		return isalpha_l((unsigned char) c, locale->info.lt);
 }
 
 
@@ -1606,7 +1596,7 @@ make_greater_string(const Const *str_const, FmgrInfo *ltproc, Oid collation)
 		else
 			workstr = TextDatumGetCString(str_const->constvalue);
 		len = strlen(workstr);
-		if (lc_collate_is_c(collation) || len == 0)
+		if (len == 0 || pg_newlocale_from_collation(collation)->collate_is_c)
 			cmpstr = str_const->constvalue;
 		else
 		{

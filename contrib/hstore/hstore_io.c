@@ -13,6 +13,7 @@
 #include "lib/stringinfo.h"
 #include "libpq/pqformat.h"
 #include "nodes/miscnodes.h"
+#include "parser/scansup.h"
 #include "utils/builtins.h"
 #include "utils/json.h"
 #include "utils/jsonb.h"
@@ -118,7 +119,7 @@ get_val(HSParser *state, bool ignoreeq, bool *escaped)
 			{
 				st = GV_WAITESCIN;
 			}
-			else if (!isspace((unsigned char) *(state->ptr)))
+			else if (!scanner_isspace((unsigned char) *(state->ptr)))
 			{
 				*(state->cur) = *(state->ptr);
 				state->cur++;
@@ -141,7 +142,7 @@ get_val(HSParser *state, bool ignoreeq, bool *escaped)
 				state->ptr--;
 				return true;
 			}
-			else if (isspace((unsigned char) *(state->ptr)))
+			else if (scanner_isspace((unsigned char) *(state->ptr)))
 			{
 				return true;
 			}
@@ -255,7 +256,7 @@ parse_hstore(HSParser *state)
 			{
 				PRSEOF;
 			}
-			else if (!isspace((unsigned char) *(state->ptr)))
+			else if (!scanner_isspace((unsigned char) *(state->ptr)))
 			{
 				PRSSYNTAXERROR;
 			}
@@ -309,7 +310,7 @@ parse_hstore(HSParser *state)
 			{
 				return true;
 			}
-			else if (!isspace((unsigned char) *(state->ptr)))
+			else if (!scanner_isspace((unsigned char) *(state->ptr)))
 			{
 				PRSSYNTAXERROR;
 			}
@@ -1342,23 +1343,20 @@ hstore_to_json_loose(PG_FUNCTION_ARGS)
 	int			count = HS_COUNT(in);
 	char	   *base = STRPTR(in);
 	HEntry	   *entries = ARRPTR(in);
-	StringInfoData tmp,
-				dst;
+	StringInfoData dst;
 
 	if (count == 0)
 		PG_RETURN_TEXT_P(cstring_to_text_with_len("{}", 2));
 
-	initStringInfo(&tmp);
 	initStringInfo(&dst);
 
 	appendStringInfoChar(&dst, '{');
 
 	for (i = 0; i < count; i++)
 	{
-		resetStringInfo(&tmp);
-		appendBinaryStringInfo(&tmp, HSTORE_KEY(entries, base, i),
-							   HSTORE_KEYLEN(entries, i));
-		escape_json(&dst, tmp.data);
+		escape_json_with_len(&dst,
+							 HSTORE_KEY(entries, base, i),
+							 HSTORE_KEYLEN(entries, i));
 		appendStringInfoString(&dst, ": ");
 		if (HSTORE_VALISNULL(entries, i))
 			appendStringInfoString(&dst, "null");
@@ -1371,13 +1369,13 @@ hstore_to_json_loose(PG_FUNCTION_ARGS)
 			appendStringInfoString(&dst, "false");
 		else
 		{
-			resetStringInfo(&tmp);
-			appendBinaryStringInfo(&tmp, HSTORE_VAL(entries, base, i),
-								   HSTORE_VALLEN(entries, i));
-			if (IsValidJsonNumber(tmp.data, tmp.len))
-				appendBinaryStringInfo(&dst, tmp.data, tmp.len);
+			char	   *str = HSTORE_VAL(entries, base, i);
+			int			len = HSTORE_VALLEN(entries, i);
+
+			if (IsValidJsonNumber(str, len))
+				appendBinaryStringInfo(&dst, str, len);
 			else
-				escape_json(&dst, tmp.data);
+				escape_json_with_len(&dst, str, len);
 		}
 
 		if (i + 1 != count)
@@ -1397,32 +1395,28 @@ hstore_to_json(PG_FUNCTION_ARGS)
 	int			count = HS_COUNT(in);
 	char	   *base = STRPTR(in);
 	HEntry	   *entries = ARRPTR(in);
-	StringInfoData tmp,
-				dst;
+	StringInfoData dst;
 
 	if (count == 0)
 		PG_RETURN_TEXT_P(cstring_to_text_with_len("{}", 2));
 
-	initStringInfo(&tmp);
 	initStringInfo(&dst);
 
 	appendStringInfoChar(&dst, '{');
 
 	for (i = 0; i < count; i++)
 	{
-		resetStringInfo(&tmp);
-		appendBinaryStringInfo(&tmp, HSTORE_KEY(entries, base, i),
-							   HSTORE_KEYLEN(entries, i));
-		escape_json(&dst, tmp.data);
+		escape_json_with_len(&dst,
+							 HSTORE_KEY(entries, base, i),
+							 HSTORE_KEYLEN(entries, i));
 		appendStringInfoString(&dst, ": ");
 		if (HSTORE_VALISNULL(entries, i))
 			appendStringInfoString(&dst, "null");
 		else
 		{
-			resetStringInfo(&tmp);
-			appendBinaryStringInfo(&tmp, HSTORE_VAL(entries, base, i),
-								   HSTORE_VALLEN(entries, i));
-			escape_json(&dst, tmp.data);
+			escape_json_with_len(&dst,
+								 HSTORE_VAL(entries, base, i),
+								 HSTORE_VALLEN(entries, i));
 		}
 
 		if (i + 1 != count)

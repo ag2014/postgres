@@ -503,13 +503,11 @@ network_abbrev_abort(int memtupcount, SortSupport ssup)
 	 */
 	if (abbr_card > 100000.0)
 	{
-#ifdef TRACE_SORT
 		if (trace_sort)
 			elog(LOG,
 				 "network_abbrev: estimation ends at cardinality %f"
 				 " after " INT64_FORMAT " values (%d rows)",
 				 abbr_card, uss->input_count, memtupcount);
-#endif
 		uss->estimating = false;
 		return false;
 	}
@@ -522,23 +520,19 @@ network_abbrev_abort(int memtupcount, SortSupport ssup)
 	 */
 	if (abbr_card < uss->input_count / 2000.0 + 0.5)
 	{
-#ifdef TRACE_SORT
 		if (trace_sort)
 			elog(LOG,
 				 "network_abbrev: aborting abbreviation at cardinality %f"
 				 " below threshold %f after " INT64_FORMAT " values (%d rows)",
 				 abbr_card, uss->input_count / 2000.0 + 0.5, uss->input_count,
 				 memtupcount);
-#endif
 		return true;
 	}
 
-#ifdef TRACE_SORT
 	if (trace_sort)
 		elog(LOG,
 			 "network_abbrev: cardinality %f after " INT64_FORMAT
 			 " values (%d rows)", abbr_card, uss->input_count, memtupcount);
-#endif
 
 	return false;
 }
@@ -1866,7 +1860,7 @@ inetnot(PG_FUNCTION_ARGS)
 		unsigned char *pip = ip_addr(ip);
 		unsigned char *pdst = ip_addr(dst);
 
-		while (nb-- > 0)
+		while (--nb >= 0)
 			pdst[nb] = ~pip[nb];
 	}
 	ip_bits(dst) = ip_bits(ip);
@@ -1898,7 +1892,7 @@ inetand(PG_FUNCTION_ARGS)
 		unsigned char *pip2 = ip_addr(ip2);
 		unsigned char *pdst = ip_addr(dst);
 
-		while (nb-- > 0)
+		while (--nb >= 0)
 			pdst[nb] = pip[nb] & pip2[nb];
 	}
 	ip_bits(dst) = Max(ip_bits(ip), ip_bits(ip2));
@@ -1930,7 +1924,7 @@ inetor(PG_FUNCTION_ARGS)
 		unsigned char *pip2 = ip_addr(ip2);
 		unsigned char *pdst = ip_addr(dst);
 
-		while (nb-- > 0)
+		while (--nb >= 0)
 			pdst[nb] = pip[nb] | pip2[nb];
 	}
 	ip_bits(dst) = Max(ip_bits(ip), ip_bits(ip2));
@@ -1955,7 +1949,7 @@ internal_inetpl(inet *ip, int64 addend)
 		unsigned char *pdst = ip_addr(dst);
 		int			carry = 0;
 
-		while (nb-- > 0)
+		while (--nb >= 0)
 		{
 			carry = pip[nb] + (int) (addend & 0xFF) + carry;
 			pdst[nb] = (unsigned char) (carry & 0xFF);
@@ -2039,7 +2033,7 @@ inetmi(PG_FUNCTION_ARGS)
 		unsigned char *pip2 = ip_addr(ip2);
 		int			carry = 1;
 
-		while (nb-- > 0)
+		while (--nb >= 0)
 		{
 			int			lobyte;
 

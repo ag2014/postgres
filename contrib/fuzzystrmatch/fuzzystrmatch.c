@@ -6,7 +6,7 @@
  * Joe Conway <mail@joeconway.com>
  *
  * contrib/fuzzystrmatch/fuzzystrmatch.c
- * Copyright (c) 2001-2023, PostgreSQL Global Development Group
+ * Copyright (c) 2001-2024, PostgreSQL Global Development Group
  * ALL RIGHTS RESERVED;
  *
  * metaphone()
@@ -40,7 +40,6 @@
 
 #include <ctype.h>
 
-#include "mb/pg_wchar.h"
 #include "utils/builtins.h"
 #include "utils/varlena.h"
 #include "varatt.h"
@@ -55,7 +54,7 @@ static void _soundex(const char *instr, char *outstr);
 #define SOUNDEX_LEN 4
 
 /*									ABCDEFGHIJKLMNOPQRSTUVWXYZ */
-static const char *soundex_table = "01230120022455012623010202";
+static const char *const soundex_table = "01230120022455012623010202";
 
 static char
 soundex_code(char letter)
@@ -728,16 +727,14 @@ _soundex(const char *instr, char *outstr)
 	Assert(instr);
 	Assert(outstr);
 
-	outstr[SOUNDEX_LEN] = '\0';
-
 	/* Skip leading non-alphabetic characters */
-	while (!isalpha((unsigned char) instr[0]) && instr[0])
+	while (*instr && !isalpha((unsigned char) *instr))
 		++instr;
 
-	/* No string left */
-	if (!instr[0])
+	/* If no string left, return all-zeroes buffer */
+	if (!*instr)
 	{
-		outstr[0] = (char) 0;
+		memset(outstr, '\0', SOUNDEX_LEN + 1);
 		return;
 	}
 
@@ -750,7 +747,7 @@ _soundex(const char *instr, char *outstr)
 		if (isalpha((unsigned char) *instr) &&
 			soundex_code(*instr) != soundex_code(*(instr - 1)))
 		{
-			*outstr = soundex_code(instr[0]);
+			*outstr = soundex_code(*instr);
 			if (*outstr != '0')
 			{
 				++outstr;
@@ -767,6 +764,9 @@ _soundex(const char *instr, char *outstr)
 		++outstr;
 		++count;
 	}
+
+	/* And null-terminate */
+	*outstr = '\0';
 }
 
 PG_FUNCTION_INFO_V1(difference);

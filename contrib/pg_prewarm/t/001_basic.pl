@@ -1,8 +1,8 @@
 
-# Copyright (c) 2021-2023, PostgreSQL Global Development Group
+# Copyright (c) 2021-2024, PostgreSQL Global Development Group
 
 use strict;
-use warnings;
+use warnings FATAL => 'all';
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
@@ -21,7 +21,7 @@ $node->start;
 
 # setup
 $node->safe_psql("postgres",
-	    "CREATE EXTENSION pg_prewarm;\n"
+		"CREATE EXTENSION pg_prewarm;\n"
 	  . "CREATE TABLE test(c1 int);\n"
 	  . "INSERT INTO test SELECT generate_series(1, 100);");
 
@@ -54,5 +54,11 @@ $node->wait_for_log(
 );
 
 $node->stop;
+
+# control file should indicate normal shut down
+command_like(
+	[ 'pg_controldata', $node->data_dir() ],
+	qr/Database cluster state:\s*shut down/,
+	'cluster shut down normally');
 
 done_testing();

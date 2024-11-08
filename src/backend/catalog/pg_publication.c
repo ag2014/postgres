@@ -3,7 +3,7 @@
  * pg_publication.c
  *		publication C API manipulation
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,15 +18,12 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/tableam.h"
-#include "access/xact.h"
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
-#include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
-#include "catalog/partition.h"
-#include "catalog/objectaccess.h"
 #include "catalog/objectaddress.h"
+#include "catalog/partition.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_publication.h"
@@ -35,18 +32,21 @@
 #include "catalog/pg_type.h"
 #include "commands/publicationcmds.h"
 #include "funcapi.h"
-#include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
 #include "utils/fmgroids.h"
-#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
-static void publication_translate_columns(Relation targetrel, List *columns,
-										  int *natts, AttrNumber **attrs);
+/* Records association between publication and published table */
+typedef struct
+{
+	Oid			relid;			/* OID of published table */
+	Oid			pubid;			/* OID of publication that publishes this
+								 * table. */
+} published_rel;
 
 /*
  * Check if relation can be in given publication and throws appropriate
@@ -172,42 +172,57 @@ pg_relation_is_publishable(PG_FUNCTION_ARGS)
 }
 
 /*
- * Filter out the partitions whose parent tables were also specified in
- * the publication.
+ * Returns true if the ancestor is in the list of published relations.
+ * Otherwise, returns false.
  */
-static List *
-filter_partitions(List *relids)
+static bool
+is_ancestor_member_tableinfos(Oid ancestor, List *table_infos)
 {
-	List	   *result = NIL;
 	ListCell   *lc;
-	ListCell   *lc2;
 
-	foreach(lc, relids)
+	foreach(lc, table_infos)
+	{
+		Oid			relid = ((published_rel *) lfirst(lc))->relid;
+
+		if (relid == ancestor)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * Filter out the partitions whose parent tables are also present in the list.
+ */
+static void
+filter_partitions(List *table_infos)
+{
+	ListCell   *lc;
+
+	foreach(lc, table_infos)
 	{
 		bool		skip = false;
 		List	   *ancestors = NIL;
-		Oid			relid = lfirst_oid(lc);
+		ListCell   *lc2;
+		published_rel *table_info = (published_rel *) lfirst(lc);
 
-		if (get_rel_relispartition(relid))
-			ancestors = get_partition_ancestors(relid);
+		if (get_rel_relispartition(table_info->relid))
+			ancestors = get_partition_ancestors(table_info->relid);
 
 		foreach(lc2, ancestors)
 		{
 			Oid			ancestor = lfirst_oid(lc2);
 
-			/* Check if the parent table exists in the published table list. */
-			if (list_member_oid(relids, ancestor))
+			if (is_ancestor_member_tableinfos(ancestor, table_infos))
 			{
 				skip = true;
 				break;
 			}
 		}
 
-		if (!skip)
-			result = lappend_oid(result, relid);
+		if (skip)
+			table_infos = foreach_delete_current(table_infos, lc);
 	}
-
-	return result;
 }
 
 /*
@@ -239,6 +254,52 @@ is_schema_publication(Oid pubid)
 	table_close(pubschsrel, AccessShareLock);
 
 	return result;
+}
+
+/*
+ * Returns true if the relation has column list associated with the
+ * publication, false otherwise.
+ *
+ * If a column list is found, the corresponding bitmap is returned through the
+ * cols parameter, if provided. The bitmap is constructed within the given
+ * memory context (mcxt).
+ */
+bool
+check_and_fetch_column_list(Publication *pub, Oid relid, MemoryContext mcxt,
+							Bitmapset **cols)
+{
+	HeapTuple	cftuple;
+	bool		found = false;
+
+	if (pub->alltables)
+		return false;
+
+	cftuple = SearchSysCache2(PUBLICATIONRELMAP,
+							  ObjectIdGetDatum(relid),
+							  ObjectIdGetDatum(pub->oid));
+	if (HeapTupleIsValid(cftuple))
+	{
+		Datum		cfdatum;
+		bool		isnull;
+
+		/* Lookup the column list attribute. */
+		cfdatum = SysCacheGetAttr(PUBLICATIONRELMAP, cftuple,
+								  Anum_pg_publication_rel_prattrs, &isnull);
+
+		/* Was a column list found? */
+		if (!isnull)
+		{
+			/* Build the column list bitmap in the given memory context. */
+			if (cols)
+				*cols = pub_collist_to_bitmapset(*cols, cfdatum, mcxt);
+
+			found = true;
+		}
+
+		ReleaseSysCache(cftuple);
+	}
+
+	return found;
 }
 
 /*
@@ -334,6 +395,33 @@ GetTopMostAncestorInPublication(Oid puboid, List *ancestors, int *ancestor_level
 }
 
 /*
+ * attnumstoint2vector
+ *		Convert a Bitmapset of AttrNumbers into an int2vector.
+ *
+ * AttrNumber numbers are 0-based, i.e., not offset by
+ * FirstLowInvalidHeapAttributeNumber.
+ */
+static int2vector *
+attnumstoint2vector(Bitmapset *attrs)
+{
+	int2vector *result;
+	int			n = bms_num_members(attrs);
+	int			i = -1;
+	int			j = 0;
+
+	result = buildint2vector(NULL, n);
+
+	while ((i = bms_next_member(attrs, i)) >= 0)
+	{
+		Assert(i <= PG_INT16_MAX);
+
+		result->values[j++] = (int16) i;
+	}
+
+	return result;
+}
+
+/*
  * Insert new publication / relation mapping.
  */
 ObjectAddress
@@ -347,12 +435,12 @@ publication_add_relation(Oid pubid, PublicationRelInfo *pri,
 	Relation	targetrel = pri->relation;
 	Oid			relid = RelationGetRelid(targetrel);
 	Oid			pubreloid;
+	Bitmapset  *attnums;
 	Publication *pub = GetPublication(pubid);
-	AttrNumber *attarray = NULL;
-	int			natts = 0;
 	ObjectAddress myself,
 				referenced;
 	List	   *relids = NIL;
+	int			i;
 
 	rel = table_open(PublicationRelRelationId, RowExclusiveLock);
 
@@ -377,13 +465,8 @@ publication_add_relation(Oid pubid, PublicationRelInfo *pri,
 
 	check_publication_add_relation(targetrel);
 
-	/*
-	 * Translate column names to attnums and make sure the column list
-	 * contains only allowed elements (no system or generated columns etc.).
-	 * Also build an array of attnums, for storing in the catalog.
-	 */
-	publication_translate_columns(pri->relation, pri->columns,
-								  &natts, &attarray);
+	/* Validate and translate column names into a Bitmapset of attnums. */
+	attnums = pub_collist_validate(pri->relation, pri->columns);
 
 	/* Form a tuple. */
 	memset(values, 0, sizeof(values));
@@ -405,7 +488,7 @@ publication_add_relation(Oid pubid, PublicationRelInfo *pri,
 
 	/* Add column list, if available */
 	if (pri->columns)
-		values[Anum_pg_publication_rel_prattrs - 1] = PointerGetDatum(buildint2vector(attarray, natts));
+		values[Anum_pg_publication_rel_prattrs - 1] = PointerGetDatum(attnumstoint2vector(attnums));
 	else
 		nulls[Anum_pg_publication_rel_prattrs - 1] = true;
 
@@ -433,9 +516,10 @@ publication_add_relation(Oid pubid, PublicationRelInfo *pri,
 										false);
 
 	/* Add dependency on the columns, if any are listed */
-	for (int i = 0; i < natts; i++)
+	i = -1;
+	while ((i = bms_next_member(attnums, i)) >= 0)
 	{
-		ObjectAddressSubSet(referenced, RelationRelationId, relid, attarray[i]);
+		ObjectAddressSubSet(referenced, RelationRelationId, relid, i);
 		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 	}
 
@@ -458,47 +542,21 @@ publication_add_relation(Oid pubid, PublicationRelInfo *pri,
 	return myself;
 }
 
-/* qsort comparator for attnums */
-static int
-compare_int16(const void *a, const void *b)
-{
-	int			av = *(const int16 *) a;
-	int			bv = *(const int16 *) b;
-
-	/* this can't overflow if int is wider than int16 */
-	return (av - bv);
-}
-
 /*
- * Translate a list of column names to an array of attribute numbers
- * and a Bitmapset with them; verify that each attribute is appropriate
- * to have in a publication column list (no system or generated attributes,
- * no duplicates).  Additional checks with replica identity are done later;
- * see check_publication_columns.
+ * pub_collist_validate
+ *		Process and validate the 'columns' list and ensure the columns are all
+ *		valid to use for a publication.  Checks for and raises an ERROR for
+ * 		any unknown columns, system columns, or duplicate columns.
  *
- * Note that the attribute numbers are *not* offset by
- * FirstLowInvalidHeapAttributeNumber; system columns are forbidden so this
- * is okay.
+ * Looks up each column's attnum and returns a 0-based Bitmapset of the
+ * corresponding attnums.
  */
-static void
-publication_translate_columns(Relation targetrel, List *columns,
-							  int *natts, AttrNumber **attrs)
+Bitmapset *
+pub_collist_validate(Relation targetrel, List *columns)
 {
-	AttrNumber *attarray = NULL;
 	Bitmapset  *set = NULL;
 	ListCell   *lc;
-	int			n = 0;
-	TupleDesc	tupdesc = RelationGetDescr(targetrel);
 
-	/* Bail out when no column list defined. */
-	if (!columns)
-		return;
-
-	/*
-	 * Translate list of columns to attnums. We prohibit system attributes and
-	 * make sure there are no duplicate columns.
-	 */
-	attarray = palloc(sizeof(AttrNumber) * list_length(columns));
 	foreach(lc, columns)
 	{
 		char	   *colname = strVal(lfirst(lc));
@@ -516,12 +574,6 @@ publication_translate_columns(Relation targetrel, List *columns,
 					errmsg("cannot use system column \"%s\" in publication column list",
 						   colname));
 
-		if (TupleDescAttr(tupdesc, attnum - 1)->attgenerated)
-			ereport(ERROR,
-					errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-					errmsg("cannot use generated column \"%s\" in publication column list",
-						   colname));
-
 		if (bms_is_member(attnum, set))
 			ereport(ERROR,
 					errcode(ERRCODE_DUPLICATE_OBJECT),
@@ -529,16 +581,9 @@ publication_translate_columns(Relation targetrel, List *columns,
 						   colname));
 
 		set = bms_add_member(set, attnum);
-		attarray[n++] = attnum;
 	}
 
-	/* Be tidy, so that the catalog representation is always sorted */
-	qsort(attarray, n, sizeof(AttrNumber), compare_int16);
-
-	*natts = n;
-	*attrs = attarray;
-
-	bms_free(set);
+	return set;
 }
 
 /*
@@ -551,18 +596,11 @@ publication_translate_columns(Relation targetrel, List *columns,
 Bitmapset *
 pub_collist_to_bitmapset(Bitmapset *columns, Datum pubcols, MemoryContext mcxt)
 {
-	Bitmapset  *result = NULL;
+	Bitmapset  *result = columns;
 	ArrayType  *arr;
 	int			nelems;
 	int16	   *elems;
 	MemoryContext oldcxt = NULL;
-
-	/*
-	 * If an existing bitmap was provided, use it. Otherwise just use NULL and
-	 * build a new bitmap.
-	 */
-	if (columns)
-		result = columns;
 
 	arr = DatumGetArrayTypeP(pubcols);
 	nelems = ARR_DIMS(arr)[0];
@@ -577,6 +615,30 @@ pub_collist_to_bitmapset(Bitmapset *columns, Datum pubcols, MemoryContext mcxt)
 
 	if (mcxt)
 		MemoryContextSwitchTo(oldcxt);
+
+	return result;
+}
+
+/*
+ * Returns a bitmap representing the columns of the specified table.
+ *
+ * Generated columns are included if include_gencols is true.
+ */
+Bitmapset *
+pub_form_cols_map(Relation relation, bool include_gencols)
+{
+	Bitmapset  *result = NULL;
+	TupleDesc	desc = RelationGetDescr(relation);
+
+	for (int i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		if (att->attisdropped || (att->attgenerated && !include_gencols))
+			continue;
+
+		result = bms_add_member(result, att->attnum);
+	}
 
 	return result;
 }
@@ -1006,6 +1068,7 @@ GetPublication(Oid pubid)
 	pub->pubactions.pubdelete = pubform->pubdelete;
 	pub->pubactions.pubtruncate = pubform->pubtruncate;
 	pub->pubviaroot = pubform->pubviaroot;
+	pub->pubgencols = pubform->pubgencols;
 
 	ReleaseSysCache(tup);
 
@@ -1026,22 +1089,27 @@ GetPublicationByName(const char *pubname, bool missing_ok)
 }
 
 /*
- * Returns information of tables in a publication.
+ * Get information of the tables in the given publication array.
+ *
+ * Returns pubid, relid, column list, row filter for each table.
  */
 Datum
 pg_get_publication_tables(PG_FUNCTION_ARGS)
 {
-#define NUM_PUBLICATION_TABLES_ELEM	3
+#define NUM_PUBLICATION_TABLES_ELEM	4
 	FuncCallContext *funcctx;
-	char	   *pubname = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	Publication *publication;
-	List	   *tables;
+	List	   *table_infos = NIL;
 
 	/* stuff done only on the first call of the function */
 	if (SRF_IS_FIRSTCALL())
 	{
 		TupleDesc	tupdesc;
 		MemoryContext oldcontext;
+		ArrayType  *arr;
+		Datum	   *elems;
+		int			nelems,
+					i;
+		bool		viaroot = false;
 
 		/* create a function context for cross-call persistence */
 		funcctx = SRF_FIRSTCALL_INIT();
@@ -1049,68 +1117,107 @@ pg_get_publication_tables(PG_FUNCTION_ARGS)
 		/* switch to memory context appropriate for multiple function calls */
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		publication = GetPublicationByName(pubname, false);
-
 		/*
-		 * Publications support partitioned tables, although all changes are
-		 * replicated using leaf partition identity and schema, so we only
-		 * need those.
+		 * Deconstruct the parameter into elements where each element is a
+		 * publication name.
 		 */
-		if (publication->alltables)
-		{
-			tables = GetAllTablesPublicationRelations(publication->pubviaroot);
-		}
-		else
-		{
-			List	   *relids,
-					   *schemarelids;
+		arr = PG_GETARG_ARRAYTYPE_P(0);
+		deconstruct_array_builtin(arr, TEXTOID, &elems, NULL, &nelems);
 
-			relids = GetPublicationRelations(publication->oid,
-											 publication->pubviaroot ?
-											 PUBLICATION_PART_ROOT :
-											 PUBLICATION_PART_LEAF);
-			schemarelids = GetAllSchemaPublicationRelations(publication->oid,
-															publication->pubviaroot ?
-															PUBLICATION_PART_ROOT :
-															PUBLICATION_PART_LEAF);
-			tables = list_concat_unique_oid(relids, schemarelids);
+		/* Get Oids of tables from each publication. */
+		for (i = 0; i < nelems; i++)
+		{
+			Publication *pub_elem;
+			List	   *pub_elem_tables = NIL;
+			ListCell   *lc;
+
+			pub_elem = GetPublicationByName(TextDatumGetCString(elems[i]), false);
 
 			/*
-			 * If the publication publishes partition changes via their
-			 * respective root partitioned tables, we must exclude partitions
-			 * in favor of including the root partitioned tables. Otherwise,
-			 * the function could return both the child and parent tables
-			 * which could cause data of the child table to be
-			 * double-published on the subscriber side.
+			 * Publications support partitioned tables. If
+			 * publish_via_partition_root is false, all changes are replicated
+			 * using leaf partition identity and schema, so we only need
+			 * those. Otherwise, get the partitioned table itself.
 			 */
-			if (publication->pubviaroot)
-				tables = filter_partitions(tables);
+			if (pub_elem->alltables)
+				pub_elem_tables = GetAllTablesPublicationRelations(pub_elem->pubviaroot);
+			else
+			{
+				List	   *relids,
+						   *schemarelids;
+
+				relids = GetPublicationRelations(pub_elem->oid,
+												 pub_elem->pubviaroot ?
+												 PUBLICATION_PART_ROOT :
+												 PUBLICATION_PART_LEAF);
+				schemarelids = GetAllSchemaPublicationRelations(pub_elem->oid,
+																pub_elem->pubviaroot ?
+																PUBLICATION_PART_ROOT :
+																PUBLICATION_PART_LEAF);
+				pub_elem_tables = list_concat_unique_oid(relids, schemarelids);
+			}
+
+			/*
+			 * Record the published table and the corresponding publication so
+			 * that we can get row filters and column lists later.
+			 *
+			 * When a table is published by multiple publications, to obtain
+			 * all row filters and column lists, the structure related to this
+			 * table will be recorded multiple times.
+			 */
+			foreach(lc, pub_elem_tables)
+			{
+				published_rel *table_info = (published_rel *) palloc(sizeof(published_rel));
+
+				table_info->relid = lfirst_oid(lc);
+				table_info->pubid = pub_elem->oid;
+				table_infos = lappend(table_infos, table_info);
+			}
+
+			/* At least one publication is using publish_via_partition_root. */
+			if (pub_elem->pubviaroot)
+				viaroot = true;
 		}
+
+		/*
+		 * If the publication publishes partition changes via their respective
+		 * root partitioned tables, we must exclude partitions in favor of
+		 * including the root partitioned tables. Otherwise, the function
+		 * could return both the child and parent tables which could cause
+		 * data of the child table to be double-published on the subscriber
+		 * side.
+		 */
+		if (viaroot)
+			filter_partitions(table_infos);
 
 		/* Construct a tuple descriptor for the result rows. */
 		tupdesc = CreateTemplateTupleDesc(NUM_PUBLICATION_TABLES_ELEM);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "relid",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "pubid",
 						   OIDOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "attrs",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "relid",
+						   OIDOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "attrs",
 						   INT2VECTOROID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "qual",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "qual",
 						   PG_NODE_TREEOID, -1, 0);
 
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
-		funcctx->user_fctx = (void *) tables;
+		funcctx->user_fctx = (void *) table_infos;
 
 		MemoryContextSwitchTo(oldcontext);
 	}
 
 	/* stuff done on every call of the function */
 	funcctx = SRF_PERCALL_SETUP();
-	tables = (List *) funcctx->user_fctx;
+	table_infos = (List *) funcctx->user_fctx;
 
-	if (funcctx->call_cntr < list_length(tables))
+	if (funcctx->call_cntr < list_length(table_infos))
 	{
 		HeapTuple	pubtuple = NULL;
 		HeapTuple	rettuple;
-		Oid			relid = list_nth_oid(tables, funcctx->call_cntr);
+		Publication *pub;
+		published_rel *table_info = (published_rel *) list_nth(table_infos, funcctx->call_cntr);
+		Oid			relid = table_info->relid;
 		Oid			schemaid = get_rel_namespace(relid);
 		Datum		values[NUM_PUBLICATION_TABLES_ELEM] = {0};
 		bool		nulls[NUM_PUBLICATION_TABLES_ELEM] = {0};
@@ -1119,42 +1226,43 @@ pg_get_publication_tables(PG_FUNCTION_ARGS)
 		 * Form tuple with appropriate data.
 		 */
 
-		publication = GetPublicationByName(pubname, false);
+		pub = GetPublication(table_info->pubid);
 
-		values[0] = ObjectIdGetDatum(relid);
+		values[0] = ObjectIdGetDatum(pub->oid);
+		values[1] = ObjectIdGetDatum(relid);
 
 		/*
 		 * We don't consider row filters or column lists for FOR ALL TABLES or
 		 * FOR TABLES IN SCHEMA publications.
 		 */
-		if (!publication->alltables &&
+		if (!pub->alltables &&
 			!SearchSysCacheExists2(PUBLICATIONNAMESPACEMAP,
 								   ObjectIdGetDatum(schemaid),
-								   ObjectIdGetDatum(publication->oid)))
+								   ObjectIdGetDatum(pub->oid)))
 			pubtuple = SearchSysCacheCopy2(PUBLICATIONRELMAP,
 										   ObjectIdGetDatum(relid),
-										   ObjectIdGetDatum(publication->oid));
+										   ObjectIdGetDatum(pub->oid));
 
 		if (HeapTupleIsValid(pubtuple))
 		{
 			/* Lookup the column list attribute. */
-			values[1] = SysCacheGetAttr(PUBLICATIONRELMAP, pubtuple,
+			values[2] = SysCacheGetAttr(PUBLICATIONRELMAP, pubtuple,
 										Anum_pg_publication_rel_prattrs,
-										&(nulls[1]));
+										&(nulls[2]));
 
 			/* Null indicates no filter. */
-			values[2] = SysCacheGetAttr(PUBLICATIONRELMAP, pubtuple,
+			values[3] = SysCacheGetAttr(PUBLICATIONRELMAP, pubtuple,
 										Anum_pg_publication_rel_prqual,
-										&(nulls[2]));
+										&(nulls[3]));
 		}
 		else
 		{
-			nulls[1] = true;
 			nulls[2] = true;
+			nulls[3] = true;
 		}
 
 		/* Show all columns when the column list is not specified. */
-		if (nulls[1] == true)
+		if (nulls[2])
 		{
 			Relation	rel = table_open(relid, AccessShareLock);
 			int			nattnums = 0;
@@ -1168,7 +1276,7 @@ pg_get_publication_tables(PG_FUNCTION_ARGS)
 			{
 				Form_pg_attribute att = TupleDescAttr(desc, i);
 
-				if (att->attisdropped || att->attgenerated)
+				if (att->attisdropped || (att->attgenerated && !pub->pubgencols))
 					continue;
 
 				attnums[nattnums++] = att->attnum;
@@ -1176,8 +1284,8 @@ pg_get_publication_tables(PG_FUNCTION_ARGS)
 
 			if (nattnums > 0)
 			{
-				values[1] = PointerGetDatum(buildint2vector(attnums, nattnums));
-				nulls[1] = false;
+				values[2] = PointerGetDatum(buildint2vector(attnums, nattnums));
+				nulls[2] = false;
 			}
 
 			table_close(rel, AccessShareLock);

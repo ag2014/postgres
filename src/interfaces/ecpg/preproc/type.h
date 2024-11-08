@@ -35,8 +35,8 @@ struct ECPGtype
 /* Everything is malloced. */
 void		ECPGmake_struct_member(const char *name, struct ECPGtype *type,
 								   struct ECPGstruct_member **start);
-struct ECPGtype *ECPGmake_simple_type(enum ECPGttype type, char *size, int counter);
-struct ECPGtype *ECPGmake_array_type(struct ECPGtype *type, char *size);
+struct ECPGtype *ECPGmake_simple_type(enum ECPGttype type, const char *size, int counter);
+struct ECPGtype *ECPGmake_array_type(struct ECPGtype *type, const char *size);
 struct ECPGtype *ECPGmake_struct_type(struct ECPGstruct_member *rm,
 									  enum ECPGttype type, char *type_name,
 									  char *struct_sizeof);
@@ -93,28 +93,28 @@ struct when
 
 struct index
 {
-	char	   *index1;
-	char	   *index2;
-	char	   *str;
+	const char *index1;
+	const char *index2;
+	const char *str;
 };
 
 struct su_symbol
 {
-	char	   *su;
-	char	   *symbol;
+	const char *su;
+	const char *symbol;
 };
 
 struct prep
 {
-	char	   *name;
-	char	   *stmt;
-	char	   *type;
+	const char *name;
+	const char *stmt;
+	const char *type;
 };
 
 struct exec
 {
-	char	   *name;
-	char	   *type;
+	const char *name;
+	const char *type;
 };
 
 struct this_type
@@ -163,13 +163,25 @@ struct typedefs
 	struct typedefs *next;
 };
 
+/*
+ * Info about a defined symbol (macro), coming from a -D command line switch
+ * or a define command in the program.  These are stored in a simple list.
+ * Because ecpg supports compiling multiple files per run, we have to remember
+ * the command-line definitions and be able to revert to those; this motivates
+ * storing cmdvalue separately from value.
+ * name and value are separately-malloc'd strings; cmdvalue typically isn't.
+ * used is NULL unless we are currently expanding the macro, in which case
+ * it points to the buffer before the one scanning the macro; we reset it
+ * to NULL upon returning to that buffer.  This is used to prevent recursive
+ * expansion of the macro.
+ */
 struct _defines
 {
-	char	   *olddef;
-	char	   *newdef;
-	int			pertinent;
-	void	   *used;
-	struct _defines *next;
+	char	   *name;			/* symbol's name */
+	char	   *value;			/* current value, or NULL if undefined */
+	const char *cmdvalue;		/* value set on command line, or NULL */
+	void	   *used;			/* buffer pointer, or NULL */
+	struct _defines *next;		/* list link */
 };
 
 /* This is a linked list of the variable names and types. */
@@ -209,14 +221,14 @@ enum errortype
 
 struct fetch_desc
 {
-	char	   *str;
-	char	   *name;
+	const char *str;
+	const char *name;
 };
 
 struct describe
 {
 	int			input;
-	char	   *stmt_name;
+	const char *stmt_name;
 };
 
 #endif							/* _ECPG_PREPROC_TYPE_H */

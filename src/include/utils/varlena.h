@@ -3,7 +3,7 @@
  * varlena.h
  *	  Functions for the variable-length built-in types.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/varlena.h
@@ -44,7 +44,7 @@ typedef struct ClosestMatchState
 	int			min_d;
 	int			max_d;
 	const char *match;
-}			ClosestMatchState;
+} ClosestMatchState;
 
 extern void initClosestMatch(ClosestMatchState *state, const char *source, int max_d);
 extern void updateClosestMatch(ClosestMatchState *state, const char *candidate);

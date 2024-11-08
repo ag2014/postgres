@@ -9,7 +9,7 @@
  * proper FooMain() routine for the incarnation.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -32,9 +32,7 @@
 
 #include "bootstrap/bootstrap.h"
 #include "common/username.h"
-#include "port/atomics.h"
 #include "postmaster/postmaster.h"
-#include "storage/spin.h"
 #include "tcop/tcopprot.h"
 #include "utils/help_config.h"
 #include "utils/memutils.h"
@@ -137,8 +135,6 @@ main(int argc, char *argv[])
 	 */
 	unsetenv("LC_ALL");
 
-	check_strxfrm_bug();
-
 	/*
 	 * Catch standard options before doing much else, in particular before we
 	 * insist on not being root.
@@ -188,7 +184,7 @@ main(int argc, char *argv[])
 	else if (argc > 1 && strcmp(argv[1], "--boot") == 0)
 		BootstrapModeMain(argc, argv, false);
 #ifdef EXEC_BACKEND
-	else if (argc > 1 && strncmp(argv[1], "--fork", 6) == 0)
+	else if (argc > 1 && strncmp(argv[1], "--forkchild", 11) == 0)
 		SubPostmasterMain(argc, argv);
 #endif
 	else if (argc > 1 && strcmp(argv[1], "--describe-config") == 0)
@@ -290,12 +286,6 @@ startup_hacks(const char *progname)
 		_CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
 	}
 #endif							/* WIN32 */
-
-	/*
-	 * Initialize dummy_spinlock, in case we are on a platform where we have
-	 * to use the fallback implementation of pg_memory_barrier().
-	 */
-	SpinLockInit(&dummy_spinlock);
 }
 
 
@@ -339,7 +329,7 @@ help(const char *progname)
 	printf(_("  -e                 use European date input format (DMY)\n"));
 	printf(_("  -F                 turn fsync off\n"));
 	printf(_("  -h HOSTNAME        host name or IP address to listen on\n"));
-	printf(_("  -i                 enable TCP/IP connections\n"));
+	printf(_("  -i                 enable TCP/IP connections (deprecated)\n"));
 	printf(_("  -k DIRECTORY       Unix-domain socket location\n"));
 #ifdef USE_SSL
 	printf(_("  -l                 enable SSL connections\n"));

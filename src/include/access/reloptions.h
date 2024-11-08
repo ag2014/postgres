@@ -9,7 +9,7 @@
  * into a lot of low-level code.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/reloptions.h
@@ -32,7 +32,7 @@ typedef enum relopt_type
 	RELOPT_TYPE_INT,
 	RELOPT_TYPE_REAL,
 	RELOPT_TYPE_ENUM,
-	RELOPT_TYPE_STRING
+	RELOPT_TYPE_STRING,
 } relopt_type;
 
 /* kinds supported by reloptions */
@@ -220,7 +220,7 @@ extern void add_local_string_reloption(local_relopts *relopts, const char *name,
 									   fill_string_relopt filler, int offset);
 
 extern Datum transformRelOptions(Datum oldOptions, List *defList,
-								 const char *namspace, char *validnsps[],
+								 const char *namspace, const char *const validnsps[],
 								 bool acceptOidsOff, bool isReset);
 extern List *untransformRelOptions(Datum options);
 extern bytea *extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,

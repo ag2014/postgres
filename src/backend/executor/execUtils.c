@@ -3,7 +3,7 @@
  * execUtils.c
  *	  miscellaneous executor utility routines
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -46,18 +46,13 @@
 #include "postgres.h"
 
 #include "access/parallel.h"
-#include "access/relscan.h"
 #include "access/table.h"
 #include "access/tableam.h"
-#include "access/transam.h"
 #include "executor/executor.h"
-#include "executor/execPartition.h"
 #include "executor/nodeModifyTable.h"
 #include "jit/jit.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "nodes/nodeFuncs.h"
-#include "parser/parsetree.h"
 #include "parser/parse_relation.h"
 #include "partitioning/partdesc.h"
 #include "storage/lmgr.h"
@@ -121,8 +116,8 @@ CreateExecutorState(void)
 	estate->es_range_table_size = 0;
 	estate->es_relations = NULL;
 	estate->es_rowmarks = NULL;
+	estate->es_rteperminfos = NIL;
 	estate->es_plannedstmt = NULL;
-	estate->es_part_prune_infos = NIL;
 
 	estate->es_junkFilter = NULL;
 
@@ -146,6 +141,7 @@ CreateExecutorState(void)
 	estate->es_tupleTable = NIL;
 
 	estate->es_processed = 0;
+	estate->es_total_processed = 0;
 
 	estate->es_top_eflags = 0;
 	estate->es_instrument = 0;
@@ -162,6 +158,8 @@ CreateExecutorState(void)
 	estate->es_sourceText = NULL;
 
 	estate->es_use_parallel_mode = false;
+	estate->es_parallel_workers_to_launch = 0;
+	estate->es_parallel_workers_launched = 0;
 
 	estate->es_jit_flags = 0;
 	estate->es_jit = NULL;
@@ -637,32 +635,6 @@ tlist_matches_tupdesc(PlanState *ps, List *tlist, int varno, TupleDesc tupdesc)
 	return true;
 }
 
-/* ----------------
- *		ExecFreeExprContext
- *
- * A plan node's ExprContext should be freed explicitly during executor
- * shutdown because there may be shutdown callbacks to call.  (Other resources
- * made by the above routines, such as projection info, don't need to be freed
- * explicitly because they're just memory in the per-query memory context.)
- *
- * However ... there is no particular need to do it during ExecEndNode,
- * because FreeExecutorState will free any remaining ExprContexts within
- * the EState.  Letting FreeExecutorState do it allows the ExprContexts to
- * be freed in reverse order of creation, rather than order of creation as
- * will happen if we delete them here, which saves O(N^2) work in the list
- * cleanup inside FreeExprContext.
- * ----------------
- */
-void
-ExecFreeExprContext(PlanState *planstate)
-{
-	/*
-	 * Per above discussion, don't actually delete the ExprContext. We do
-	 * unlink it from the plan node, though.
-	 */
-	planstate->ps_ExprContext = NULL;
-}
-
 
 /* ----------------------------------------------------------------
  *				  Scan node support
@@ -755,10 +727,13 @@ ExecOpenScanRelation(EState *estate, Index scanrelid, int eflags)
  * indexed by rangetable index.
  */
 void
-ExecInitRangeTable(EState *estate, List *rangeTable)
+ExecInitRangeTable(EState *estate, List *rangeTable, List *permInfos)
 {
 	/* Remember the range table List as-is */
 	estate->es_range_table = rangeTable;
+
+	/* ... and the RTEPermissionInfo List too */
+	estate->es_rteperminfos = permInfos;
 
 	/* Set size of associated arrays */
 	estate->es_range_table_size = list_length(rangeTable);
@@ -783,7 +758,7 @@ ExecInitRangeTable(EState *estate, List *rangeTable)
  * ExecGetRangeTableRelation
  *		Open the Relation for a range table entry, if not already done
  *
- * The Relations will be closed again in ExecEndPlan().
+ * The Relations will be closed in ExecEndPlan().
  */
 Relation
 ExecGetRangeTableRelation(EState *estate, Index rti)
@@ -877,15 +852,7 @@ UpdateChangedParamSet(PlanState *node, Bitmapset *newchg)
 	 * include anything else into its chgParam set.
 	 */
 	parmset = bms_intersect(node->plan->allParam, newchg);
-
-	/*
-	 * Keep node->chgParam == NULL if there's not actually any members; this
-	 * allows the simplest possible tests in executor node files.
-	 */
-	if (!bms_is_empty(parmset))
-		node->chgParam = bms_join(node->chgParam, parmset);
-	else
-		bms_free(parmset);
+	node->chgParam = bms_join(node->chgParam, parmset);
 }
 
 /*
@@ -1343,18 +1310,32 @@ ExecGetUpdatedCols(ResultRelInfo *relinfo, EState *estate)
 Bitmapset *
 ExecGetExtraUpdatedCols(ResultRelInfo *relinfo, EState *estate)
 {
-	/* In some code paths we can reach here before initializing the info */
-	if (relinfo->ri_GeneratedExprs == NULL)
+	/* Compute the info if we didn't already */
+	if (relinfo->ri_GeneratedExprsU == NULL)
 		ExecInitStoredGenerated(relinfo, estate, CMD_UPDATE);
 	return relinfo->ri_extraUpdatedCols;
 }
 
-/* Return columns being updated, including generated columns */
+/*
+ * Return columns being updated, including generated columns
+ *
+ * The bitmap is allocated in per-tuple memory context. It's up to the caller to
+ * copy it into a different context with the appropriate lifespan, if needed.
+ */
 Bitmapset *
 ExecGetAllUpdatedCols(ResultRelInfo *relinfo, EState *estate)
 {
-	return bms_union(ExecGetUpdatedCols(relinfo, estate),
-					 ExecGetExtraUpdatedCols(relinfo, estate));
+	Bitmapset  *ret;
+	MemoryContext oldcxt;
+
+	oldcxt = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+
+	ret = bms_union(ExecGetUpdatedCols(relinfo, estate),
+					ExecGetExtraUpdatedCols(relinfo, estate));
+
+	MemoryContextSwitchTo(oldcxt);
+
+	return ret;
 }
 
 /*
@@ -1406,7 +1387,7 @@ GetResultRTEPermissionInfo(ResultRelInfo *relinfo, EState *estate)
 }
 
 /*
- * GetResultRelCheckAsUser
+ * ExecGetResultRelCheckAsUser
  *		Returns the user to modify passed-in result relation as
  *
  * The user is chosen by looking up the relation's or, if a child table, its

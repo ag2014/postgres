@@ -3,7 +3,7 @@
  * execReplication.c
  *	  miscellaneous executor routines for logical replication
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,95 +19,197 @@
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "catalog/pg_am_d.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/nodeModifyTable.h"
-#include "nodes/nodeFuncs.h"
-#include "parser/parse_relation.h"
-#include "parser/parsetree.h"
-#include "storage/bufmgr.h"
+#include "replication/conflict.h"
+#include "replication/logicalrelation.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
-#include "utils/datum.h"
 #include "utils/lsyscache.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
 
+static bool tuples_equal(TupleTableSlot *slot1, TupleTableSlot *slot2,
+						 TypeCacheEntry **eq);
+
+/*
+ * Returns the fixed strategy number, if any, of the equality operator for the
+ * given index access method, otherwise, InvalidStrategy.
+ *
+ * Currently, only Btree and Hash indexes are supported. The other index access
+ * methods don't have a fixed strategy for equality operation - instead, the
+ * support routines of each operator class interpret the strategy numbers
+ * according to the operator class's definition.
+ */
+StrategyNumber
+get_equal_strategy_number_for_am(Oid am)
+{
+	int			ret;
+
+	switch (am)
+	{
+		case BTREE_AM_OID:
+			ret = BTEqualStrategyNumber;
+			break;
+		case HASH_AM_OID:
+			ret = HTEqualStrategyNumber;
+			break;
+		default:
+			/* XXX: Only Btree and Hash indexes are supported */
+			ret = InvalidStrategy;
+			break;
+	}
+
+	return ret;
+}
+
+/*
+ * Return the appropriate strategy number which corresponds to the equality
+ * operator.
+ */
+static StrategyNumber
+get_equal_strategy_number(Oid opclass)
+{
+	Oid			am = get_opclass_method(opclass);
+
+	return get_equal_strategy_number_for_am(am);
+}
+
 /*
  * Setup a ScanKey for a search in the relation 'rel' for a tuple 'key' that
  * is setup to match 'rel' (*NOT* idxrel!).
  *
- * Returns whether any column contains NULLs.
+ * Returns how many columns to use for the index scan.
  *
- * This is not generic routine, it expects the idxrel to be replication
- * identity of a rel and meet all limitations associated with that.
+ * This is not generic routine, idxrel must be PK, RI, or an index that can be
+ * used for REPLICA IDENTITY FULL table. See FindUsableIndexForReplicaIdentityFull()
+ * for details.
+ *
+ * By definition, replication identity of a rel meets all limitations associated
+ * with that. Note that any other index could also meet these limitations.
  */
-static bool
+static int
 build_replindex_scan_key(ScanKey skey, Relation rel, Relation idxrel,
 						 TupleTableSlot *searchslot)
 {
-	int			attoff;
-	bool		isnull;
+	int			index_attoff;
+	int			skey_attoff = 0;
 	Datum		indclassDatum;
 	oidvector  *opclass;
 	int2vector *indkey = &idxrel->rd_index->indkey;
-	bool		hasnulls = false;
 
-	Assert(RelationGetReplicaIndex(rel) == RelationGetRelid(idxrel) ||
-		   RelationGetPrimaryKeyIndex(rel) == RelationGetRelid(idxrel));
-
-	indclassDatum = SysCacheGetAttr(INDEXRELID, idxrel->rd_indextuple,
-									Anum_pg_index_indclass, &isnull);
-	Assert(!isnull);
+	indclassDatum = SysCacheGetAttrNotNull(INDEXRELID, idxrel->rd_indextuple,
+										   Anum_pg_index_indclass);
 	opclass = (oidvector *) DatumGetPointer(indclassDatum);
 
-	/* Build scankey for every attribute in the index. */
-	for (attoff = 0; attoff < IndexRelationGetNumberOfKeyAttributes(idxrel); attoff++)
+	/* Build scankey for every non-expression attribute in the index. */
+	for (index_attoff = 0; index_attoff < IndexRelationGetNumberOfKeyAttributes(idxrel);
+		 index_attoff++)
 	{
 		Oid			operator;
+		Oid			optype;
 		Oid			opfamily;
 		RegProcedure regop;
-		int			pkattno = attoff + 1;
-		int			mainattno = indkey->values[attoff];
-		Oid			optype = get_opclass_input_type(opclass->values[attoff]);
+		int			table_attno = indkey->values[index_attoff];
+		StrategyNumber eq_strategy;
+
+		if (!AttributeNumberIsValid(table_attno))
+		{
+			/*
+			 * XXX: Currently, we don't support expressions in the scan key,
+			 * see code below.
+			 */
+			continue;
+		}
 
 		/*
 		 * Load the operator info.  We need this to get the equality operator
 		 * function for the scan key.
 		 */
-		opfamily = get_opclass_family(opclass->values[attoff]);
+		optype = get_opclass_input_type(opclass->values[index_attoff]);
+		opfamily = get_opclass_family(opclass->values[index_attoff]);
+		eq_strategy = get_equal_strategy_number(opclass->values[index_attoff]);
 
 		operator = get_opfamily_member(opfamily, optype,
 									   optype,
-									   BTEqualStrategyNumber);
+									   eq_strategy);
+
 		if (!OidIsValid(operator))
 			elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
-				 BTEqualStrategyNumber, optype, optype, opfamily);
+				 eq_strategy, optype, optype, opfamily);
 
 		regop = get_opcode(operator);
 
 		/* Initialize the scankey. */
-		ScanKeyInit(&skey[attoff],
-					pkattno,
-					BTEqualStrategyNumber,
+		ScanKeyInit(&skey[skey_attoff],
+					index_attoff + 1,
+					eq_strategy,
 					regop,
-					searchslot->tts_values[mainattno - 1]);
+					searchslot->tts_values[table_attno - 1]);
 
-		skey[attoff].sk_collation = idxrel->rd_indcollation[attoff];
+		skey[skey_attoff].sk_collation = idxrel->rd_indcollation[index_attoff];
 
 		/* Check for null value. */
-		if (searchslot->tts_isnull[mainattno - 1])
-		{
-			hasnulls = true;
-			skey[attoff].sk_flags |= SK_ISNULL;
-		}
+		if (searchslot->tts_isnull[table_attno - 1])
+			skey[skey_attoff].sk_flags |= (SK_ISNULL | SK_SEARCHNULL);
+
+		skey_attoff++;
 	}
 
-	return hasnulls;
+	/* There must always be at least one attribute for the index scan. */
+	Assert(skey_attoff > 0);
+
+	return skey_attoff;
+}
+
+
+/*
+ * Helper function to check if it is necessary to re-fetch and lock the tuple
+ * due to concurrent modifications. This function should be called after
+ * invoking table_tuple_lock.
+ */
+static bool
+should_refetch_tuple(TM_Result res, TM_FailureData *tmfd)
+{
+	bool		refetch = false;
+
+	switch (res)
+	{
+		case TM_Ok:
+			break;
+		case TM_Updated:
+			/* XXX: Improve handling here */
+			if (ItemPointerIndicatesMovedPartitions(&tmfd->ctid))
+				ereport(LOG,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("tuple to be locked was already moved to another partition due to concurrent update, retrying")));
+			else
+				ereport(LOG,
+						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+						 errmsg("concurrent update, retrying")));
+			refetch = true;
+			break;
+		case TM_Deleted:
+			/* XXX: Improve handling here */
+			ereport(LOG,
+					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+					 errmsg("concurrent delete, retrying")));
+			refetch = true;
+			break;
+		case TM_Invisible:
+			elog(ERROR, "attempted to lock invisible tuple");
+			break;
+		default:
+			elog(ERROR, "unexpected table_tuple_lock status: %u", res);
+			break;
+	}
+
+	return refetch;
 }
 
 /*
@@ -123,33 +225,49 @@ RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
 							 TupleTableSlot *outslot)
 {
 	ScanKeyData skey[INDEX_MAX_KEYS];
+	int			skey_attoff;
 	IndexScanDesc scan;
 	SnapshotData snap;
 	TransactionId xwait;
 	Relation	idxrel;
 	bool		found;
+	TypeCacheEntry **eq = NULL;
+	bool		isIdxSafeToSkipDuplicates;
 
 	/* Open the index. */
 	idxrel = index_open(idxoid, RowExclusiveLock);
 
-	/* Start an index scan. */
+	isIdxSafeToSkipDuplicates = (GetRelationIdentityOrPK(rel) == idxoid);
+
 	InitDirtySnapshot(snap);
-	scan = index_beginscan(rel, idxrel, &snap,
-						   IndexRelationGetNumberOfKeyAttributes(idxrel),
-						   0);
 
 	/* Build scan key. */
-	build_replindex_scan_key(skey, rel, idxrel, searchslot);
+	skey_attoff = build_replindex_scan_key(skey, rel, idxrel, searchslot);
+
+	/* Start an index scan. */
+	scan = index_beginscan(rel, idxrel, &snap, skey_attoff, 0);
 
 retry:
 	found = false;
 
-	index_rescan(scan, skey, IndexRelationGetNumberOfKeyAttributes(idxrel), NULL, 0);
+	index_rescan(scan, skey, skey_attoff, NULL, 0);
 
 	/* Try to find the tuple */
-	if (index_getnext_slot(scan, ForwardScanDirection, outslot))
+	while (index_getnext_slot(scan, ForwardScanDirection, outslot))
 	{
-		found = true;
+		/*
+		 * Avoid expensive equality check if the index is primary key or
+		 * replica identity index.
+		 */
+		if (!isIdxSafeToSkipDuplicates)
+		{
+			if (eq == NULL)
+				eq = palloc0(sizeof(*eq) * outslot->tts_tupleDescriptor->natts);
+
+			if (!tuples_equal(outslot, searchslot, eq))
+				continue;
+		}
+
 		ExecMaterializeSlot(outslot);
 
 		xwait = TransactionIdIsValid(snap.xmin) ?
@@ -164,6 +282,10 @@ retry:
 			XactLockTableWait(xwait, NULL, NULL, XLTW_None);
 			goto retry;
 		}
+
+		/* Found our tuple and it's not locked */
+		found = true;
+		break;
 	}
 
 	/* Found tuple, try to lock it in the lockmode. */
@@ -184,34 +306,8 @@ retry:
 
 		PopActiveSnapshot();
 
-		switch (res)
-		{
-			case TM_Ok:
-				break;
-			case TM_Updated:
-				/* XXX: Improve handling here */
-				if (ItemPointerIndicatesMovedPartitions(&tmfd.ctid))
-					ereport(LOG,
-							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-							 errmsg("tuple to be locked was already moved to another partition due to concurrent update, retrying")));
-				else
-					ereport(LOG,
-							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-							 errmsg("concurrent update, retrying")));
-				goto retry;
-			case TM_Deleted:
-				/* XXX: Improve handling here */
-				ereport(LOG,
-						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-						 errmsg("concurrent delete, retrying")));
-				goto retry;
-			case TM_Invisible:
-				elog(ERROR, "attempted to lock invisible tuple");
-				break;
-			default:
-				elog(ERROR, "unexpected table_tuple_lock status: %u", res);
-				break;
-		}
+		if (should_refetch_tuple(res, &tmfd))
+			goto retry;
 	}
 
 	index_endscan(scan);
@@ -243,6 +339,15 @@ tuples_equal(TupleTableSlot *slot1, TupleTableSlot *slot2,
 		Form_pg_attribute att;
 		TypeCacheEntry *typentry;
 
+		att = TupleDescAttr(slot1->tts_tupleDescriptor, attrnum);
+
+		/*
+		 * Ignore dropped and generated columns as the publisher doesn't send
+		 * those
+		 */
+		if (att->attisdropped || att->attgenerated)
+			continue;
+
 		/*
 		 * If one value is NULL and other is not, then they are certainly not
 		 * equal
@@ -255,8 +360,6 @@ tuples_equal(TupleTableSlot *slot1, TupleTableSlot *slot2,
 		 */
 		if (slot1->tts_isnull[attrnum] || slot2->tts_isnull[attrnum])
 			continue;
-
-		att = TupleDescAttr(slot1->tts_tupleDescriptor, attrnum);
 
 		typentry = eq[attrnum];
 		if (typentry == NULL)
@@ -361,40 +464,97 @@ retry:
 
 		PopActiveSnapshot();
 
-		switch (res)
-		{
-			case TM_Ok:
-				break;
-			case TM_Updated:
-				/* XXX: Improve handling here */
-				if (ItemPointerIndicatesMovedPartitions(&tmfd.ctid))
-					ereport(LOG,
-							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-							 errmsg("tuple to be locked was already moved to another partition due to concurrent update, retrying")));
-				else
-					ereport(LOG,
-							(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-							 errmsg("concurrent update, retrying")));
-				goto retry;
-			case TM_Deleted:
-				/* XXX: Improve handling here */
-				ereport(LOG,
-						(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-						 errmsg("concurrent delete, retrying")));
-				goto retry;
-			case TM_Invisible:
-				elog(ERROR, "attempted to lock invisible tuple");
-				break;
-			default:
-				elog(ERROR, "unexpected table_tuple_lock status: %u", res);
-				break;
-		}
+		if (should_refetch_tuple(res, &tmfd))
+			goto retry;
 	}
 
 	table_endscan(scan);
 	ExecDropSingleTupleTableSlot(scanslot);
 
 	return found;
+}
+
+/*
+ * Find the tuple that violates the passed unique index (conflictindex).
+ *
+ * If the conflicting tuple is found return true, otherwise false.
+ *
+ * We lock the tuple to avoid getting it deleted before the caller can fetch
+ * the required information. Note that if the tuple is deleted before a lock
+ * is acquired, we will retry to find the conflicting tuple again.
+ */
+static bool
+FindConflictTuple(ResultRelInfo *resultRelInfo, EState *estate,
+				  Oid conflictindex, TupleTableSlot *slot,
+				  TupleTableSlot **conflictslot)
+{
+	Relation	rel = resultRelInfo->ri_RelationDesc;
+	ItemPointerData conflictTid;
+	TM_FailureData tmfd;
+	TM_Result	res;
+
+	*conflictslot = NULL;
+
+retry:
+	if (ExecCheckIndexConstraints(resultRelInfo, slot, estate,
+								  &conflictTid, &slot->tts_tid,
+								  list_make1_oid(conflictindex)))
+	{
+		if (*conflictslot)
+			ExecDropSingleTupleTableSlot(*conflictslot);
+
+		*conflictslot = NULL;
+		return false;
+	}
+
+	*conflictslot = table_slot_create(rel, NULL);
+
+	PushActiveSnapshot(GetLatestSnapshot());
+
+	res = table_tuple_lock(rel, &conflictTid, GetLatestSnapshot(),
+						   *conflictslot,
+						   GetCurrentCommandId(false),
+						   LockTupleShare,
+						   LockWaitBlock,
+						   0 /* don't follow updates */ ,
+						   &tmfd);
+
+	PopActiveSnapshot();
+
+	if (should_refetch_tuple(res, &tmfd))
+		goto retry;
+
+	return true;
+}
+
+/*
+ * Check all the unique indexes in 'recheckIndexes' for conflict with the
+ * tuple in 'remoteslot' and report if found.
+ */
+static void
+CheckAndReportConflict(ResultRelInfo *resultRelInfo, EState *estate,
+					   ConflictType type, List *recheckIndexes,
+					   TupleTableSlot *searchslot, TupleTableSlot *remoteslot)
+{
+	/* Check all the unique indexes for a conflict */
+	foreach_oid(uniqueidx, resultRelInfo->ri_onConflictArbiterIndexes)
+	{
+		TupleTableSlot *conflictslot;
+
+		if (list_member_oid(recheckIndexes, uniqueidx) &&
+			FindConflictTuple(resultRelInfo, estate, uniqueidx, remoteslot,
+							  &conflictslot))
+		{
+			RepOriginId origin;
+			TimestampTz committs;
+			TransactionId xmin;
+
+			GetTupleTransactionInfo(conflictslot, &xmin, &origin, &committs);
+			ReportApplyConflict(estate, resultRelInfo, ERROR, type,
+								searchslot, conflictslot, remoteslot,
+								uniqueidx, xmin, origin, committs);
+		}
+	}
 }
 
 /*
@@ -426,6 +586,8 @@ ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 	if (!skip_tuple)
 	{
 		List	   *recheckIndexes = NIL;
+		List	   *conflictindexes;
+		bool		conflict = false;
 
 		/* Compute stored generated columns */
 		if (rel->rd_att->constr &&
@@ -442,10 +604,33 @@ ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 		/* OK, store the tuple and create index entries for it */
 		simple_table_tuple_insert(resultRelInfo->ri_RelationDesc, slot);
 
+		conflictindexes = resultRelInfo->ri_onConflictArbiterIndexes;
+
 		if (resultRelInfo->ri_NumIndices > 0)
 			recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
-												   slot, estate, false, false,
-												   NULL, NIL);
+												   slot, estate, false,
+												   conflictindexes ? true : false,
+												   &conflict,
+												   conflictindexes, false);
+
+		/*
+		 * Checks the conflict indexes to fetch the conflicting local tuple
+		 * and reports the conflict. We perform this check here, instead of
+		 * performing an additional index scan before the actual insertion and
+		 * reporting the conflict if any conflicting tuples are found. This is
+		 * to avoid the overhead of executing the extra scan for each INSERT
+		 * operation, even when no conflict arises, which could introduce
+		 * significant overhead to replication, particularly in cases where
+		 * conflicts are rare.
+		 *
+		 * XXX OTOH, this could lead to clean-up effort for dead tuples added
+		 * in heap and index in case of conflicts. But as conflicts shouldn't
+		 * be a frequent thing so we preferred to save the performance
+		 * overhead of extra scan before each insertion.
+		 */
+		if (conflict)
+			CheckAndReportConflict(resultRelInfo, estate, CT_INSERT_EXISTS,
+								   recheckIndexes, NULL, slot);
 
 		/* AFTER ROW INSERT Triggers */
 		ExecARInsertTriggers(estate, resultRelInfo, slot,
@@ -476,8 +661,12 @@ ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 	Relation	rel = resultRelInfo->ri_RelationDesc;
 	ItemPointer tid = &(searchslot->tts_tid);
 
-	/* For now we support only tables. */
+	/*
+	 * We support only non-system tables, with
+	 * check_publication_add_relation() accountable.
+	 */
 	Assert(rel->rd_rel->relkind == RELKIND_RELATION);
+	Assert(!IsCatalogRelation(rel));
 
 	CheckCmdReplicaIdentity(rel, CMD_UPDATE);
 
@@ -486,14 +675,16 @@ ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 		resultRelInfo->ri_TrigDesc->trig_update_before_row)
 	{
 		if (!ExecBRUpdateTriggers(estate, epqstate, resultRelInfo,
-								  tid, NULL, slot, NULL))
+								  tid, NULL, slot, NULL, NULL))
 			skip_tuple = true;	/* "do nothing" */
 	}
 
 	if (!skip_tuple)
 	{
 		List	   *recheckIndexes = NIL;
-		bool		update_indexes;
+		TU_UpdateIndexes update_indexes;
+		List	   *conflictindexes;
+		bool		conflict = false;
 
 		/* Compute stored generated columns */
 		if (rel->rd_att->constr &&
@@ -510,10 +701,23 @@ ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 		simple_table_tuple_update(rel, tid, slot, estate->es_snapshot,
 								  &update_indexes);
 
-		if (resultRelInfo->ri_NumIndices > 0 && update_indexes)
+		conflictindexes = resultRelInfo->ri_onConflictArbiterIndexes;
+
+		if (resultRelInfo->ri_NumIndices > 0 && (update_indexes != TU_None))
 			recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
-												   slot, estate, true, false,
-												   NULL, NIL);
+												   slot, estate, true,
+												   conflictindexes ? true : false,
+												   &conflict, conflictindexes,
+												   (update_indexes == TU_Summarizing));
+
+		/*
+		 * Refer to the comments above the call to CheckAndReportConflict() in
+		 * ExecSimpleRelationInsert to understand why this check is done at
+		 * this point.
+		 */
+		if (conflict)
+			CheckAndReportConflict(resultRelInfo, estate, CT_UPDATE_EXISTS,
+								   recheckIndexes, searchslot, slot);
 
 		/* AFTER ROW UPDATE Triggers */
 		ExecARUpdateTriggers(estate, resultRelInfo,
@@ -547,7 +751,7 @@ ExecSimpleRelationDelete(ResultRelInfo *resultRelInfo,
 		resultRelInfo->ri_TrigDesc->trig_delete_before_row)
 	{
 		skip_tuple = !ExecBRDeleteTriggers(estate, epqstate, resultRelInfo,
-										   tid, NULL, NULL);
+										   tid, NULL, NULL, NULL, NULL);
 	}
 
 	if (!skip_tuple)

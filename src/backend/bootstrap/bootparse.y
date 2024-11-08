@@ -4,7 +4,7 @@
  * bootparse.y
  *	  yacc grammar for the "bootstrap" mode (BKI file format)
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -31,6 +31,12 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "utils/memutils.h"
+
+#include "bootparse.h"
+
+/* silence -Wmissing-variable-declarations */
+extern int boot_yychar;
+extern int boot_yynerrs;
 
 
 /*
@@ -306,6 +312,7 @@ Boot_DeclareIndexStmt:
 								$4,
 								InvalidOid,
 								InvalidOid,
+								-1,
 								false,
 								false,
 								false,
@@ -358,6 +365,7 @@ Boot_DeclareUniqueIndexStmt:
 								$5,
 								InvalidOid,
 								InvalidOid,
+								-1,
 								false,
 								false,
 								false,

@@ -202,8 +202,7 @@ plpython3_call_handler(PG_FUNCTION_ARGS)
 		!castNode(CallContext, fcinfo->context)->atomic;
 
 	/* Note: SPI_finish() happens in plpy_exec.c, which is dubious design */
-	if (SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0) != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
+	SPI_connect_ext(nonatomic ? SPI_OPT_NONATOMIC : 0);
 
 	/*
 	 * Push execution context onto stack.  It is important that this get
@@ -272,8 +271,7 @@ plpython3_inline_handler(PG_FUNCTION_ARGS)
 	PLy_initialize();
 
 	/* Note: SPI_finish() happens in plpy_exec.c, which is dubious design */
-	if (SPI_connect_ext(codeblock->atomic ? 0 : SPI_OPT_NONATOMIC) != SPI_OK_CONNECT)
-		elog(ERROR, "SPI_connect failed");
+	SPI_connect_ext(codeblock->atomic ? 0 : SPI_OPT_NONATOMIC);
 
 	MemSet(fcinfo, 0, SizeForFunctionCallInfo(0));
 	MemSet(&flinfo, 0, sizeof(flinfo));
@@ -306,7 +304,7 @@ plpython3_inline_handler(PG_FUNCTION_ARGS)
 		/*
 		 * Setup error traceback support for ereport().
 		 * plpython_inline_error_callback doesn't currently need exec_ctx, but
-		 * for consistency with plpython_call_handler we do it the same way.
+		 * for consistency with plpython3_call_handler we do it the same way.
 		 */
 		plerrcontext.callback = plpython_inline_error_callback;
 		plerrcontext.arg = exec_ctx;

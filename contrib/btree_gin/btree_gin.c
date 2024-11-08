@@ -7,15 +7,12 @@
 
 #include "access/stratnum.h"
 #include "utils/builtins.h"
-#include "utils/bytea.h"
-#include "utils/cash.h"
 #include "utils/date.h"
 #include "utils/float.h"
 #include "utils/inet.h"
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
 #include "utils/uuid.h"
-#include "utils/varbit.h"
 
 PG_MODULE_MAGIC;
 
@@ -306,9 +303,8 @@ leftmostvalue_interval(void)
 {
 	Interval   *v = palloc(sizeof(Interval));
 
-	v->time = DT_NOBEGIN;
-	v->day = 0;
-	v->month = 0;
+	INTERVAL_NOBEGIN(v);
+
 	return IntervalPGetDatum(v);
 }
 

@@ -3,7 +3,7 @@
  * tsgistidx.c
  *	  GiST support functions for tsvector_ops
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -17,10 +17,11 @@
 #include "access/gist.h"
 #include "access/heaptoast.h"
 #include "access/reloptions.h"
+#include "common/int.h"
 #include "lib/qunique.h"
 #include "port/pg_bitutils.h"
 #include "tsearch/ts_utils.h"
-#include "utils/builtins.h"
+#include "utils/fmgrprotos.h"
 #include "utils/pg_crc.h"
 
 
@@ -95,30 +96,26 @@ gtsvectorin(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();			/* keep compiler quiet */
 }
 
-#define SINGOUTSTR	"%d true bits, %d false bits"
-#define ARROUTSTR	"%d unique words"
-#define EXTRALEN	( 2*13 )
-
-static int	outbuf_maxlen = 0;
-
 Datum
 gtsvectorout(PG_FUNCTION_ARGS)
 {
 	SignTSVector *key = (SignTSVector *) PG_DETOAST_DATUM(PG_GETARG_DATUM(0));
 	char	   *outbuf;
 
-	if (outbuf_maxlen == 0)
-		outbuf_maxlen = 2 * EXTRALEN + Max(strlen(SINGOUTSTR), strlen(ARROUTSTR)) + 1;
-	outbuf = palloc(outbuf_maxlen);
-
 	if (ISARRKEY(key))
-		sprintf(outbuf, ARROUTSTR, (int) ARRNELEM(key));
+		outbuf = psprintf("%d unique words", (int) ARRNELEM(key));
 	else
 	{
-		int			siglen = GETSIGLEN(key);
-		int			cnttrue = (ISALLTRUE(key)) ? SIGLENBIT(siglen) : sizebitvec(GETSIGN(key), siglen);
+		if (ISALLTRUE(key))
+			outbuf = pstrdup("all true bits");
+		else
+		{
+			int			siglen = GETSIGLEN(key);
+			int			cnttrue = sizebitvec(GETSIGN(key), siglen);
 
-		sprintf(outbuf, SINGOUTSTR, cnttrue, (int) SIGLENBIT(siglen) - cnttrue);
+			outbuf = psprintf("%d true bits, %d false bits",
+							  cnttrue, (int) SIGLENBIT(siglen) - cnttrue);
+		}
 	}
 
 	PG_FREE_IF_COPY(key, 0);
@@ -131,9 +128,7 @@ compareint(const void *va, const void *vb)
 	int32		a = *((const int32 *) va);
 	int32		b = *((const int32 *) vb);
 
-	if (a == b)
-		return 0;
-	return (a > b) ? 1 : -1;
+	return pg_cmp_s32(a, b);
 }
 
 static void
@@ -593,10 +588,7 @@ comparecost(const void *va, const void *vb)
 	const SPLITCOST *a = (const SPLITCOST *) va;
 	const SPLITCOST *b = (const SPLITCOST *) vb;
 
-	if (a->cost == b->cost)
-		return 0;
-	else
-		return (a->cost > b->cost) ? 1 : -1;
+	return pg_cmp_s32(a->cost, b->cost);
 }
 
 
@@ -730,7 +722,7 @@ gtsvector_picksplit(PG_FUNCTION_ARGS)
 				size_alpha = SIGLENBIT(siglen) -
 					sizebitvec((cache[j].allistrue) ?
 							   GETSIGN(datum_l) :
-							   GETSIGN(cache[j].sign),
+							   cache[j].sign,
 							   siglen);
 		}
 		else
@@ -744,7 +736,7 @@ gtsvector_picksplit(PG_FUNCTION_ARGS)
 				size_beta = SIGLENBIT(siglen) -
 					sizebitvec((cache[j].allistrue) ?
 							   GETSIGN(datum_r) :
-							   GETSIGN(cache[j].sign),
+							   cache[j].sign,
 							   siglen);
 		}
 		else

@@ -3,7 +3,7 @@
  * nodeMergeAppend.c
  *	  routines to handle MergeAppend nodes.
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -38,7 +38,7 @@
 
 #include "postgres.h"
 
-#include "executor/execdebug.h"
+#include "executor/executor.h"
 #include "executor/execPartition.h"
 #include "executor/nodeMergeAppend.h"
 #include "lib/binaryheap.h"
@@ -82,7 +82,7 @@ ExecInitMergeAppend(MergeAppend *node, EState *estate, int eflags)
 	mergestate->ps.ExecProcNode = ExecMergeAppend;
 
 	/* If run-time partition pruning is enabled, then set that up now */
-	if (node->part_prune_index >= 0)
+	if (node->part_prune_info != NULL)
 	{
 		PartitionPruneState *prunestate;
 
@@ -93,8 +93,7 @@ ExecInitMergeAppend(MergeAppend *node, EState *estate, int eflags)
 		 */
 		prunestate = ExecInitPartitionPruning(&mergestate->ps,
 											  list_length(node->mergeplans),
-											  node->part_prune_index,
-											  node->apprelids,
+											  node->part_prune_info,
 											  &validsubplans);
 		mergestate->ms_prune_state = prunestate;
 		nplans = bms_num_members(validsubplans);
