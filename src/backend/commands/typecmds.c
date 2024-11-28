@@ -944,6 +944,10 @@ DefineDomain(CreateDomainStmt *stmt)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("conflicting NULL/NOT NULL constraints")));
+				if (constr->is_no_inherit)
+					ereport(ERROR,
+							errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+							errmsg("not-null constraints for domains cannot be marked NO INHERIT"));
 				typNotNull = true;
 				nullDefined = true;
 				break;
@@ -3558,7 +3562,7 @@ domainAddCheckConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
 	domVal->location = -1;		/* will be set when/if used */
 
 	pstate->p_pre_columnref_hook = replace_domain_constraint_value;
-	pstate->p_ref_hook_state = (void *) domVal;
+	pstate->p_ref_hook_state = domVal;
 
 	expr = transformExpr(pstate, constr->raw_expr, EXPR_KIND_DOMAIN_CHECK);
 

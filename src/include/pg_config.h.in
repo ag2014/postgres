@@ -125,6 +125,9 @@
 /* Define to 1 if you have the <editline/readline.h> header file. */
 #undef HAVE_EDITLINE_READLINE_H
 
+/* Define to 1 if you have the `elf_aux_info' function. */
+#undef HAVE_ELF_AUX_INFO
+
 /* Define to 1 if you have the <execinfo.h> header file. */
 #undef HAVE_EXECINFO_H
 
@@ -153,6 +156,9 @@
 /* Define to 1 if you have __sync_val_compare_and_swap(int64 *, int64, int64).
    */
 #undef HAVE_GCC__SYNC_INT64_CAS
+
+/* Define to 1 if you have the `getauxval' function. */
+#undef HAVE_GETAUXVAL
 
 /* Define to 1 if you have the `getifaddrs' function. */
 #undef HAVE_GETIFADDRS
@@ -361,9 +367,6 @@
 /* Define to 1 if you have the `SSL_CTX_set_num_tickets' function. */
 #undef HAVE_SSL_CTX_SET_NUM_TICKETS
 
-/* Define to 1 if stdbool.h conforms to C99. */
-#undef HAVE_STDBOOL_H
-
 /* Define to 1 if you have the <stdint.h> header file. */
 #undef HAVE_STDINT_H
 
@@ -493,9 +496,6 @@
 /* Define to 1 if you have XSAVE intrinsics. */
 #undef HAVE_XSAVE_INTRINSICS
 
-/* Define to 1 if the system has the type `_Bool'. */
-#undef HAVE__BOOL
-
 /* Define to 1 if your compiler understands __builtin_bswap16. */
 #undef HAVE__BUILTIN_BSWAP16
 
@@ -528,9 +528,6 @@
 
 /* Define to 1 if your compiler understands __builtin_unreachable. */
 #undef HAVE__BUILTIN_UNREACHABLE
-
-/* Define to 1 if you have the `_configthreadlocale' function. */
-#undef HAVE__CONFIGTHREADLOCALE
 
 /* Define to 1 if you have __cpuid. */
 #undef HAVE__CPUID
@@ -600,9 +597,6 @@
 /* Define to best printf format archetype, usually gnu_printf if available. */
 #undef PG_PRINTF_ATTRIBUTE
 
-/* Define to 1 to use <stdbool.h> to define type bool. */
-#undef PG_USE_STDBOOL
-
 /* PostgreSQL version as a string */
 #undef PG_VERSION
 
@@ -632,9 +626,6 @@
    save a few cycles in md.c, but is not absolutely required. Changing
    RELSEG_SIZE requires an initdb. */
 #undef RELSEG_SIZE
-
-/* The size of `bool', as computed by sizeof. */
-#undef SIZEOF_BOOL
 
 /* The size of `long', as computed by sizeof. */
 #undef SIZEOF_LONG

@@ -1755,16 +1755,6 @@ if cc.compiles('''
 endif
 
 
-# We use <stdbool.h> if we have it and it declares type bool as having
-# size 1.  Otherwise, c.h will fall back to declaring bool as unsigned char.
-if cc.has_type('_Bool', args: test_c_args) \
-    and cc.has_type('bool', prefix: '#include <stdbool.h>', args: test_c_args) \
-    and cc.sizeof('bool', prefix: '#include <stdbool.h>', args: test_c_args) == 1
-  cdata.set('HAVE__BOOL', 1)
-  cdata.set('PG_USE_STDBOOL', 1)
-endif
-
-
 # Need to check a call with %m because netbsd supports gnu_printf but emits a
 # warning for each use of %m.
 printf_attributes = ['gnu_printf', '__syslog__', 'printf']
@@ -2214,14 +2204,19 @@ endif
 # If we are targeting a processor that has Intel SSE 4.2 instructions, we can
 # use the special CRC instructions for calculating CRC-32C. If we're not
 # targeting such a processor, but we can nevertheless produce code that uses
-# the SSE intrinsics, perhaps with some extra CFLAGS, compile both
-# implementations and select which one to use at runtime, depending on whether
-# SSE 4.2 is supported by the processor we're running on.
+# the SSE intrinsics, compile both implementations and select which one to use
+# at runtime, depending on whether SSE 4.2 is supported by the processor we're
+# running on.
 #
 # Similarly, if we are targeting an ARM processor that has the CRC
 # instructions that are part of the ARMv8 CRC Extension, use them. And if
 # we're not targeting such a processor, but can nevertheless produce code that
 # uses the CRC instructions, compile both, and select at runtime.
+#
+# Note that we do not use __attribute__((target("..."))) for the ARM CRC
+# instructions because until clang 16, using the ARM intrinsics still requires
+# special -march flags.  Perhaps we can re-evaluate this decision after some
+# time has passed.
 ###############################################################
 
 have_optimized_crc = false
@@ -2237,6 +2232,9 @@ if host_cpu == 'x86' or host_cpu == 'x86_64'
     prog = '''
 #include <nmmintrin.h>
 
+#if defined(__has_attribute) && __has_attribute (target)
+__attribute__((target("sse4.2")))
+#endif
 int main(void)
 {
     unsigned int crc = 0;
@@ -2247,16 +2245,16 @@ int main(void)
 }
 '''
 
-    if cc.links(prog, name: '_mm_crc32_u8 and _mm_crc32_u32 without -msse4.2',
+    if not cc.links(prog, name: '_mm_crc32_u8 and _mm_crc32_u32',
           args: test_c_args)
+      # Do not use Intel SSE 4.2
+    elif (cc.get_define('__SSE4_2__') != '')
       # Use Intel SSE 4.2 unconditionally.
       cdata.set('USE_SSE42_CRC32C', 1)
       have_optimized_crc = true
-    elif cc.links(prog, name: '_mm_crc32_u8 and _mm_crc32_u32 with -msse4.2',
-          args: test_c_args + ['-msse4.2'])
+    else
       # Use Intel SSE 4.2, with runtime check. The CPUID instruction is needed for
       # the runtime check.
-      cflags_crc += '-msse4.2'
       cdata.set('USE_SSE42_CRC32C', false)
       cdata.set('USE_SSE42_CRC32C_WITH_RUNTIME_CHECK', 1)
       have_optimized_crc = true
@@ -2286,6 +2284,13 @@ int main(void)
       args: test_c_args)
     # Use ARM CRC Extension unconditionally
     cdata.set('USE_ARMV8_CRC32C', 1)
+    have_optimized_crc = true
+  elif cc.links(prog, name: '__crc32cb, __crc32ch, __crc32cw, and __crc32cd with -march=armv8-a+crc+simd',
+      args: test_c_args + ['-march=armv8-a+crc+simd'])
+    # Use ARM CRC Extension, with runtime check
+    cflags_crc += '-march=armv8-a+crc+simd'
+    cdata.set('USE_ARMV8_CRC32C', false)
+    cdata.set('USE_ARMV8_CRC32C_WITH_RUNTIME_CHECK', 1)
     have_optimized_crc = true
   elif cc.links(prog, name: '__crc32cb, __crc32ch, __crc32cw, and __crc32cd with -march=armv8-a+crc',
       args: test_c_args + ['-march=armv8-a+crc'])
@@ -2383,7 +2388,6 @@ header_checks = [
   'getopt.h',
   'ifaddrs.h',
   'mbarrier.h',
-  'stdbool.h',
   'strings.h',
   'sys/epoll.h',
   'sys/event.h',
@@ -2614,7 +2618,6 @@ endif
 # XXX: Might be worth conditioning some checks on the OS, to avoid doing
 # unnecessary checks over and over, particularly on windows.
 func_checks = [
-  ['_configthreadlocale', {'skip': host_system != 'windows'}],
   ['backtrace_symbols', {'dependencies': [execinfo_dep]}],
   ['clock_gettime', {'dependencies': [rt_dep], 'define': false}],
   ['copyfile'],
@@ -2623,7 +2626,9 @@ func_checks = [
   # when enabling asan the dlopen check doesn't notice that -ldl is actually
   # required. Just checking for dlsym() ought to suffice.
   ['dlsym', {'dependencies': [dl_dep], 'define': false}],
+  ['elf_aux_info'],
   ['explicit_bzero'],
+  ['getauxval'],
   ['getifaddrs'],
   ['getopt', {'dependencies': [getopt_dep, gnugetopt_dep], 'skip': always_replace_getopt}],
   ['getopt_long', {'dependencies': [getopt_dep, gnugetopt_dep], 'skip': always_replace_getopt_long}],
