@@ -31,7 +31,7 @@
  * should be killed by SIGQUIT and then a recovery cycle started.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -51,6 +51,7 @@
 #include "postmaster/auxprocess.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/walwriter.h"
+#include "storage/aio_subsys.h"
 #include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
 #include "storage/fd.h"
@@ -61,6 +62,7 @@
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/wait_event.h"
 
 
 /*
@@ -84,7 +86,7 @@ int			WalWriterFlushAfter = DEFAULT_WAL_WRITER_FLUSH_AFTER;
  * basic execution environment, but not enabled signals yet.
  */
 void
-WalWriterMain(char *startup_data, size_t startup_data_len)
+WalWriterMain(const void *startup_data, size_t startup_data_len)
 {
 	sigjmp_buf	local_sigjmp_buf;
 	MemoryContext walwriter_context;
@@ -93,17 +95,13 @@ WalWriterMain(char *startup_data, size_t startup_data_len)
 
 	Assert(startup_data_len == 0);
 
-	MyBackendType = B_WAL_WRITER;
 	AuxiliaryProcessMainCommon();
 
 	/*
 	 * Properly accept or ignore signals the postmaster might send us
-	 *
-	 * We have no particular use for SIGINT at the moment, but seems
-	 * reasonable to treat like SIGTERM.
 	 */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
-	pqsignal(SIGINT, SignalHandlerForShutdownRequest);
+	pqsignal(SIGINT, SIG_IGN);	/* no query to cancel */
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	/* SIGQUIT handler was already set up by InitPostmasterChild */
 	pqsignal(SIGALRM, SIG_IGN);
@@ -164,6 +162,7 @@ WalWriterMain(char *startup_data, size_t startup_data_len)
 		LWLockReleaseAll();
 		ConditionVariableCancelSleep();
 		pgstat_report_wait_end();
+		pgaio_error_cleanup();
 		UnlockBuffers();
 		ReleaseAuxProcessResources(false);
 		AtEOXact_Buffers(false);
@@ -239,7 +238,7 @@ WalWriterMain(char *startup_data, size_t startup_data_len)
 		ResetLatch(MyLatch);
 
 		/* Process any signals received recently */
-		HandleMainLoopInterrupts();
+		ProcessMainLoopInterrupts();
 
 		/*
 		 * Do what we're here for; then, if XLogBackgroundFlush() found useful

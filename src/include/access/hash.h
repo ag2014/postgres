@@ -4,7 +4,7 @@
  *	  header file for postgres hash access method implementation
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/hash.h
@@ -387,6 +387,9 @@ extern void hashadjustmembers(Oid opfamilyoid,
 							  List *operators,
 							  List *functions);
 
+extern CompareType hashtranslatestrategy(StrategyNumber strategy, Oid opfamily);
+extern StrategyNumber hashtranslatecmptype(CompareType cmptype, Oid opfamily);
+
 /* private routines */
 
 /* hashinsert.c */
@@ -450,7 +453,7 @@ typedef struct HSpool HSpool;	/* opaque struct in hashsort.c */
 
 extern HSpool *_h_spoolinit(Relation heap, Relation index, uint32 num_buckets);
 extern void _h_spooldestroy(HSpool *hspool);
-extern void _h_spool(HSpool *hspool, ItemPointer self,
+extern void _h_spool(HSpool *hspool, const ItemPointerData *self,
 					 const Datum *values, const bool *isnull);
 extern void _h_indexbuild(HSpool *hspool, Relation heapRel);
 
@@ -465,7 +468,7 @@ extern uint32 _hash_get_totalbuckets(uint32 splitpoint_phase);
 extern void _hash_checkpage(Relation rel, Buffer buf, int flags);
 extern uint32 _hash_get_indextuple_hashkey(IndexTuple itup);
 extern bool _hash_convert_tuple(Relation index,
-								Datum *user_values, bool *user_isnull,
+								const Datum *user_values, const bool *user_isnull,
 								Datum *index_values, bool *index_isnull);
 extern OffsetNumber _hash_binsearch(Page page, uint32 hash_value);
 extern OffsetNumber _hash_binsearch_last(Page page, uint32 hash_value);

@@ -2,7 +2,7 @@
  *
  * Write a new backup manifest.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_combinebackup/write_manifest.c
@@ -47,7 +47,7 @@ static size_t hex_encode(const uint8 *src, size_t len, char *dst);
 manifest_writer *
 create_manifest_writer(char *directory, uint64 system_identifier)
 {
-	manifest_writer *mwriter = pg_malloc(sizeof(manifest_writer));
+	manifest_writer *mwriter = pg_malloc_object(manifest_writer);
 
 	snprintf(mwriter->pathname, MAXPGPATH, "%s/backup_manifest", directory);
 	mwriter->fd = -1;
@@ -104,8 +104,7 @@ add_file_to_manifest(manifest_writer *mwriter, const char *manifest_path,
 		appendStringInfoString(&mwriter->buf, "\", ");
 	}
 
-	appendStringInfo(&mwriter->buf, "\"Size\": %llu, ",
-					 (unsigned long long) size);
+	appendStringInfo(&mwriter->buf, "\"Size\": %" PRIu64 ", ", size);
 
 	appendStringInfoString(&mwriter->buf, "\"Last-Modified\": \"");
 	enlargeStringInfo(&mwriter->buf, 128);
@@ -156,7 +155,7 @@ finalize_manifest(manifest_writer *mwriter,
 	for (wal_range = first_wal_range; wal_range != NULL;
 		 wal_range = wal_range->next)
 		appendStringInfo(&mwriter->buf,
-						 "%s{ \"Timeline\": %u, \"Start-LSN\": \"%X/%X\", \"End-LSN\": \"%X/%X\" }",
+						 "%s{ \"Timeline\": %u, \"Start-LSN\": \"%X/%08X\", \"End-LSN\": \"%X/%08X\" }",
 						 wal_range == first_wal_range ? "" : ",\n",
 						 wal_range->tli,
 						 LSN_FORMAT_ARGS(wal_range->start_lsn),
@@ -260,8 +259,8 @@ flush_manifest(manifest_writer *mwriter)
 			if (wb < 0)
 				pg_fatal("could not write file \"%s\": %m", mwriter->pathname);
 			else
-				pg_fatal("could not write file \"%s\": wrote %d of %d",
-						 mwriter->pathname, (int) wb, mwriter->buf.len);
+				pg_fatal("could not write file \"%s\": wrote %zd of %d",
+						 mwriter->pathname, wb, mwriter->buf.len);
 		}
 
 		if (mwriter->still_checksumming &&

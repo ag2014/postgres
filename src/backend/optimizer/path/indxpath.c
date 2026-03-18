@@ -4,7 +4,7 @@
  *	  Routines to determine which indexes are usable for scanning a
  *	  given relation, and create Paths accordingly.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,10 +15,9 @@
  */
 #include "postgres.h"
 
-#include <math.h>
-
 #include "access/stratnum.h"
 #include "access/sysattr.h"
+#include "access/transam.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
 #include "catalog/pg_operator.h"
@@ -33,10 +32,8 @@
 #include "optimizer/paths.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
-#include "utils/array.h"
 #include "utils/lsyscache.h"
 #include "utils/selfuncs.h"
-#include "utils/syscache.h"
 
 
 /* XXX see PartCollMatchesExprColl */
@@ -198,6 +195,8 @@ static Expr *match_clause_to_ordering_op(IndexOptInfo *index,
 static bool ec_member_matches_indexcol(PlannerInfo *root, RelOptInfo *rel,
 									   EquivalenceClass *ec, EquivalenceMember *em,
 									   void *arg);
+static bool contain_strippable_phv_walker(Node *node, void *context);
+static Node *strip_phvs_in_index_operand_mutator(Node *node, void *context);
 
 
 /*
@@ -1189,6 +1188,8 @@ typedef struct
 	Oid			inputcollid;	/* OID of the OpClause input collation */
 	int			argindex;		/* index of the clause in the list of
 								 * arguments */
+	int			groupindex;		/* value of argindex for the fist clause in
+								 * the group of similar clauses */
 } OrArgIndexMatch;
 
 /*
@@ -1230,6 +1231,29 @@ or_arg_index_match_cmp(const void *a, const void *b)
 }
 
 /*
+ * Another comparison function for OrArgIndexMatch.  It sorts groups together
+ * using groupindex.  The group items are then sorted by argindex.
+ */
+static int
+or_arg_index_match_cmp_group(const void *a, const void *b)
+{
+	const OrArgIndexMatch *match_a = (const OrArgIndexMatch *) a;
+	const OrArgIndexMatch *match_b = (const OrArgIndexMatch *) b;
+
+	if (match_a->groupindex < match_b->groupindex)
+		return -1;
+	else if (match_a->groupindex > match_b->groupindex)
+		return 1;
+
+	if (match_a->argindex < match_b->argindex)
+		return -1;
+	else if (match_a->argindex > match_b->argindex)
+		return 1;
+
+	return 0;
+}
+
+/*
  * group_similar_or_args
  *		Transform incoming OR-restrictinfo into a list of sub-restrictinfos,
  *		each of them containing a subset of similar OR-clause arguments from
@@ -1255,6 +1279,7 @@ group_similar_or_args(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo)
 	ListCell   *lc2;
 	List	   *orargs;
 	List	   *result = NIL;
+	Index		relid = rel->relid;
 
 	Assert(IsA(rinfo->orclause, BoolExpr));
 	orargs = ((BoolExpr *) rinfo->orclause)->args;
@@ -1266,7 +1291,7 @@ group_similar_or_args(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo)
 	 * which will be used to sort these arguments at the next step.
 	 */
 	i = -1;
-	matches = (OrArgIndexMatch *) palloc(sizeof(OrArgIndexMatch) * n);
+	matches = palloc_array(OrArgIndexMatch, n);
 	foreach(lc, orargs)
 	{
 		Node	   *arg = lfirst(lc);
@@ -1281,6 +1306,7 @@ group_similar_or_args(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo)
 
 		i++;
 		matches[i].argindex = i;
+		matches[i].groupindex = i;
 		matches[i].indexnum = -1;
 		matches[i].colnum = -1;
 		matches[i].opno = InvalidOid;
@@ -1319,10 +1345,13 @@ group_similar_or_args(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo)
 		/*
 		 * Check for clauses of the form: (indexkey operator constant) or
 		 * (constant operator indexkey).  But we don't know a particular index
-		 * yet.  First check for a constant, which must be Const or Param.
-		 * That's cheaper than search for an index key among all indexes.
+		 * yet.  Therefore, we try to distinguish the potential index key and
+		 * constant first, then search for a matching index key among all
+		 * indexes.
 		 */
-		if (IsA(leftop, Const) || IsA(leftop, Param))
+		if (bms_is_member(relid, argrinfo->right_relids) &&
+			!bms_is_member(relid, argrinfo->left_relids) &&
+			!contain_volatile_functions(leftop))
 		{
 			opno = get_commutator(opno);
 
@@ -1333,7 +1362,9 @@ group_similar_or_args(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo)
 			}
 			nonConstExpr = rightop;
 		}
-		else if (IsA(rightop, Const) || IsA(rightop, Param))
+		else if (bms_is_member(relid, argrinfo->left_relids) &&
+				 !bms_is_member(relid, argrinfo->right_relids) &&
+				 !contain_volatile_functions(rightop))
 		{
 			nonConstExpr = leftop;
 		}
@@ -1394,8 +1425,39 @@ group_similar_or_args(PlannerInfo *root, RelOptInfo *rel, RestrictInfo *rinfo)
 		return orargs;
 	}
 
-	/* Sort clauses to make similar clauses go together */
+	/*
+	 * Sort clauses to make similar clauses go together.  But at the same
+	 * time, we would like to change the order of clauses as little as
+	 * possible.  To do so, we reorder each group of similar clauses so that
+	 * the first item of the group stays in place, and all the other items are
+	 * moved after it.  So, if there are no similar clauses, the order of
+	 * clauses stays the same.  When there are some groups, required
+	 * reordering happens while the rest of the clauses remain in their
+	 * places.  That is achieved by assigning a 'groupindex' to each clause:
+	 * the number of the first item in the group in the original clause list.
+	 */
 	qsort(matches, n, sizeof(OrArgIndexMatch), or_arg_index_match_cmp);
+
+	/* Assign groupindex to the sorted clauses */
+	for (i = 1; i < n; i++)
+	{
+		/*
+		 * When two clauses are similar and should belong to the same group,
+		 * copy the 'groupindex' from the previous clause.  Given we are
+		 * considering clauses in direct order, all the clauses would have a
+		 * 'groupindex' equal to the 'groupindex' of the first clause in the
+		 * group.
+		 */
+		if (matches[i].indexnum == matches[i - 1].indexnum &&
+			matches[i].colnum == matches[i - 1].colnum &&
+			matches[i].opno == matches[i - 1].opno &&
+			matches[i].inputcollid == matches[i - 1].inputcollid &&
+			matches[i].indexnum != -1)
+			matches[i].groupindex = matches[i - 1].groupindex;
+	}
+
+	/* Re-sort clauses first by groupindex then by argindex */
+	qsort(matches, n, sizeof(OrArgIndexMatch), or_arg_index_match_cmp_group);
 
 	/*
 	 * Group similar clauses into single sub-restrictinfo. Side effect: the
@@ -1791,8 +1853,7 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 	 * same set of clauses; keep only the cheapest-to-scan of any such groups.
 	 * The surviving paths are put into an array for qsort'ing.
 	 */
-	pathinfoarray = (PathClauseUsage **)
-		palloc(npaths * sizeof(PathClauseUsage *));
+	pathinfoarray = palloc_array(PathClauseUsage *, npaths);
 	clauselist = NIL;
 	npaths = 0;
 	foreach(l, paths)
@@ -2028,7 +2089,7 @@ classify_index_clause_usage(Path *path, List **clauselist)
 	Bitmapset  *clauseids;
 	ListCell   *lc;
 
-	result = (PathClauseUsage *) palloc(sizeof(PathClauseUsage));
+	result = palloc_object(PathClauseUsage);
 	result->path = path;
 
 	/* Recursively find the quals and preds used by the path */
@@ -2171,8 +2232,8 @@ check_index_only(RelOptInfo *rel, IndexOptInfo *index)
 	ListCell   *lc;
 	int			i;
 
-	/* Index-only scans must be enabled */
-	if (!enable_indexonlyscan)
+	/* If we're not allowed to consider index-only scans, give up now */
+	if ((rel->pgs_mask & PGS_CONSIDER_INDEXONLY) == 0)
 		return false;
 
 	/*
@@ -2414,6 +2475,7 @@ match_restriction_clauses_to_index(PlannerInfo *root,
  *	  Identify join clauses for the rel that match the index.
  *	  Matching clauses are added to *clauseset.
  *	  Also, add any potentially usable join OR clauses to *joinorclauses.
+ *	  They also might be processed by match_clause_to_index() as a whole.
  */
 static void
 match_join_clauses_to_index(PlannerInfo *root,
@@ -2432,11 +2494,15 @@ match_join_clauses_to_index(PlannerInfo *root,
 		if (!join_clause_is_movable_to(rinfo, rel))
 			continue;
 
-		/* Potentially usable, so see if it matches the index or is an OR */
+		/*
+		 * Potentially usable, so see if it matches the index or is an OR. Use
+		 * list_append_unique_ptr() here to avoid possible duplicates when
+		 * processing the same clauses with different indexes.
+		 */
 		if (restriction_is_or_clause(rinfo))
-			*joinorclauses = lappend(*joinorclauses, rinfo);
-		else
-			match_clause_to_index(root, rinfo, index, clauseset);
+			*joinorclauses = list_append_unique_ptr(*joinorclauses, rinfo);
+
+		match_clause_to_index(root, rinfo, index, clauseset);
 	}
 }
 
@@ -2585,10 +2651,7 @@ match_clause_to_index(PlannerInfo *root,
  *	  (3)  must match the collation of the index, if collation is relevant.
  *
  *	  Our definition of "const" is exceedingly liberal: we allow anything that
- *	  doesn't involve a volatile function or a Var of the index's relation
- *	  except for a boolean OR expression input: due to a trade-off between the
- *	  expected execution speedup and planning complexity, we limit or->saop
- *	  transformation by obvious cases when an index scan can get a profit.
+ *	  doesn't involve a volatile function or a Var of the index's relation.
  *	  In particular, Vars belonging to other relations of the query are
  *	  accepted here, since a clause of that form can be used in a
  *	  parameterized indexscan.  It's the responsibility of higher code levels
@@ -2620,7 +2683,7 @@ match_clause_to_index(PlannerInfo *root,
  *
  *	  It is also possible to match a list of OR clauses if it might be
  *	  transformed into a single ScalarArrayOpExpr clause.  On success,
- *	  the returning index clause will contain a trasformed clause.
+ *	  the returning index clause will contain a transformed clause.
  *
  *	  For boolean indexes, it is also possible to match the clause directly
  *	  to the indexkey; or perhaps the clause is (NOT indexkey).
@@ -2639,8 +2702,9 @@ match_clause_to_index(PlannerInfo *root,
  * Returns an IndexClause if the clause can be used with this index key,
  * or NULL if not.
  *
- * NOTE:  returns NULL if clause is an OR or AND clause; it is the
- * responsibility of higher-level routines to cope with those.
+ * NOTE:  This routine always returns NULL if the clause is an AND clause.
+ * Higher-level routines deal with OR and AND clauses. OR clause can be
+ * matched as a whole by match_orclause_to_indexcol() though.
  */
 static IndexClause *
 match_clause_to_indexcol(PlannerInfo *root,
@@ -3225,8 +3289,8 @@ match_rowcompare_to_indexcol(PlannerInfo *root,
  *
  * In this routine, we attempt to transform a list of OR-clause args into a
  * single SAOP expression matching the target index column.  On success,
- * return an IndexClause, containing the transformed expression or NULL,
- * if failed.
+ * return an IndexClause containing the transformed expression.
+ * Return NULL if the transformation fails.
  */
 static IndexClause *
 match_orclause_to_indexcol(PlannerInfo *root,
@@ -3234,95 +3298,72 @@ match_orclause_to_indexcol(PlannerInfo *root,
 						   int indexcol,
 						   IndexOptInfo *index)
 {
-	ListCell   *lc;
 	BoolExpr   *orclause = (BoolExpr *) rinfo->orclause;
-	Node	   *indexExpr = NULL;
 	List	   *consts = NIL;
-	Node	   *arrayNode = NULL;
-	ScalarArrayOpExpr *saopexpr = NULL;
+	Node	   *indexExpr = NULL;
 	Oid			matchOpno = InvalidOid;
-	IndexClause *iclause;
 	Oid			consttype = InvalidOid;
 	Oid			arraytype = InvalidOid;
 	Oid			inputcollid = InvalidOid;
 	bool		firstTime = true;
-	bool		haveParam = false;
+	bool		haveNonConst = false;
+	Index		indexRelid = index->rel->relid;
+	ScalarArrayOpExpr *saopexpr;
+	IndexClause *iclause;
+	ListCell   *lc;
 
-	Assert(IsA(orclause, BoolExpr));
-	Assert(orclause->boolop == OR_EXPR);
-
-	/* Ignore index if it doesn't support SAOP clauses */
+	/* Forget it if index doesn't support SAOP clauses */
 	if (!index->amsearcharray)
 		return NULL;
 
 	/*
 	 * Try to convert a list of OR-clauses to a single SAOP expression. Each
 	 * OR entry must be in the form: (indexkey operator constant) or (constant
-	 * operator indexkey).  Operators of all the entries must match.  Constant
-	 * might be either Const or Param.  To be effective, give up on the first
-	 * non-matching entry.  Exit is implemented as a break from the loop,
-	 * which is catched afterwards.
+	 * operator indexkey).  Operators of all the entries must match.  On
+	 * discovery of anything unsupported, we give up by breaking out of the
+	 * loop immediately and returning NULL.
 	 */
 	foreach(lc, orclause->args)
 	{
-		RestrictInfo *subRinfo;
+		RestrictInfo *subRinfo = (RestrictInfo *) lfirst(lc);
 		OpExpr	   *subClause;
 		Oid			opno;
 		Node	   *leftop,
 				   *rightop;
 		Node	   *constExpr;
 
-		if (!IsA(lfirst(lc), RestrictInfo))
+		/* If it's not a RestrictInfo (i.e. it's a sub-AND), we can't use it */
+		if (!IsA(subRinfo, RestrictInfo))
 			break;
 
-		subRinfo = (RestrictInfo *) lfirst(lc);
-
-		/* Only operator clauses can match  */
+		/* Only operator clauses can match */
 		if (!IsA(subRinfo->clause, OpExpr))
 			break;
 
 		subClause = (OpExpr *) subRinfo->clause;
 		opno = subClause->opno;
 
-		/* Only binary operators can match  */
+		/* Only binary operators can match */
 		if (list_length(subClause->args) != 2)
 			break;
 
 		/*
-		 * The parameters below must match between sub-rinfo and its parent as
-		 * make_restrictinfo() fills them with the same values, and further
-		 * modifications are also the same for the whole subtree.  However,
-		 * still make a sanity check.
-		 */
-		Assert(subRinfo->is_pushed_down == rinfo->is_pushed_down);
-		Assert(subRinfo->is_clone == rinfo->is_clone);
-		Assert(subRinfo->security_level == rinfo->security_level);
-		Assert(bms_equal(subRinfo->incompatible_relids, rinfo->incompatible_relids));
-		Assert(bms_equal(subRinfo->outer_relids, rinfo->outer_relids));
-
-		/*
-		 * Also, check that required_relids in sub-rinfo is subset of parent's
-		 * required_relids.
-		 */
-		Assert(bms_is_subset(subRinfo->required_relids, rinfo->required_relids));
-
-		/* Only the operator returning a boolean suit the transformation. */
-		if (get_op_rettype(opno) != BOOLOID)
-			break;
-
-		/*
 		 * Check for clauses of the form: (indexkey operator constant) or
-		 * (constant operator indexkey).  Determine indexkey side first, check
-		 * the constant later.
+		 * (constant operator indexkey).  These tests should agree with
+		 * match_opclause_to_indexcol.
 		 */
 		leftop = (Node *) linitial(subClause->args);
 		rightop = (Node *) lsecond(subClause->args);
-		if (match_index_to_operand(leftop, indexcol, index))
+		if (match_index_to_operand(leftop, indexcol, index) &&
+			!bms_is_member(indexRelid, subRinfo->right_relids) &&
+			!contain_volatile_functions(rightop))
 		{
 			indexExpr = leftop;
 			constExpr = rightop;
 		}
-		else if (match_index_to_operand(rightop, indexcol, index))
+		else if (match_index_to_operand(rightop, indexcol, index) &&
+				 !bms_is_member(indexRelid, subRinfo->left_relids) &&
+				 !contain_volatile_functions(leftop))
 		{
 			opno = get_commutator(opno);
 			if (!OidIsValid(opno))
@@ -3337,26 +3378,6 @@ match_orclause_to_indexcol(PlannerInfo *root,
 		{
 			break;
 		}
-
-		/*
-		 * Ignore any RelabelType node above the operands.  This is needed to
-		 * be able to apply indexscanning in binary-compatible-operator cases.
-		 * Note: we can assume there is at most one RelabelType node;
-		 * eval_const_expressions() will have simplified if more than one.
-		 */
-		if (IsA(constExpr, RelabelType))
-			constExpr = (Node *) ((RelabelType *) constExpr)->arg;
-		if (IsA(indexExpr, RelabelType))
-			indexExpr = (Node *) ((RelabelType *) indexExpr)->arg;
-
-		/* We allow constant to be Const or Param */
-		if (!IsA(constExpr, Const) && !IsA(constExpr, Param))
-			break;
-
-		/* Forbid transformation for composite types, records. */
-		if (type_is_rowtype(exprType(constExpr)) ||
-			type_is_rowtype(exprType(indexExpr)))
-			break;
 
 		/*
 		 * Save information about the operator, type, and collation for the
@@ -3375,105 +3396,71 @@ match_orclause_to_indexcol(PlannerInfo *root,
 			 * the expression collation matches the index collation.  Also,
 			 * there must be an array type to construct an array later.
 			 */
-			if (!IndexCollMatchesExprColl(index->indexcollations[indexcol], inputcollid) ||
+			if (!IndexCollMatchesExprColl(index->indexcollations[indexcol],
+										  inputcollid) ||
 				!op_in_opfamily(matchOpno, index->opfamily[indexcol]) ||
 				!OidIsValid(arraytype))
 				break;
+
+			/*
+			 * Disallow if either type is RECORD, mainly because we can't be
+			 * positive that all the RHS expressions are the same record type.
+			 */
+			if (consttype == RECORDOID || exprType(indexExpr) == RECORDOID)
+				break;
+
 			firstTime = false;
 		}
 		else
 		{
-			if (opno != matchOpno ||
+			if (matchOpno != opno ||
 				inputcollid != subClause->inputcollid ||
 				consttype != exprType(constExpr))
 				break;
 		}
 
-		if (IsA(constExpr, Param))
-			haveParam = true;
+		/*
+		 * The righthand inputs don't necessarily have to be plain Consts, but
+		 * make_SAOP_expr needs to know if any are not.
+		 */
+		if (!IsA(constExpr, Const))
+			haveNonConst = true;
+
 		consts = lappend(consts, constExpr);
 	}
 
 	/*
-	 * Catch the break from the loop above.  Normally, a foreach() loop ends
-	 * up with a NULL list cell.  A non-NULL list cell indicates a break from
-	 * the foreach() loop.  Free the consts list and return NULL then.
+	 * Handle failed conversion from breaking out of the loop because of an
+	 * unsupported qual.  Also check that we have an indexExpr, just in case
+	 * the OR list was somehow empty (it shouldn't be).  Return NULL to
+	 * indicate the conversion failed.
 	 */
-	if (lc != NULL)
+	if (lc != NULL || indexExpr == NULL)
 	{
-		list_free(consts);
+		list_free(consts);		/* might as well */
 		return NULL;
 	}
 
 	/*
-	 * Assemble an array from the list of constants.  It seems more profitable
-	 * to build a const array.  But in the presence of parameters, we don't
-	 * have a specific value here and must employ an ArrayExpr instead.
+	 * Build the new SAOP node.  We use the indexExpr from the last OR arm;
+	 * since all the arms passed match_index_to_operand, it shouldn't matter
+	 * which one we use.  But using "inputcollid" twice is a bit of a cheat:
+	 * we might end up with an array Const node that is labeled with a
+	 * collation despite its elements being of a noncollatable type.  But
+	 * nothing is likely to complain about that, so we don't bother being more
+	 * accurate.
 	 */
-	if (haveParam)
-	{
-		ArrayExpr  *arrayExpr = makeNode(ArrayExpr);
-
-		/* array_collid will be set by parse_collate.c */
-		arrayExpr->element_typeid = consttype;
-		arrayExpr->array_typeid = arraytype;
-		arrayExpr->multidims = false;
-		arrayExpr->elements = consts;
-		arrayExpr->location = -1;
-
-		arrayNode = (Node *) arrayExpr;
-	}
-	else
-	{
-		int16		typlen;
-		bool		typbyval;
-		char		typalign;
-		Datum	   *elems;
-		int			i = 0;
-		ArrayType  *arrayConst;
-
-		get_typlenbyvalalign(consttype, &typlen, &typbyval, &typalign);
-
-		elems = (Datum *) palloc(sizeof(Datum) * list_length(consts));
-		foreach_node(Const, value, consts)
-		{
-			Assert(!value->constisnull);
-
-			elems[i++] = value->constvalue;
-		}
-
-		arrayConst = construct_array(elems, i, consttype,
-									 typlen, typbyval, typalign);
-		arrayNode = (Node *) makeConst(arraytype, -1, inputcollid,
-									   -1, PointerGetDatum(arrayConst),
-									   false, false);
-
-		pfree(elems);
-		list_free(consts);
-	}
-
-	/* Build the SAOP expression node */
-	saopexpr = makeNode(ScalarArrayOpExpr);
-	saopexpr->opno = matchOpno;
-	saopexpr->opfuncid = get_opcode(matchOpno);
-	saopexpr->hashfuncid = InvalidOid;
-	saopexpr->negfuncid = InvalidOid;
-	saopexpr->useOr = true;
-	saopexpr->inputcollid = inputcollid;
-	saopexpr->args = list_make2(indexExpr, arrayNode);
-	saopexpr->location = -1;
+	saopexpr = make_SAOP_expr(matchOpno, indexExpr, consttype, inputcollid,
+							  inputcollid, consts, haveNonConst);
+	Assert(saopexpr != NULL);
 
 	/*
-	 * Finally, build an IndexClause based on the SAOP node.  Use
-	 * make_simple_restrictinfo() to get RestrictInfo with clean selectivity
-	 * estimations, because they may differ from the estimation made for an OR
-	 * clause.  Although it is not a lossy expression, keep the original rinfo
-	 * in iclause->rinfo as prescribed.
+	 * Finally, build an IndexClause based on the SAOP node.  It's not lossy.
 	 */
 	iclause = makeNode(IndexClause);
 	iclause->rinfo = rinfo;
 	iclause->indexquals = list_make1(make_simple_restrictinfo(root,
-															  &saopexpr->xpr));
+															  (Expr *) saopexpr));
 	iclause->lossy = false;
 	iclause->indexcol = indexcol;
 	iclause->indexcols = NIL;
@@ -3675,7 +3662,7 @@ expand_indexqual_rowcompare(PlannerInfo *root,
 		{
 			RowCompareExpr *rc = makeNode(RowCompareExpr);
 
-			rc->rctype = (RowCompareType) op_strategy;
+			rc->cmptype = (CompareType) op_strategy;
 			rc->opnos = new_ops;
 			rc->opfamilies = list_copy_head(clause->opfamilies,
 											matching_cols);
@@ -3743,12 +3730,12 @@ match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 	{
 		PathKey    *pathkey = (PathKey *) lfirst(lc1);
 		bool		found = false;
-		ListCell   *lc2;
+		EquivalenceMemberIterator it;
+		EquivalenceMember *member;
 
 
 		/* Pathkey must request default sort order for the target opfamily */
-		if (pathkey->pk_strategy != BTLessStrategyNumber ||
-			pathkey->pk_nulls_first)
+		if (pathkey->pk_cmptype != COMPARE_LT || pathkey->pk_nulls_first)
 			return;
 
 		/* If eclass is volatile, no hope of using an indexscan */
@@ -3763,9 +3750,10 @@ match_pathkeys_to_index(IndexOptInfo *index, List *pathkeys,
 		 * be considered to match more than one pathkey list, which is OK
 		 * here.  See also get_eclass_for_sort_expr.)
 		 */
-		foreach(lc2, pathkey->pk_eclass->ec_members)
+		setup_eclass_member_iterator(&it, pathkey->pk_eclass,
+									 index->rel->relids);
+		while ((member = eclass_member_iterator_next(&it)) != NULL)
 		{
-			EquivalenceMember *member = (EquivalenceMember *) lfirst(lc2);
 			int			indexcol;
 
 			/* No possibility of match if it references other relations */
@@ -4062,6 +4050,16 @@ check_index_predicates(PlannerInfo *root, RelOptInfo *rel)
 		if (is_target_rel)
 			continue;
 
+		/*
+		 * If index is !amoptionalkey, also leave indrestrictinfo as set
+		 * above.  Otherwise we risk removing all quals for the first index
+		 * key and then not being able to generate an indexscan at all.  It
+		 * would be better to be more selective, but we've not yet identified
+		 * which if any of the quals match the first index key.
+		 */
+		if (!index->amoptionalkey)
+			continue;
+
 		/* Else compute indrestrictinfo as the non-implied quals */
 		index->indrestrictinfo = NIL;
 		foreach(lcr, rel->baserestrictinfo)
@@ -4129,30 +4127,25 @@ ec_member_matches_indexcol(PlannerInfo *root, RelOptInfo *rel,
  *	  a set of equality conditions, because the conditions constrain all
  *	  columns of some unique index.
  *
- * The conditions can be represented in either or both of two ways:
- * 1. A list of RestrictInfo nodes, where the caller has already determined
- * that each condition is a mergejoinable equality with an expression in
- * this relation on one side, and an expression not involving this relation
- * on the other.  The transient outer_is_left flag is used to identify which
- * side we should look at: left side if outer_is_left is false, right side
- * if it is true.
- * 2. A list of expressions in this relation, and a corresponding list of
- * equality operators. The caller must have already checked that the operators
- * represent equality.  (Note: the operators could be cross-type; the
- * expressions should correspond to their RHS inputs.)
+ * The conditions are provided as a list of RestrictInfo nodes, where the
+ * caller has already determined that each condition is a mergejoinable
+ * equality with an expression in this relation on one side, and an
+ * expression not involving this relation on the other.  The transient
+ * outer_is_left flag is used to identify which side we should look at:
+ * left side if outer_is_left is false, right side if it is true.
  *
  * The caller need only supply equality conditions arising from joins;
  * this routine automatically adds in any usable baserestrictinfo clauses.
  * (Note that the passed-in restrictlist will be destructively modified!)
+ *
+ * If extra_clauses isn't NULL, return baserestrictinfo clauses which were used
+ * to derive uniqueness.
  */
 bool
 relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
-							  List *restrictlist,
-							  List *exprlist, List *oprlist)
+							  List *restrictlist, List **extra_clauses)
 {
 	ListCell   *ic;
-
-	Assert(list_length(exprlist) == list_length(oprlist));
 
 	/* Short-circuit if no indexes... */
 	if (rel->indexlist == NIL)
@@ -4196,7 +4189,7 @@ relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/* Short-circuit the easy case */
-	if (restrictlist == NIL && exprlist == NIL)
+	if (restrictlist == NIL)
 		return false;
 
 	/* Examine each index of the relation ... */
@@ -4204,6 +4197,7 @@ relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 	{
 		IndexOptInfo *ind = (IndexOptInfo *) lfirst(ic);
 		int			c;
+		List	   *exprs = NIL;
 
 		/*
 		 * If the index is not unique, or not immediately enforced, or if it's
@@ -4217,14 +4211,12 @@ relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 			continue;
 
 		/*
-		 * Try to find each index column in the lists of conditions.  This is
+		 * Try to find each index column in the list of conditions.  This is
 		 * O(N^2) or worse, but we expect all the lists to be short.
 		 */
 		for (c = 0; c < ind->nkeycolumns; c++)
 		{
-			bool		matched = false;
 			ListCell   *lc;
-			ListCell   *lc2;
 
 			foreach(lc, restrictlist)
 			{
@@ -4254,50 +4246,38 @@ relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 
 				if (match_index_to_operand(rexpr, c, ind))
 				{
-					matched = true; /* column is unique */
-					break;
+					if (bms_membership(rinfo->clause_relids) == BMS_SINGLETON)
+					{
+						MemoryContext oldMemCtx =
+							MemoryContextSwitchTo(root->planner_cxt);
+
+						/*
+						 * Add filter clause into a list allowing caller to
+						 * know if uniqueness have made not only by join
+						 * clauses.
+						 */
+						Assert(bms_is_empty(rinfo->left_relids) ||
+							   bms_is_empty(rinfo->right_relids));
+						if (extra_clauses)
+							exprs = lappend(exprs, rinfo);
+						MemoryContextSwitchTo(oldMemCtx);
+					}
+
+					break;		/* found a match; column is unique */
 				}
 			}
 
-			if (matched)
-				continue;
-
-			forboth(lc, exprlist, lc2, oprlist)
-			{
-				Node	   *expr = (Node *) lfirst(lc);
-				Oid			opr = lfirst_oid(lc2);
-
-				/* See if the expression matches the index key */
-				if (!match_index_to_operand(expr, c, ind))
-					continue;
-
-				/*
-				 * The equality operator must be a member of the index
-				 * opfamily, else it is not asserting the right kind of
-				 * equality behavior for this index.  We assume the caller
-				 * determined it is an equality operator, so we don't need to
-				 * check any more tightly than this.
-				 */
-				if (!op_in_opfamily(opr, ind->opfamily[c]))
-					continue;
-
-				/*
-				 * XXX at some point we may need to check collations here too.
-				 * For the moment we assume all collations reduce to the same
-				 * notion of equality.
-				 */
-
-				matched = true; /* column is unique */
-				break;
-			}
-
-			if (!matched)
+			if (lc == NULL)
 				break;			/* no match; this index doesn't help us */
 		}
 
 		/* Matched all key columns of this index? */
 		if (c == ind->nkeycolumns)
+		{
+			if (extra_clauses)
+				*extra_clauses = exprs;
 			return true;
+		}
 	}
 
 	return false;
@@ -4378,12 +4358,23 @@ match_index_to_operand(Node *operand,
 	int			indkey;
 
 	/*
-	 * Ignore any RelabelType node above the operand.   This is needed to be
-	 * able to apply indexscanning in binary-compatible-operator cases. Note:
-	 * we can assume there is at most one RelabelType node;
-	 * eval_const_expressions() will have simplified if more than one.
+	 * Ignore any PlaceHolderVar node contained in the operand.  This is
+	 * needed to be able to apply indexscanning in cases where the operand (or
+	 * a subtree) has been wrapped in PlaceHolderVars to enforce separate
+	 * identity or as a result of outer joins.
 	 */
-	if (operand && IsA(operand, RelabelType))
+	operand = strip_phvs_in_index_operand(operand);
+
+	/*
+	 * Ignore any RelabelType node above the operand.  This is needed to be
+	 * able to apply indexscanning in binary-compatible-operator cases.
+	 *
+	 * Note: we must handle nested RelabelType nodes here.  While
+	 * eval_const_expressions() will have simplified them to at most one
+	 * layer, our prior stripping of PlaceHolderVars may have brought separate
+	 * RelabelTypes into adjacency.
+	 */
+	while (operand && IsA(operand, RelabelType))
 		operand = (Node *) ((RelabelType *) operand)->arg;
 
 	indkey = index->indexkeys[indexcol];
@@ -4434,6 +4425,92 @@ match_index_to_operand(Node *operand,
 	}
 
 	return false;
+}
+
+/*
+ * strip_phvs_in_index_operand
+ *	  Strip PlaceHolderVar nodes from the given operand expression to
+ *	  facilitate matching against an index's key.
+ *
+ * A PlaceHolderVar appearing in a relation-scan-level expression is
+ * effectively a no-op.  Nevertheless, to play it safe, we strip only
+ * PlaceHolderVars that are not marked nullable.
+ *
+ * The removal is performed recursively because PlaceHolderVars can be nested
+ * or interleaved with other node types.  We must peel back all layers to
+ * expose the base operand.
+ *
+ * As a performance optimization, we first use a lightweight walker to check
+ * for the presence of strippable PlaceHolderVars.  The expensive mutator is
+ * invoked only if a candidate is found, avoiding unnecessary memory allocation
+ * and tree copying in the common case where no PlaceHolderVars are present.
+ */
+Node *
+strip_phvs_in_index_operand(Node *operand)
+{
+	/* Don't mutate/copy if no target PHVs exist */
+	if (!contain_strippable_phv_walker(operand, NULL))
+		return operand;
+
+	return strip_phvs_in_index_operand_mutator(operand, NULL);
+}
+
+/*
+ * contain_strippable_phv_walker
+ *	  Detect if there are any PlaceHolderVars in the tree that are candidates
+ *	  for stripping.
+ *
+ * We identify a PlaceHolderVar as strippable only if its phnullingrels is
+ * empty.
+ */
+static bool
+contain_strippable_phv_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+
+	if (IsA(node, PlaceHolderVar))
+	{
+		PlaceHolderVar *phv = (PlaceHolderVar *) node;
+
+		if (bms_is_empty(phv->phnullingrels))
+			return true;
+	}
+
+	return expression_tree_walker(node, contain_strippable_phv_walker,
+								  context);
+}
+
+/*
+ * strip_phvs_in_index_operand_mutator
+ *	  Recursively remove PlaceHolderVars in the tree that match the criteria.
+ *
+ * We strip a PlaceHolderVar only if its phnullingrels is empty, replacing it
+ * with its contained expression.
+ */
+static Node *
+strip_phvs_in_index_operand_mutator(Node *node, void *context)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, PlaceHolderVar))
+	{
+		PlaceHolderVar *phv = (PlaceHolderVar *) node;
+
+		/* If matches the criteria, strip it */
+		if (bms_is_empty(phv->phnullingrels))
+		{
+			/* Recurse on its contained expression */
+			return strip_phvs_in_index_operand_mutator((Node *) phv->phexpr,
+													   context);
+		}
+
+		/* Otherwise, keep this PHV but check its contained expression */
+	}
+
+	return expression_tree_mutator(node, strip_phvs_in_index_operand_mutator,
+								   context);
 }
 
 /*

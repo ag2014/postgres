@@ -3,7 +3,7 @@
  * pg_visibility.c
  *	  display visibility map information and page-level visibility bits
  *
- * Copyright (c) 2016-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  *	  contrib/pg_visibility/pg_visibility.c
  *-------------------------------------------------------------------------
@@ -19,12 +19,16 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "utils/rel.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pg_visibility",
+					.version = PG_VERSION
+);
 
 typedef struct vbits
 {
@@ -266,11 +270,8 @@ pg_visibility_map_summary(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
 	Relation	rel;
-	BlockNumber nblocks;
-	BlockNumber blkno;
-	Buffer		vmbuffer = InvalidBuffer;
-	int64		all_visible = 0;
-	int64		all_frozen = 0;
+	BlockNumber all_visible = 0;
+	BlockNumber all_frozen = 0;
 	TupleDesc	tupdesc;
 	Datum		values[2];
 	bool		nulls[2] = {0};
@@ -280,33 +281,15 @@ pg_visibility_map_summary(PG_FUNCTION_ARGS)
 	/* Only some relkinds have a visibility map */
 	check_relation_relkind(rel);
 
-	nblocks = RelationGetNumberOfBlocks(rel);
+	visibilitymap_count(rel, &all_visible, &all_frozen);
 
-	for (blkno = 0; blkno < nblocks; ++blkno)
-	{
-		int32		mapbits;
-
-		/* Make sure we are interruptible. */
-		CHECK_FOR_INTERRUPTS();
-
-		/* Get map info. */
-		mapbits = (int32) visibilitymap_get_status(rel, blkno, &vmbuffer);
-		if ((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0)
-			++all_visible;
-		if ((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0)
-			++all_frozen;
-	}
-
-	/* Clean up. */
-	if (vmbuffer != InvalidBuffer)
-		ReleaseBuffer(vmbuffer);
 	relation_close(rel, AccessShareLock);
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 
-	values[0] = Int64GetDatum(all_visible);
-	values[1] = Int64GetDatum(all_frozen);
+	values[0] = Int64GetDatum((int64) all_visible);
+	values[1] = Int64GetDatum((int64) all_frozen);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
@@ -390,6 +373,7 @@ pg_truncate_visibility_map(PG_FUNCTION_ARGS)
 	Relation	rel;
 	ForkNumber	fork;
 	BlockNumber block;
+	BlockNumber old_block;
 
 	rel = relation_open(relid, AccessExclusiveLock);
 
@@ -399,15 +383,22 @@ pg_truncate_visibility_map(PG_FUNCTION_ARGS)
 	/* Forcibly reset cached file size */
 	RelationGetSmgr(rel)->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = InvalidBlockNumber;
 
+	/* Compute new and old size before entering critical section. */
+	fork = VISIBILITYMAP_FORKNUM;
 	block = visibilitymap_prepare_truncate(rel, 0);
-	if (BlockNumberIsValid(block))
-	{
-		fork = VISIBILITYMAP_FORKNUM;
-		smgrtruncate(RelationGetSmgr(rel), &fork, 1, &block);
-	}
+	old_block = BlockNumberIsValid(block) ? smgrnblocks(RelationGetSmgr(rel), fork) : 0;
+
+	/*
+	 * WAL-logging, buffer dropping, file truncation must be atomic and all on
+	 * one side of a checkpoint.  See RelationTruncate() for discussion.
+	 */
+	Assert((MyProc->delayChkptFlags & (DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE)) == 0);
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE;
+	START_CRIT_SECTION();
 
 	if (RelationNeedsWAL(rel))
 	{
+		XLogRecPtr	lsn;
 		xl_smgr_truncate xlrec;
 
 		xlrec.blkno = 0;
@@ -415,10 +406,18 @@ pg_truncate_visibility_map(PG_FUNCTION_ARGS)
 		xlrec.flags = SMGR_TRUNCATE_VM;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+		XLogRegisterData(&xlrec, sizeof(xlrec));
 
-		XLogInsert(RM_SMGR_ID, XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
+		lsn = XLogInsert(RM_SMGR_ID,
+						 XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
+		XLogFlush(lsn);
 	}
+
+	if (BlockNumberIsValid(block))
+		smgrtruncate(RelationGetSmgr(rel), &fork, 1, &old_block, &block);
+
+	END_CRIT_SECTION();
+	MyProc->delayChkptFlags &= ~(DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE);
 
 	/*
 	 * Release the lock right away, not at commit time.
@@ -470,6 +469,8 @@ pg_visibility_tupdesc(bool include_blkno, bool include_pd)
 		TupleDescInitEntry(tupdesc, ++a, "pd_all_visible", BOOLOID, -1, 0);
 	Assert(a == maxattr);
 
+	TupleDescFinalize(tupdesc);
+
 	return BlessTupleDesc(tupdesc);
 }
 
@@ -506,7 +507,13 @@ collect_visibility_data(Oid relid, bool include_pd)
 	{
 		p.current_blocknum = 0;
 		p.last_exclusive = nblocks;
-		stream = read_stream_begin_relation(READ_STREAM_FULL,
+
+		/*
+		 * It is safe to use batchmode as block_range_read_stream_cb takes no
+		 * locks.
+		 */
+		stream = read_stream_begin_relation(READ_STREAM_FULL |
+											READ_STREAM_USE_BATCHING,
 											bstrategy,
 											rel,
 											MAIN_FORKNUM,
@@ -715,7 +722,7 @@ collect_corrupt_items(Oid relid, bool all_visible, bool all_frozen)
 	 * number of entries allocated.  We'll repurpose these fields before
 	 * returning.
 	 */
-	items = palloc0(sizeof(corrupt_items));
+	items = palloc0_object(corrupt_items);
 	items->next = 0;
 	items->count = 64;
 	items->tids = palloc(items->count * sizeof(ItemPointerData));
@@ -813,7 +820,7 @@ collect_corrupt_items(Oid relid, bool all_visible, bool all_frozen)
 				 *
 				 * From a concurrency point of view, it sort of sucks to
 				 * retake ProcArrayLock here while we're holding the buffer
-				 * exclusively locked, but it should be safe against
+				 * locked in shared mode, but it should be safe against
 				 * deadlocks, because surely
 				 * GetStrictOldestNonRemovableTransactionId() should never
 				 * take a buffer lock. And this shouldn't happen often, so

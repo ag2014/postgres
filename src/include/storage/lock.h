@@ -4,7 +4,7 @@
  *	  POSTGRES low-level lock mechanism
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/lock.h
@@ -18,6 +18,7 @@
 #error "lock.h may not be included from frontend code"
 #endif
 
+#include "access/transam.h"
 #include "lib/ilist.h"
 #include "storage/lockdefs.h"
 #include "storage/lwlock.h"
@@ -30,6 +31,7 @@ typedef struct PGPROC PGPROC;
 
 /* GUC variables */
 extern PGDLLIMPORT int max_locks_per_xact;
+extern PGDLLIMPORT bool log_lock_failures;
 
 #ifdef LOCK_DEBUG
 extern PGDLLIMPORT int Trace_lock_oidmin;
@@ -560,7 +562,8 @@ extern LockAcquireResult LockAcquireExtended(const LOCKTAG *locktag,
 											 bool sessionLock,
 											 bool dontWait,
 											 bool reportMemoryError,
-											 LOCALLOCK **locallockp);
+											 LOCALLOCK **locallockp,
+											 bool logLockFailure);
 extern void AbortStrongLockAcquire(void);
 extern void MarkLockClear(LOCALLOCK *locallock);
 extern bool LockRelease(const LOCKTAG *locktag,
@@ -579,13 +582,14 @@ extern bool LockHasWaiters(const LOCKTAG *locktag,
 extern VirtualTransactionId *GetLockConflicts(const LOCKTAG *locktag,
 											  LOCKMODE lockmode, int *countp);
 extern void AtPrepare_Locks(void);
-extern void PostPrepare_Locks(TransactionId xid);
+extern void PostPrepare_Locks(FullTransactionId fxid);
 extern bool LockCheckConflicts(LockMethod lockMethodTable,
 							   LOCKMODE lockmode,
 							   LOCK *lock, PROCLOCK *proclock);
 extern void GrantLock(LOCK *lock, PROCLOCK *proclock, LOCKMODE lockmode);
 extern void GrantAwaitedLock(void);
 extern LOCALLOCK *GetAwaitedLock(void);
+extern void ResetAwaitedLock(void);
 
 extern void RemoveFromWaitQueue(PGPROC *proc, uint32 hashcode);
 extern LockData *GetLockStatusData(void);
@@ -594,18 +598,18 @@ extern BlockedProcsData *GetBlockerStatusData(int blocked_pid);
 extern xl_standby_lock *GetRunningTransactionLocks(int *nlocks);
 extern const char *GetLockmodeName(LOCKMETHODID lockmethodid, LOCKMODE mode);
 
-extern void lock_twophase_recover(TransactionId xid, uint16 info,
+extern void lock_twophase_recover(FullTransactionId fxid, uint16 info,
 								  void *recdata, uint32 len);
-extern void lock_twophase_postcommit(TransactionId xid, uint16 info,
+extern void lock_twophase_postcommit(FullTransactionId fxid, uint16 info,
 									 void *recdata, uint32 len);
-extern void lock_twophase_postabort(TransactionId xid, uint16 info,
+extern void lock_twophase_postabort(FullTransactionId fxid, uint16 info,
 									void *recdata, uint32 len);
-extern void lock_twophase_standby_recover(TransactionId xid, uint16 info,
+extern void lock_twophase_standby_recover(FullTransactionId fxid, uint16 info,
 										  void *recdata, uint32 len);
 
 extern DeadLockState DeadLockCheck(PGPROC *proc);
 extern PGPROC *GetBlockingAutoVacuumPgproc(void);
-extern void DeadLockReport(void) pg_attribute_noreturn();
+pg_noreturn extern void DeadLockReport(void);
 extern void RememberSimpleDeadLock(PGPROC *proc1,
 								   LOCKMODE lockmode,
 								   LOCK *lock,

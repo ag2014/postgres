@@ -17,10 +17,10 @@
  * the same APIs that astreamer_gzip_writer now uses, and it didn't seem
  * necessary to change anything at the time.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *		  src/bin/pg_basebackup/astreamer_gzip.c
+ *		  src/fe_utils/astreamer_gzip.c
  *-------------------------------------------------------------------------
  */
 
@@ -102,7 +102,7 @@ astreamer_gzip_writer_new(char *pathname, FILE *file,
 #ifdef HAVE_LIBZ
 	astreamer_gzip_writer *streamer;
 
-	streamer = palloc0(sizeof(astreamer_gzip_writer));
+	streamer = palloc0_object(astreamer_gzip_writer);
 	*((const astreamer_ops **) &streamer->base.bbs_ops) =
 		&astreamer_gzip_writer_ops;
 
@@ -241,7 +241,7 @@ astreamer_gzip_decompressor_new(astreamer *next)
 
 	Assert(next != NULL);
 
-	streamer = palloc0(sizeof(astreamer_gzip_decompressor));
+	streamer = palloc0_object(astreamer_gzip_decompressor);
 	*((const astreamer_ops **) &streamer->base.bbs_ops) =
 		&astreamer_gzip_decompressor_ops;
 
@@ -317,7 +317,7 @@ astreamer_gzip_decompressor_content(astreamer *streamer,
 		res = inflate(zs, Z_NO_FLUSH);
 
 		if (res == Z_STREAM_ERROR)
-			pg_log_error("could not decompress data: %s", zs->msg);
+			pg_fatal("could not decompress data: %s", zs->msg);
 
 		mystreamer->bytes_written =
 			mystreamer->base.bbs_buffer.maxlen - zs->avail_out;

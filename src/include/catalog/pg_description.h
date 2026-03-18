@@ -23,7 +23,7 @@
  * for example).
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_description.h
@@ -38,13 +38,15 @@
 #define PG_DESCRIPTION_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_description_d.h"
+#include "catalog/pg_description_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_description definition.  cpp turns this into
  *		typedef struct FormData_pg_description
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_description,2609,DescriptionRelationId)
 {
 	Oid			objoid;			/* OID of object itself */
@@ -55,6 +57,8 @@ CATALOG(pg_description,2609,DescriptionRelationId)
 	text		description BKI_FORCE_NOT_NULL; /* description of object */
 #endif
 } FormData_pg_description;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_description corresponds to a pointer to a tuple with

@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # logical replication of 2PC test
 use strict;
@@ -373,7 +373,14 @@ $result =
   $node_publisher->safe_psql('postgres', "SELECT count(*) FROM tab_copy;");
 is($result, qq(6), 'publisher inserted data');
 
+# Wait for both subscribers to catchup
 $node_publisher->wait_for_catchup($appname_copy);
+$node_publisher->wait_for_catchup($appname);
+
+# Make sure there are no prepared transactions on the subscriber
+$result = $node_subscriber->safe_psql('postgres',
+	"SELECT count(*) FROM pg_prepared_xacts;");
+is($result, qq(0), 'should be no prepared transactions on subscriber');
 
 $result =
   $node_subscriber->safe_psql('postgres', "SELECT count(*) FROM tab_copy;");

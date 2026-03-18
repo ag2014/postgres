@@ -3,7 +3,7 @@
  * test_radixtree.c
  *		Test module for adaptive radix tree.
  *
- * Copyright (c) 2024, PostgreSQL Global Development Group
+ * Copyright (c) 2024-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/test_radixtree/test_radixtree.c
@@ -44,7 +44,7 @@
 		uint64		_expected = (expected_expr); \
 		if (_result != _expected) \
 			elog(ERROR, \
-				 "%s yielded " UINT64_HEX_FORMAT ", expected " UINT64_HEX_FORMAT " (%s) in file \"%s\" line %u", \
+				 "%s yielded %" PRIx64 ", expected %" PRIx64 " (%s) in file \"%s\" line %u", \
 				 #result_expr, _result, _expected, #expected_expr, __FILE__, __LINE__); \
 	} while (0)
 
@@ -120,25 +120,21 @@ PG_FUNCTION_INFO_V1(test_radixtree);
 static void
 test_empty(void)
 {
-	MemoryContext radixtree_ctx;
 	rt_radix_tree *radixtree;
 	rt_iter    *iter;
 	uint64		key;
 #ifdef TEST_SHARED_RT
-	int			tranche_id = LWLockNewTrancheId();
+	int			tranche_id = LWLockNewTrancheId("test_radix_tree");
 	dsa_area   *dsa;
-#endif
+
+	dsa = dsa_create(tranche_id);
+	radixtree = rt_create(dsa, tranche_id);
+#else
+	MemoryContext radixtree_ctx;
 
 	radixtree_ctx = AllocSetContextCreate(CurrentMemoryContext,
 										  "test_radix_tree",
 										  ALLOCSET_SMALL_SIZES);
-
-#ifdef TEST_SHARED_RT
-	LWLockRegisterTranche(tranche_id, "test_radix_tree");
-	dsa = dsa_create(tranche_id);
-
-	radixtree = rt_create(radixtree_ctx, dsa, tranche_id);
-#else
 	radixtree = rt_create(radixtree_ctx);
 #endif
 
@@ -165,33 +161,29 @@ test_empty(void)
 static void
 test_basic(rt_node_class_test_elem *test_info, int shift, bool asc)
 {
-	MemoryContext radixtree_ctx;
 	rt_radix_tree *radixtree;
 	rt_iter    *iter;
 	uint64	   *keys;
 	int			children = test_info->nkeys;
 #ifdef TEST_SHARED_RT
-	int			tranche_id = LWLockNewTrancheId();
+	int			tranche_id = LWLockNewTrancheId("test_radix_tree");
 	dsa_area   *dsa;
-#endif
+
+	dsa = dsa_create(tranche_id);
+	radixtree = rt_create(dsa, tranche_id);
+#else
+	MemoryContext radixtree_ctx;
 
 	radixtree_ctx = AllocSetContextCreate(CurrentMemoryContext,
 										  "test_radix_tree",
 										  ALLOCSET_SMALL_SIZES);
-
-#ifdef TEST_SHARED_RT
-	LWLockRegisterTranche(tranche_id, "test_radix_tree");
-	dsa = dsa_create(tranche_id);
-
-	radixtree = rt_create(radixtree_ctx, dsa, tranche_id);
-#else
 	radixtree = rt_create(radixtree_ctx);
 #endif
 
 	elog(NOTICE, "testing node %s with shift %d and %s keys",
 		 test_info->class_name, shift, asc ? "ascending" : "descending");
 
-	keys = palloc(sizeof(uint64) * children);
+	keys = palloc_array(uint64, children);
 	for (int i = 0; i < children; i++)
 	{
 		if (asc)
@@ -227,7 +219,7 @@ test_basic(rt_node_class_test_elem *test_info, int shift, bool asc)
 		TestValueType update = keys[i] + 1;
 
 		/* rt_set should report the key found */
-		EXPECT_TRUE(rt_set(radixtree, keys[i], (TestValueType *) &update));
+		EXPECT_TRUE(rt_set(radixtree, keys[i], &update));
 	}
 
 	/* delete and re-insert keys */
@@ -300,7 +292,6 @@ key_cmp(const void *a, const void *b)
 static void
 test_random(void)
 {
-	MemoryContext radixtree_ctx;
 	rt_radix_tree *radixtree;
 	rt_iter    *iter;
 	pg_prng_state state;
@@ -311,20 +302,18 @@ test_random(void)
 	int			num_keys = 100000;
 	uint64	   *keys;
 #ifdef TEST_SHARED_RT
-	int			tranche_id = LWLockNewTrancheId();
+	int			tranche_id = LWLockNewTrancheId("test_radix_tree");
 	dsa_area   *dsa;
-#endif
 
-	radixtree_ctx = AllocSetContextCreate(CurrentMemoryContext,
-										  "test_radix_tree",
-										  ALLOCSET_SMALL_SIZES);
-
-#ifdef TEST_SHARED_RT
-	LWLockRegisterTranche(tranche_id, "test_radix_tree");
 	dsa = dsa_create(tranche_id);
-
-	radixtree = rt_create(radixtree_ctx, dsa, tranche_id);
+	radixtree = rt_create(dsa, tranche_id);
 #else
+	MemoryContext radixtree_ctx;
+
+	radixtree_ctx = SlabContextCreate(CurrentMemoryContext,
+									  "test_radix_tree",
+									  SLAB_DEFAULT_BLOCK_SIZE,
+									  sizeof(TestValueType));
 	radixtree = rt_create(radixtree_ctx);
 #endif
 

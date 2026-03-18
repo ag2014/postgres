@@ -7,6 +7,8 @@
 #include "btree_utils_num.h"
 #include "common/int.h"
 #include "utils/cash.h"
+#include "utils/rel.h"
+#include "utils/sortsupport.h"
 
 typedef struct
 {
@@ -14,9 +16,7 @@ typedef struct
 	Cash		upper;
 } cashKEY;
 
-/*
-** Cash ops
-*/
+/* GiST support functions */
 PG_FUNCTION_INFO_V1(gbt_cash_compress);
 PG_FUNCTION_INFO_V1(gbt_cash_fetch);
 PG_FUNCTION_INFO_V1(gbt_cash_union);
@@ -25,6 +25,7 @@ PG_FUNCTION_INFO_V1(gbt_cash_consistent);
 PG_FUNCTION_INFO_V1(gbt_cash_distance);
 PG_FUNCTION_INFO_V1(gbt_cash_penalty);
 PG_FUNCTION_INFO_V1(gbt_cash_same);
+PG_FUNCTION_INFO_V1(gbt_cash_sortsupport);
 
 static bool
 gbt_cashgt(const void *a, const void *b, FmgrInfo *flinfo)
@@ -111,10 +112,10 @@ cash_dist(PG_FUNCTION_ARGS)
 	PG_RETURN_CASH(ra);
 }
 
-/**************************************************
- * Cash ops
- **************************************************/
 
+/**************************************************
+ * GiST support functions
+ **************************************************/
 
 Datum
 gbt_cash_compress(PG_FUNCTION_ARGS)
@@ -138,8 +139,9 @@ gbt_cash_consistent(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	Cash		query = PG_GETARG_CASH(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	cashKEY    *kkk = (cashKEY *) DatumGetPointer(entry->key);
 	GBT_NUMKEY_R key;
@@ -155,14 +157,14 @@ gbt_cash_consistent(PG_FUNCTION_ARGS)
 									  fcinfo->flinfo));
 }
 
-
 Datum
 gbt_cash_distance(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	Cash		query = PG_GETARG_CASH(1);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	cashKEY    *kkk = (cashKEY *) DatumGetPointer(entry->key);
 	GBT_NUMKEY_R key;
 
@@ -173,7 +175,6 @@ gbt_cash_distance(PG_FUNCTION_ARGS)
 									  &tinfo, fcinfo->flinfo));
 }
 
-
 Datum
 gbt_cash_union(PG_FUNCTION_ARGS)
 {
@@ -183,7 +184,6 @@ gbt_cash_union(PG_FUNCTION_ARGS)
 	*(int *) PG_GETARG_POINTER(1) = sizeof(cashKEY);
 	PG_RETURN_POINTER(gbt_num_union(out, entryvec, &tinfo, fcinfo->flinfo));
 }
-
 
 Datum
 gbt_cash_penalty(PG_FUNCTION_ARGS)
@@ -214,4 +214,30 @@ gbt_cash_same(PG_FUNCTION_ARGS)
 
 	*result = gbt_num_same((void *) b1, (void *) b2, &tinfo, fcinfo->flinfo);
 	PG_RETURN_POINTER(result);
+}
+
+static int
+gbt_cash_ssup_cmp(Datum x, Datum y, SortSupport ssup)
+{
+	cashKEY    *arg1 = (cashKEY *) DatumGetPointer(x);
+	cashKEY    *arg2 = (cashKEY *) DatumGetPointer(y);
+
+	/* for leaf items we expect lower == upper, so only compare lower */
+	if (arg1->lower > arg2->lower)
+		return 1;
+	else if (arg1->lower < arg2->lower)
+		return -1;
+	else
+		return 0;
+}
+
+Datum
+gbt_cash_sortsupport(PG_FUNCTION_ARGS)
+{
+	SortSupport ssup = (SortSupport) PG_GETARG_POINTER(0);
+
+	ssup->comparator = gbt_cash_ssup_cmp;
+	ssup->ssup_extra = NULL;
+
+	PG_RETURN_VOID();
 }

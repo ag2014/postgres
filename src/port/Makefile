@@ -44,7 +44,11 @@ OBJS = \
 	noblock.o \
 	path.o \
 	pg_bitutils.o \
-	pg_popcount_avx512.o \
+	pg_cpu_x86.o \
+	pg_localeconv_r.o \
+	pg_numa.o \
+	pg_popcount_aarch64.o \
+	pg_popcount_x86.o \
 	pg_strong_random.o \
 	pgcheckdir.o \
 	pgmkdirp.o \

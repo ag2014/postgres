@@ -4,7 +4,7 @@
  *	  POSTGRES LIBPQ buffer structure definitions.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/libpq/libpq.h
@@ -18,7 +18,10 @@
 
 #include "lib/stringinfo.h"
 #include "libpq/libpq-be.h"
-#include "storage/latch.h"
+
+
+/* avoid including waiteventset.h */
+typedef struct WaitEventSet WaitEventSet;
 
 
 /*
@@ -71,7 +74,7 @@ extern int	AcceptConnection(pgsocket server_fd, ClientSocket *client_sock);
 extern void TouchSocketFiles(void);
 extern void RemoveSocketFiles(void);
 extern Port *pq_init(ClientSocket *client_sock);
-extern int	pq_getbytes(char *s, size_t len);
+extern int	pq_getbytes(void *b, size_t len);
 extern void pq_startmsgread(void);
 extern void pq_endmsgread(void);
 extern bool pq_is_reading_msg(void);
@@ -92,7 +95,7 @@ extern void secure_destroy(void);
 extern int	secure_open_server(Port *port);
 extern void secure_close(Port *port);
 extern ssize_t secure_read(Port *port, void *ptr, size_t len);
-extern ssize_t secure_write(Port *port, void *ptr, size_t len);
+extern ssize_t secure_write(Port *port, const void *ptr, size_t len);
 extern ssize_t secure_raw_read(Port *port, void *ptr, size_t len);
 extern ssize_t secure_raw_write(Port *port, const void *ptr, size_t len);
 
@@ -116,6 +119,24 @@ extern PGDLLIMPORT char *SSLECDHCurve;
 extern PGDLLIMPORT bool SSLPreferServerCiphers;
 #ifdef USE_SSL
 extern PGDLLIMPORT bool ssl_loaded_verify_locations;
+#endif
+
+#ifdef USE_SSL
+#define SSL_LIBRARY "OpenSSL"
+#else
+#define SSL_LIBRARY ""
+#endif
+
+#ifdef USE_OPENSSL
+#define DEFAULT_SSL_CIPHERS "HIGH:MEDIUM:+3DES:!aNULL"
+#else
+#define DEFAULT_SSL_CIPHERS "none"
+#endif
+
+#ifdef USE_SSL
+#define DEFAULT_SSL_GROUPS "X25519:prime256v1"
+#else
+#define DEFAULT_SSL_GROUPS "none"
 #endif
 
 /*

@@ -61,6 +61,11 @@ in both master and the branch.
 * Ports
 	o update ports list in doc/src/sgml/installation.sgml
 
+* Create .abi-compliance-history file with initial entry shortly before the .0
+  stamp.  The easiest way to do this is to copy it from the previous
+  REL_*_STABLE branch, remove all entries, and follow the instructions in the
+  file to add the initial reference point for the major version.
+
 
 Pre-Beta Tasks
 ==============
@@ -88,6 +93,9 @@ Starting a New Development Cycle
 
 * Typically, we do pgindent and perltidy runs just before branching,
   as well as before beta (complete steps from src/tools/pgindent/README)
+
+* It's also advisable to check that copyright years are up-to-date
+  (run src/tools/copyright.pl, commit any changes it finds)
 
 * Create a branch in git for maintenance of the previous release
 	o on master branch, do:

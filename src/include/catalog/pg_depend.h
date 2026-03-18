@@ -17,7 +17,7 @@
  * convenient to find from the contents of other catalogs.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_depend.h
@@ -32,13 +32,15 @@
 #define PG_DEPEND_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_depend_d.h"
+#include "catalog/pg_depend_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_depend definition.  cpp turns this into
  *		typedef struct FormData_pg_depend
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_depend,2608,DependRelationId)
 {
 	/*
@@ -63,6 +65,8 @@ CATALOG(pg_depend,2608,DependRelationId)
 	 */
 	char		deptype;		/* see codes in dependency.h */
 } FormData_pg_depend;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_depend corresponds to a pointer to a row with

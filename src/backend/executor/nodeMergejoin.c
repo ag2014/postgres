@@ -3,7 +3,7 @@
  * nodeMergejoin.c
  *	  routines supporting merge joins
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -94,9 +94,11 @@
 
 #include "access/nbtree.h"
 #include "executor/execdebug.h"
+#include "executor/instrument.h"
 #include "executor/nodeMergejoin.h"
 #include "miscadmin.h"
 #include "utils/lsyscache.h"
+#include "utils/sortsupport.h"
 
 
 /*
@@ -220,7 +222,7 @@ MJExamineQuals(List *mergeclauses,
 								   &op_strategy,
 								   &op_lefttype,
 								   &op_righttype);
-		if (op_strategy != BTEqualStrategyNumber)	/* should not happen */
+		if (IndexAmTranslateStrategy(op_strategy, get_opfamily_method(opfamily), opfamily, true) != COMPARE_EQ) /* should not happen */
 			elog(ERROR, "cannot merge using non-equality operator %u",
 				 qual->opno);
 

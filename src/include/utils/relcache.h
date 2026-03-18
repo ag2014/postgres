@@ -4,7 +4,7 @@
  *	  Relation descriptor cache definitions.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/relcache.h
@@ -37,6 +37,14 @@ typedef Relation *RelationPtr;
 /*
  * Routines to open (lookup) and close a relcache entry
  */
+#ifdef USE_ASSERT_CHECKING
+extern void AssertCouldGetRelation(void);
+#else
+static inline void
+AssertCouldGetRelation(void)
+{
+}
+#endif
 extern Relation RelationIdGetRelation(Oid relationId);
 extern void RelationClose(Relation relation);
 

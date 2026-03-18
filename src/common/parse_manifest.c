@@ -3,7 +3,7 @@
  * parse_manifest.c
  *	  Parse a backup manifest in JSON format.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/common/parse_manifest.c
@@ -114,8 +114,8 @@ static void json_manifest_finalize_wal_range(JsonManifestParseState *parse);
 static void verify_manifest_checksum(JsonManifestParseState *parse,
 									 const char *buffer, size_t size,
 									 pg_cryptohash_ctx *incr_ctx);
-static void json_manifest_parse_failure(JsonManifestParseContext *context,
-										char *msg);
+pg_noreturn static void json_manifest_parse_failure(JsonManifestParseContext *context,
+													char *msg);
 
 static int	hexdecode_char(char c);
 static bool hexdecode_string(uint8 *result, char *input, int nbytes);
@@ -132,8 +132,8 @@ json_parse_manifest_incremental_init(JsonManifestParseContext *context)
 	JsonManifestParseState *parse;
 	pg_cryptohash_ctx *manifest_ctx;
 
-	incstate = palloc(sizeof(JsonManifestParseIncrementalState));
-	parse = palloc(sizeof(JsonManifestParseState));
+	incstate = palloc_object(JsonManifestParseIncrementalState);
+	parse = palloc_object(JsonManifestParseState);
 
 	parse->context = context;
 	parse->state = JM_EXPECT_TOPLEVEL_START;
@@ -889,6 +889,7 @@ static void
 json_manifest_parse_failure(JsonManifestParseContext *context, char *msg)
 {
 	context->error_cb(context, "could not parse backup manifest: %s", msg);
+	pg_unreachable();
 }
 
 /*
@@ -941,7 +942,7 @@ parse_xlogrecptr(XLogRecPtr *result, char *input)
 	uint32		hi;
 	uint32		lo;
 
-	if (sscanf(input, "%X/%X", &hi, &lo) != 2)
+	if (sscanf(input, "%X/%08X", &hi, &lo) != 2)
 		return false;
 	*result = ((uint64) hi) << 32 | lo;
 	return true;

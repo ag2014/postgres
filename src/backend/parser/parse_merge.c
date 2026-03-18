@@ -3,7 +3,7 @@
  * parse_merge.c
  *	  handle merge-statement in parser
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -247,8 +247,8 @@ transformMergeStmt(ParseState *pstate, MergeStmt *stmt)
 	qry->jointree = makeFromExpr(pstate->p_joinlist, NULL);
 
 	/* Transform the RETURNING list, if any */
-	qry->returningList = transformReturningList(pstate, stmt->returningList,
-												EXPR_KIND_MERGE_RETURNING);
+	transformReturningClause(pstate, qry, stmt->returningClause,
+							 EXPR_KIND_MERGE_RETURNING);
 
 	/*
 	 * We now have a good query shape, so now look at the WHEN conditions and
@@ -306,8 +306,6 @@ transformMergeStmt(ParseState *pstate, MergeStmt *stmt)
 					ListCell   *attnos;
 					List	   *icolumns;
 					List	   *attrnos;
-
-					pstate->p_is_insert = true;
 
 					icolumns = checkInsertTargets(pstate,
 												  mergeWhenClause->targetList,
@@ -381,12 +379,9 @@ transformMergeStmt(ParseState *pstate, MergeStmt *stmt)
 				}
 				break;
 			case CMD_UPDATE:
-				{
-					pstate->p_is_insert = false;
-					action->targetList =
-						transformUpdateTargetList(pstate,
-												  mergeWhenClause->targetList);
-				}
+				action->targetList =
+					transformUpdateTargetList(pstate,
+											  mergeWhenClause->targetList);
 				break;
 			case CMD_DELETE:
 				break;

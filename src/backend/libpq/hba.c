@@ -5,7 +5,7 @@
  *	  wherein you authenticate a user by seeing what IP address the system
  *	  says he comes from and choosing authentication method based on it).
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -32,6 +32,7 @@
 #include "libpq/hba.h"
 #include "libpq/ifaddr.h"
 #include "libpq/libpq-be.h"
+#include "libpq/oauth.h"
 #include "postmaster/postmaster.h"
 #include "regex/regex.h"
 #include "replication/walsender.h"
@@ -114,7 +115,8 @@ static const char *const UserAuthName[] =
 	"ldap",
 	"cert",
 	"radius",
-	"peer"
+	"peer",
+	"oauth",
 };
 
 /*
@@ -136,14 +138,11 @@ static int	regexec_auth_token(const char *match, AuthToken *token,
 static void tokenize_error_callback(void *arg);
 
 
-/*
- * isblank() exists in the ISO C99 spec, but it's not very portable yet,
- * so provide our own version.
- */
-bool
+static bool
 pg_isblank(const char c)
 {
-	return c == ' ' || c == '\t' || c == '\r';
+	/* don't accept non-ASCII data */
+	return (!IS_HIGHBIT_SET(c) && isblank(c));
 }
 
 
@@ -310,7 +309,7 @@ regcomp_auth_token(AuthToken *token, char *filename, int line_num,
 	if (token->string[0] != '/')
 		return 0;				/* nothing to compile */
 
-	token->regex = (regex_t *) palloc0(sizeof(regex_t));
+	token->regex = palloc0_object(regex_t);
 	wstr = palloc((strlen(token->string + 1) + 1) * sizeof(pg_wchar));
 	wlen = pg_mb2wchar_with_len(token->string + 1,
 								wstr, strlen(token->string + 1));
@@ -892,7 +891,7 @@ process_line:
 		 * to this list.
 		 */
 		oldcxt = MemoryContextSwitchTo(tokenize_context);
-		tok_line = (TokenizedAuthLine *) palloc0(sizeof(TokenizedAuthLine));
+		tok_line = palloc0_object(TokenizedAuthLine);
 		tok_line->fields = current_line;
 		tok_line->file_name = pstrdup(filename);
 		tok_line->line_num = line_number;
@@ -1073,7 +1072,7 @@ hostname_match(const char *pattern, const char *actual_hostname)
  * Check to see if a connecting IP matches a given host name.
  */
 static bool
-check_hostname(hbaPort *port, const char *hostname)
+check_hostname(Port *port, const char *hostname)
 {
 	struct addrinfo *gai_result,
 			   *gai;
@@ -1340,7 +1339,7 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 	AuthToken  *token;
 	HbaLine    *parsedline;
 
-	parsedline = palloc0(sizeof(HbaLine));
+	parsedline = palloc0_object(HbaLine);
 	parsedline->sourcefile = pstrdup(file_name);
 	parsedline->linenumber = line_num;
 	parsedline->rawline = pstrdup(tok_line->raw_line);
@@ -1747,6 +1746,8 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 #endif
 	else if (strcmp(token->string, "radius") == 0)
 		parsedline->auth_method = uaRADIUS;
+	else if (strcmp(token->string, "oauth") == 0)
+		parsedline->auth_method = uaOAuth;
 	else
 	{
 		ereport(elevel,
@@ -2039,6 +2040,36 @@ parse_hba_line(TokenizedAuthLine *tok_line, int elevel)
 		parsedline->clientcert = clientCertFull;
 	}
 
+	/*
+	 * Enforce proper configuration of OAuth authentication.
+	 */
+	if (parsedline->auth_method == uaOAuth)
+	{
+		MANDATORY_AUTH_ARG(parsedline->oauth_scope, "scope", "oauth");
+		MANDATORY_AUTH_ARG(parsedline->oauth_issuer, "issuer", "oauth");
+
+		/* Ensure a validator library is set and permitted by the config. */
+		if (!check_oauth_validator(parsedline, elevel, err_msg))
+			return NULL;
+
+		/*
+		 * Supplying a usermap combined with the option to skip usermapping is
+		 * nonsensical and indicates a configuration error.
+		 */
+		if (parsedline->oauth_skip_usermap && parsedline->usermap != NULL)
+		{
+			ereport(elevel,
+					errcode(ERRCODE_CONFIG_FILE_ERROR),
+			/* translator: strings are replaced with hba options */
+					errmsg("%s cannot be used in combination with %s",
+						   "map", "delegate_ident_mapping"),
+					errcontext("line %d of configuration file \"%s\"",
+							   line_num, file_name));
+			*err_msg = "map cannot be used in combination with delegate_ident_mapping";
+			return NULL;
+		}
+	}
+
 	return parsedline;
 }
 
@@ -2066,8 +2097,9 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 			hbaline->auth_method != uaPeer &&
 			hbaline->auth_method != uaGSS &&
 			hbaline->auth_method != uaSSPI &&
-			hbaline->auth_method != uaCert)
-			INVALID_AUTH_OPTION("map", gettext_noop("ident, peer, gssapi, sspi, and cert"));
+			hbaline->auth_method != uaCert &&
+			hbaline->auth_method != uaOAuth)
+			INVALID_AUTH_OPTION("map", gettext_noop("ident, peer, gssapi, sspi, cert, and oauth"));
 		hbaline->usermap = pstrdup(val);
 	}
 	else if (strcmp(name, "clientcert") == 0)
@@ -2450,6 +2482,29 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
 		hbaline->radiusidentifiers = parsed_identifiers;
 		hbaline->radiusidentifiers_s = pstrdup(val);
 	}
+	else if (strcmp(name, "issuer") == 0)
+	{
+		REQUIRE_AUTH_OPTION(uaOAuth, "issuer", "oauth");
+		hbaline->oauth_issuer = pstrdup(val);
+	}
+	else if (strcmp(name, "scope") == 0)
+	{
+		REQUIRE_AUTH_OPTION(uaOAuth, "scope", "oauth");
+		hbaline->oauth_scope = pstrdup(val);
+	}
+	else if (strcmp(name, "validator") == 0)
+	{
+		REQUIRE_AUTH_OPTION(uaOAuth, "validator", "oauth");
+		hbaline->oauth_validator = pstrdup(val);
+	}
+	else if (strcmp(name, "delegate_ident_mapping") == 0)
+	{
+		REQUIRE_AUTH_OPTION(uaOAuth, "delegate_ident_mapping", "oauth");
+		if (strcmp(val, "1") == 0)
+			hbaline->oauth_skip_usermap = true;
+		else
+			hbaline->oauth_skip_usermap = false;
+	}
 	else
 	{
 		ereport(elevel,
@@ -2470,7 +2525,7 @@ parse_hba_auth_opt(char *name, char *val, HbaLine *hbaline,
  *	request.
  */
 static void
-check_hba(hbaPort *port)
+check_hba(Port *port)
 {
 	Oid			roleid;
 	ListCell   *line;
@@ -2567,7 +2622,7 @@ check_hba(hbaPort *port)
 	}
 
 	/* If no matching entry was found, then implicitly reject. */
-	hba = palloc0(sizeof(HbaLine));
+	hba = palloc0_object(HbaLine);
 	hba->auth_method = uaImplicitReject;
 	port->hba = hba;
 }
@@ -2703,7 +2758,7 @@ parse_ident_line(TokenizedAuthLine *tok_line, int elevel)
 	Assert(tok_line->fields != NIL);
 	field = list_head(tok_line->fields);
 
-	parsedline = palloc0(sizeof(IdentLine));
+	parsedline = palloc0_object(IdentLine);
 	parsedline->linenumber = line_num;
 
 	/* Get the map token (must exist) */
@@ -2815,8 +2870,11 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 			!token_has_regexp(identLine->pg_user) &&
 			(ofs = strstr(identLine->pg_user->string, "\\1")) != NULL)
 		{
+			const char *repl_str;
+			size_t		repl_len;
+			char	   *old_pg_user;
 			char	   *expanded_pg_user;
-			int			offset;
+			size_t		offset;
 
 			/* substitution of the first argument requested */
 			if (matches[1].rm_so < 0)
@@ -2828,18 +2886,33 @@ check_ident_usermap(IdentLine *identLine, const char *usermap_name,
 				*error_p = true;
 				return;
 			}
+			repl_str = system_user + matches[1].rm_so;
+			repl_len = matches[1].rm_eo - matches[1].rm_so;
 
 			/*
-			 * length: original length minus length of \1 plus length of match
-			 * plus null terminator
+			 * It's allowed to have more than one \1 in the string, and we'll
+			 * replace them all.  But that's pretty unusual so we optimize on
+			 * the assumption of only one occurrence, which motivates doing
+			 * repeated replacements instead of making two passes over the
+			 * string to determine the final length right away.
 			 */
-			expanded_pg_user = palloc0(strlen(identLine->pg_user->string) - 2 + (matches[1].rm_eo - matches[1].rm_so) + 1);
-			offset = ofs - identLine->pg_user->string;
-			memcpy(expanded_pg_user, identLine->pg_user->string, offset);
-			memcpy(expanded_pg_user + offset,
-				   system_user + matches[1].rm_so,
-				   matches[1].rm_eo - matches[1].rm_so);
-			strcat(expanded_pg_user, ofs + 2);
+			old_pg_user = identLine->pg_user->string;
+			do
+			{
+				/*
+				 * length: current length minus length of \1 plus length of
+				 * replacement plus null terminator
+				 */
+				expanded_pg_user = palloc(strlen(old_pg_user) - 2 + repl_len + 1);
+				/* ofs points into the old_pg_user string at this point */
+				offset = ofs - old_pg_user;
+				memcpy(expanded_pg_user, old_pg_user, offset);
+				memcpy(expanded_pg_user + offset, repl_str, repl_len);
+				strcpy(expanded_pg_user + offset + repl_len, ofs + 2);
+				if (old_pg_user != identLine->pg_user->string)
+					pfree(old_pg_user);
+				old_pg_user = expanded_pg_user;
+			} while ((ofs = strstr(old_pg_user + offset + repl_len, "\\1")) != NULL);
 
 			/*
 			 * Mark the token as quoted, so it will only be compared literally
@@ -3049,7 +3122,7 @@ load_ident(void)
  *	method = uaImplicitReject.
  */
 void
-hba_getauthmethod(hbaPort *port)
+hba_getauthmethod(Port *port)
 {
 	check_hba(port);
 }

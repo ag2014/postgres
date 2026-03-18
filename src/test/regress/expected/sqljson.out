@@ -272,7 +272,7 @@ SELECT pg_typeof(JSON_SERIALIZE(NULL));
 
 -- only string types or bytea allowed
 SELECT JSON_SERIALIZE('{ "a" : 1 } ' RETURNING jsonb);
-ERROR:  cannot use RETURNING type jsonb in JSON_SERIALIZE()
+ERROR:  cannot use type jsonb in RETURNING clause of JSON_SERIALIZE()
 HINT:  Try returning a string type or bytea.
 EXPLAIN (VERBOSE, COSTS OFF) SELECT JSON_SERIALIZE('{}');
                      QUERY PLAN                      
@@ -573,6 +573,18 @@ SELECT JSON_OBJECT(1: 1, '2': NULL, '3': 1, 4: NULL, '5': 'a' ABSENT ON NULL WIT
  {"1": 1, "3": 1, "5": "a"}
 (1 row)
 
+-- BUG: https://postgr.es/m/CADXhmgTJtJZK9A3Na_ry%2BXrq-ghjcejBRhcRMzWZvbd__QdgJA%40mail.gmail.com
+-- datum_to_jsonb_internal() didn't catch keys that are casts instead of a simple scalar
+CREATE TYPE mood AS ENUM ('happy', 'sad', 'neutral');
+CREATE FUNCTION mood_to_json(mood) RETURNS json AS $$
+  SELECT to_json($1::text);
+$$ LANGUAGE sql IMMUTABLE;
+CREATE CAST (mood AS json) WITH FUNCTION mood_to_json(mood) AS IMPLICIT;
+SELECT JSON_OBJECT('happy'::mood: '123'::jsonb);
+ERROR:  key value must be scalar, not array, composite, or json
+DROP CAST (mood AS json);
+DROP FUNCTION mood_to_json;
+DROP TYPE mood;
 -- JSON_ARRAY()
 SELECT JSON_ARRAY();
  json_array 
@@ -739,6 +751,12 @@ SELECT JSON_ARRAY(SELECT i FROM (VALUES (3), (1), (NULL), (2)) foo(i) ORDER BY i
  [1, 2, 3]
 (1 row)
 
+SELECT JSON_ARRAY(WITH x AS (SELECT 1) VALUES (TRUE));
+ json_array 
+------------
+ [true]
+(1 row)
+
 -- Should fail
 SELECT JSON_ARRAY(SELECT FROM (VALUES (1)) foo(i));
 ERROR:  subquery must return only one column
@@ -821,22 +839,22 @@ SELECT
 FROM
 	(VALUES (NULL), (3), (1), (NULL), (NULL), (5), (2), (4), (NULL)) foo(bar);
 -[ RECORD 1 ]--------------------+-------------------------------------------------------------------------------------------------------------------------
-no_options                       | [1, 2, 3, 4, 5]
-returning_jsonb                  | [1, 2, 3, 4, 5]
-absent_on_null                   | [1, 2, 3, 4, 5]
-absentonnull_returning_jsonb     | [1, 2, 3, 4, 5]
-null_on_null                     | [1, 2, 3, 4, 5, null, null, null, null]
-nullonnull_returning_jsonb       | [1, 2, 3, 4, 5, null, null, null, null]
-row_no_options                   | [{"bar":1},                                                                                                             +
-                                 |  {"bar":2},                                                                                                             +
+no_options                       | [3, 1, 5, 2, 4]
+returning_jsonb                  | [3, 1, 5, 2, 4]
+absent_on_null                   | [3, 1, 5, 2, 4]
+absentonnull_returning_jsonb     | [3, 1, 5, 2, 4]
+null_on_null                     | [null, 3, 1, null, null, 5, 2, 4, null]
+nullonnull_returning_jsonb       | [null, 3, 1, null, null, 5, 2, 4, null]
+row_no_options                   | [{"bar":null},                                                                                                          +
                                  |  {"bar":3},                                                                                                             +
-                                 |  {"bar":4},                                                                                                             +
+                                 |  {"bar":1},                                                                                                             +
+                                 |  {"bar":null},                                                                                                          +
+                                 |  {"bar":null},                                                                                                          +
                                  |  {"bar":5},                                                                                                             +
-                                 |  {"bar":null},                                                                                                          +
-                                 |  {"bar":null},                                                                                                          +
-                                 |  {"bar":null},                                                                                                          +
+                                 |  {"bar":2},                                                                                                             +
+                                 |  {"bar":4},                                                                                                             +
                                  |  {"bar":null}]
-row_returning_jsonb              | [{"bar": 1}, {"bar": 2}, {"bar": 3}, {"bar": 4}, {"bar": 5}, {"bar": null}, {"bar": null}, {"bar": null}, {"bar": null}]
+row_returning_jsonb              | [{"bar": null}, {"bar": 3}, {"bar": 1}, {"bar": null}, {"bar": null}, {"bar": 5}, {"bar": 2}, {"bar": 4}, {"bar": null}]
 row_filtered_agg                 | [{"bar":3},                                                                                                             +
                                  |  {"bar":4},                                                                                                             +
                                  |  {"bar":5}]
@@ -1011,17 +1029,18 @@ FROM generate_series(1,5) i;
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT JSON_OBJECTAGG(i: ('111' || i)::bytea FORMAT JSON WITH UNIQUE RETURNING text) OVER (PARTITION BY i % 2)
 FROM generate_series(1,5) i;
-                                                            QUERY PLAN                                                             
------------------------------------------------------------------------------------------------------------------------------------
+                                                            QUERY PLAN                                                            
+----------------------------------------------------------------------------------------------------------------------------------
  WindowAgg
-   Output: JSON_OBJECTAGG(i : (('111'::text || (i)::text))::bytea FORMAT JSON WITH UNIQUE KEYS RETURNING text) OVER (?), ((i % 2))
+   Output: JSON_OBJECTAGG(i : (('111'::text || (i)::text))::bytea FORMAT JSON WITH UNIQUE KEYS RETURNING text) OVER w1, ((i % 2))
+   Window: w1 AS (PARTITION BY ((i.i % 2)))
    ->  Sort
          Output: ((i % 2)), i
          Sort Key: ((i.i % 2))
          ->  Function Scan on pg_catalog.generate_series i
                Output: (i % 2), i
                Function Call: generate_series(1, 5)
-(8 rows)
+(9 rows)
 
 CREATE VIEW json_objectagg_view AS
 SELECT JSON_OBJECTAGG(i: ('111' || i)::bytea FORMAT JSON WITH UNIQUE RETURNING text) FILTER (WHERE i > 3)
@@ -1047,17 +1066,18 @@ FROM generate_series(1,5) i;
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT JSON_ARRAYAGG(('111' || i)::bytea FORMAT JSON NULL ON NULL RETURNING text) OVER (PARTITION BY i % 2)
 FROM generate_series(1,5) i;
-                                                        QUERY PLAN                                                        
---------------------------------------------------------------------------------------------------------------------------
+                                                       QUERY PLAN                                                        
+-------------------------------------------------------------------------------------------------------------------------
  WindowAgg
-   Output: JSON_ARRAYAGG((('111'::text || (i)::text))::bytea FORMAT JSON NULL ON NULL RETURNING text) OVER (?), ((i % 2))
+   Output: JSON_ARRAYAGG((('111'::text || (i)::text))::bytea FORMAT JSON NULL ON NULL RETURNING text) OVER w1, ((i % 2))
+   Window: w1 AS (PARTITION BY ((i.i % 2)))
    ->  Sort
          Output: ((i % 2)), i
          Sort Key: ((i.i % 2))
          ->  Function Scan on pg_catalog.generate_series i
                Output: (i % 2), i
                Function Call: generate_series(1, 5)
-(8 rows)
+(9 rows)
 
 CREATE VIEW json_arrayagg_view AS
 SELECT JSON_ARRAYAGG(('111' || i)::bytea FORMAT JSON NULL ON NULL RETURNING text) FILTER (WHERE i > 3)
@@ -1073,8 +1093,8 @@ SELECT JSON_ARRAY(SELECT i FROM (VALUES (1), (2), (NULL), (4)) foo(i) RETURNING 
                              QUERY PLAN                              
 ---------------------------------------------------------------------
  Result
-   Output: (InitPlan 1).col1
-   InitPlan 1
+   Output: (InitPlan expr_1).col1
+   InitPlan expr_1
      ->  Aggregate
            Output: JSON_ARRAYAGG("*VALUES*".column1 RETURNING jsonb)
            ->  Values Scan on "*VALUES*"
@@ -1089,6 +1109,171 @@ CREATE OR REPLACE VIEW public.json_array_subquery_view AS
            FROM ( SELECT foo.i
                    FROM ( VALUES (1), (2), (NULL::integer), (4)) foo(i)) q(a)) AS "json_array"
 DROP VIEW json_array_subquery_view;
+-- Test mutability of JSON_OBJECTAGG, JSON_ARRAYAGG, JSON_ARRAY, JSON_OBJECT
+create type comp1 as (a int, b date);
+create domain d_comp1 as comp1;
+create domain mydomain as timestamptz;
+create type mydomainrange as range(subtype=mydomain);
+create type comp3 as (a int, b mydomainrange);
+create table test_mutability(
+	a text[], b timestamp, c timestamptz,
+	d date, f1 comp1[], f2 timestamp[],
+	f3 d_comp1[],
+	f4 mydomainrange[],
+	f5 comp3,
+	f6 mydomainmultirange);
+-- JSON_OBJECTAGG, JSON_ARRAYAGG are aggregate functions, cannot be used in index
+create index xx on test_mutability(json_objectagg(a: b absent on null with unique keys returning jsonb));
+ERROR:  aggregate functions are not allowed in index expressions
+LINE 1: create index xx on test_mutability(json_objectagg(a: b absen...
+                                           ^
+create index xx on test_mutability(json_objectagg(a: b absent on null with unique keys returning json));
+ERROR:  aggregate functions are not allowed in index expressions
+LINE 1: create index xx on test_mutability(json_objectagg(a: b absen...
+                                           ^
+create index xx on test_mutability(json_arrayagg(a returning jsonb));
+ERROR:  aggregate functions are not allowed in index expressions
+LINE 1: create index xx on test_mutability(json_arrayagg(a returning...
+                                           ^
+create index xx on test_mutability(json_arrayagg(a returning json));
+ERROR:  aggregate functions are not allowed in index expressions
+LINE 1: create index xx on test_mutability(json_arrayagg(a returning...
+                                           ^
+-- jsonb: create expression index via json_array
+create index on test_mutability(json_array(a returning jsonb)); -- ok
+create index on test_mutability(json_array(b returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_array(b returning jsonb...
+                                        ^
+create index on test_mutability(json_array(c returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_array(c returning jsonb...
+                                        ^
+create index on test_mutability(json_array(d returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_array(d returning jsonb...
+                                        ^
+create index on test_mutability(json_array(f1 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_array(f1 returning json...
+                                        ^
+create index on test_mutability(json_array(f2 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_array(f2 returning json...
+                                        ^
+create index on test_mutability(json_array(f3 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_array(f3 returning json...
+                                        ^
+create index on test_mutability(json_array(f4 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_array(f4 returning json...
+                                        ^
+create index on test_mutability(json_array(f5 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_array(f5 returning json...
+                                        ^
+create index on test_mutability(json_array(f6 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_array(f6 returning json...
+                                        ^
+-- jsonb: create expression index via json_object
+create index on test_mutability(json_object('hello' value a returning jsonb)); -- ok
+create index on test_mutability(json_object('hello' value b returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_object('hello' value b ...
+                                        ^
+create index on test_mutability(json_object('hello' value c returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_object('hello' value c ...
+                                        ^
+create index on test_mutability(json_object('hello' value d returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_object('hello' value d ...
+                                        ^
+create index on test_mutability(json_object('hello' value f1 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_object('hello' value f1...
+                                        ^
+create index on test_mutability(json_object('hello' value f2 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_object('hello' value f2...
+                                        ^
+create index on test_mutability(json_object('hello' value f3 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_object('hello' value f3...
+                                        ^
+create index on test_mutability(json_object('hello' value f4 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_object('hello' value f4...
+                                        ^
+create index on test_mutability(json_object('hello' value f5 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_object('hello' value f5...
+                                        ^
+create index on test_mutability(json_object('hello' value f6 returning jsonb)); -- error
+ERROR:  functions in index expression must be marked IMMUTABLE
+LINE 1: create index on test_mutability(json_object('hello' value f6...
+                                        ^
+-- data type json doesn't have a default operator class for access method "btree" so
+-- we use a generated column to test whether the JSON_ARRAY expression is
+-- immutable
+alter table test_mutability add column f10 json generated always as (json_array(a returning json)); -- ok
+alter table test_mutability add column f11 json generated always as (json_array(b returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f11 json generated always as (json_array(c returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f11 json generated always as (json_array(d returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f11 json generated always as (json_array(f1 returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f11 json generated always as (json_array(f2 returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f11 json generated always as (json_array(f3 returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f11 json generated always as (json_array(f4 returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f11 json generated always as (json_array(f5 returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f11 json generated always as (json_array(f6 returning json)); -- error
+ERROR:  generation expression is not immutable
+-- data type json doesn't have a default operator class for access method "btree" so
+-- we use a generated column to test whether the JSON_OBJECT expression is
+-- immutable
+alter table test_mutability add column f11 json generated always as (json_object('hello' value a returning json)); -- ok
+alter table test_mutability add column f12 json generated always as (json_object('hello' value b returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f12 json generated always as (json_object('hello' value c returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f12 json generated always as (json_object('hello' value d returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f12 json generated always as (json_object('hello' value f1 returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f12 json generated always as (json_object('hello' value f2 returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f12 json generated always as (json_object('hello' value f3 returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f12 json generated always as (json_object('hello' value f4 returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f12 json generated always as (json_object('hello' value f5 returning json)); -- error
+ERROR:  generation expression is not immutable
+alter table test_mutability add column f12 json generated always as (json_object('hello' value f6 returning json)); -- error
+ERROR:  generation expression is not immutable
+drop table test_mutability;
+drop domain d_comp1;
+drop type comp3;
+drop type mydomainrange;
+drop domain mydomain;
+drop type comp1;
+-- Range/multirange with immutable subtype should be considered immutable
+create type range_int as range(subtype=int);
+create table test_range_immutable(r range_int, m multirange_int);
+create index on test_range_immutable(json_array(r returning jsonb)); -- ok
+create index on test_range_immutable(json_array(m returning jsonb)); -- ok
+create index on test_range_immutable(json_object('key' value r returning jsonb)); -- ok
+create index on test_range_immutable(json_object('key' value m returning jsonb)); -- ok
+drop table test_range_immutable;
+drop type range_int;
 -- IS JSON predicate
 SELECT NULL IS JSON;
  ?column? 
@@ -1128,6 +1313,63 @@ SELECT NULL::bytea IS JSON;
 
 SELECT NULL::int IS JSON;
 ERROR:  cannot use type integer in IS JSON predicate
+LINE 1: SELECT NULL::int IS JSON;
+               ^
+-- IS JSON with domain types
+CREATE DOMAIN jd1 AS json CHECK ((VALUE ->'a')::text <> '3');
+CREATE DOMAIN jd2 AS jsonb CHECK ((VALUE ->'a') = '1'::jsonb);
+CREATE DOMAIN jd3 AS text CHECK (VALUE <> 'a');
+CREATE DOMAIN jd4 AS bytea CHECK (VALUE <> '\x61');
+CREATE DOMAIN jd5 AS date CHECK (VALUE <> NULL);
+-- NULLs through domains should return NULL (not error)
+SELECT NULL::jd1 IS JSON, NULL::jd2 IS JSON, NULL::jd3 IS JSON, NULL::jd4 IS JSON;
+ ?column? | ?column? | ?column? | ?column? 
+----------+----------+----------+----------
+          |          |          | 
+(1 row)
+
+SELECT NULL::jd1 IS NOT JSON;
+ ?column? 
+----------
+ 
+(1 row)
+
+-- domain over unsupported base type should error
+SELECT NULL::jd5 IS JSON; -- error
+ERROR:  cannot use type jd5 in IS JSON predicate
+LINE 1: SELECT NULL::jd5 IS JSON;
+               ^
+SELECT NULL::jd5 IS JSON WITH UNIQUE KEYS; -- error
+ERROR:  cannot use type jd5 in IS JSON predicate
+LINE 1: SELECT NULL::jd5 IS JSON WITH UNIQUE KEYS;
+               ^
+-- domain constraint violation during cast
+SELECT a::jd2 IS JSON WITH UNIQUE KEYS as col1 FROM (VALUES('{"a": 1, "a": 2}')) s(a); -- error
+ERROR:  value for domain jd2 violates check constraint "jd2_check"
+-- view creation and deparsing with domain IS JSON
+CREATE VIEW domain_isjson AS
+WITH cte(a) AS (VALUES('{"a": 1, "a": 2}'))
+SELECT	a::jd1 IS JSON WITH UNIQUE KEYS as jd1,
+		a::jd3 IS JSON WITH UNIQUE KEYS as jd3,
+		a::jd4 IS JSON WITH UNIQUE KEYS as jd4
+FROM cte;
+\sv domain_isjson
+CREATE OR REPLACE VIEW public.domain_isjson AS
+ WITH cte(a) AS (
+         VALUES ('{"a": 1, "a": 2}'::text)
+        )
+ SELECT a::jd1 IS JSON WITH UNIQUE KEYS AS jd1,
+    a::jd3 IS JSON WITH UNIQUE KEYS AS jd3,
+    a::jd4 IS JSON WITH UNIQUE KEYS AS jd4
+   FROM cte
+SELECT * FROM domain_isjson;
+ jd1 | jd3 | jd4 
+-----+-----+-----
+ f   | f   | f
+(1 row)
+
+DROP VIEW domain_isjson;
+DROP DOMAIN jd5, jd4, jd3, jd2, jd1;
 SELECT '' IS JSON;
  ?column? 
 ----------

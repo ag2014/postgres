@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # OVERVIEW
 # --------
@@ -107,7 +107,7 @@ $node->append_conf(
 listen_addresses = '$hostaddr'
 
 # Capturing the EVENTS that occur during tests requires these settings
-log_connections = on
+log_connections = 'receipt,authentication,authorization'
 log_disconnections = on
 trace_connection_negotiation = on
 lc_messages = 'C'
@@ -673,7 +673,9 @@ sub connect_test
 	my ($ret, $stdout, $stderr) = $node->psql(
 		'postgres',
 		'',
-		extra_params => [ '-w', '-c', 'SELECT current_enc()' ],
+		extra_params => [
+			'--no-password', '--command' => 'SELECT current_enc()',
+		],
 		connstr => "$connstr_full",
 		on_error_stop => 0);
 

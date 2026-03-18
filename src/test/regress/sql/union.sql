@@ -134,9 +134,20 @@ select count(*) from
 select count(*) from
   ( select unique1 from tenk1 intersect select fivethous from tenk1 ) ss;
 
+-- this query will prefer a sorted setop unless we force it.
+set enable_indexscan to off;
+
 explain (costs off)
 select unique1 from tenk1 except select unique2 from tenk1 where unique2 != 10;
 select unique1 from tenk1 except select unique2 from tenk1 where unique2 != 10;
+
+reset enable_indexscan;
+
+-- the hashed implementation is sensitive to child plans' tuple slot types
+explain (costs off)
+select * from int8_tbl intersect select q2, q1 from int8_tbl order by 1, 2;
+select * from int8_tbl intersect select q2, q1 from int8_tbl order by 1, 2;
+select q2, q1 from int8_tbl intersect select * from int8_tbl order by 1, 2;
 
 set enable_hashagg to off;
 
@@ -155,6 +166,10 @@ select count(*) from
 explain (costs off)
 select unique1 from tenk1 except select unique2 from tenk1 where unique2 != 10;
 select unique1 from tenk1 except select unique2 from tenk1 where unique2 != 10;
+
+explain (costs off)
+select f1 from int4_tbl union all
+  (select unique1 from tenk1 union select unique2 from tenk1);
 
 reset enable_hashagg;
 
@@ -443,6 +458,78 @@ select event_id
 drop table events_child, events, other_events;
 
 reset enable_indexonlyscan;
+
+--
+-- Test handling of UNION / EXCEPT / INTERSECT with provably empty inputs
+--
+
+-- Ensure the empty UNION input is pruned and de-duplication is done for the
+-- remaining relation.
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT two FROM tenk1 WHERE 1=2
+UNION
+SELECT four FROM tenk1
+ORDER BY 1;
+
+-- Validate that the results of the above are correct
+SELECT two FROM tenk1 WHERE 1=2
+UNION
+SELECT four FROM tenk1
+ORDER BY 1;
+
+-- All UNION inputs are proven empty.  Ensure the planner provides a
+-- const-false Result node
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT two FROM tenk1 WHERE 1=2
+UNION
+SELECT four FROM tenk1 WHERE 1=2
+UNION
+SELECT ten FROM tenk1 WHERE 1=2
+ORDER BY 1;
+
+-- Ensure the planner provides a const-false Result node
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT two FROM tenk1 WHERE 1=2
+INTERSECT
+SELECT four FROM tenk1
+ORDER BY 1;
+
+-- As above, with the inputs swapped
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT four FROM tenk1
+INTERSECT
+SELECT two FROM tenk1 WHERE 1=2
+ORDER BY 1;
+
+-- Try with both inputs dummy
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT four FROM tenk1 WHERE 1=2
+INTERSECT
+SELECT two FROM tenk1 WHERE 1=2
+ORDER BY 1;
+
+-- Ensure the planner provides a const-false Result node when the left input
+-- is empty
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT two FROM tenk1 WHERE 1=2
+EXCEPT
+SELECT four FROM tenk1
+ORDER BY 1;
+
+-- Ensure the planner only scans the left input when right input is empty
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT two FROM tenk1
+EXCEPT ALL
+SELECT four FROM tenk1 WHERE 1=2
+ORDER BY 1;
+
+-- Try a mixed setop case.  Ensure the right-hand UNION child gets removed.
+EXPLAIN (COSTS OFF, VERBOSE)
+SELECT two FROM tenk1 t1
+EXCEPT
+SELECT four FROM tenk1 t2
+UNION
+SELECT ten FROM tenk1 dummy WHERE 1=2;
 
 -- Test constraint exclusion of UNION ALL subqueries
 explain (costs off)

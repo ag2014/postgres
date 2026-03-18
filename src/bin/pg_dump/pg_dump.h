@@ -3,7 +3,7 @@
  * pg_dump.h
  *	  Common header file for the pg_dump utility
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_dump/pg_dump.h
@@ -15,6 +15,7 @@
 #define PG_DUMP_H
 
 #include "pg_backup.h"
+#include "catalog/pg_publication_d.h"
 
 
 #define oidcmp(x,y) ( ((x) < (y) ? -1 : ((x) > (y)) ?  1 : 0) )
@@ -82,15 +83,26 @@ typedef enum
 	DO_PUBLICATION,
 	DO_PUBLICATION_REL,
 	DO_PUBLICATION_TABLE_IN_SCHEMA,
+	DO_REL_STATS,
 	DO_SUBSCRIPTION,
 	DO_SUBSCRIPTION_REL,		/* see note for SubRelInfo */
 } DumpableObjectType;
 
+#define NUM_DUMPABLE_OBJECT_TYPES (DO_SUBSCRIPTION_REL + 1)
+
 /*
  * DumpComponents is a bitmask of the potentially dumpable components of
  * a database object: its core definition, plus optional attributes such
- * as ACL, comments, etc.  The NONE and ALL symbols are convenient
- * shorthands.
+ * as ACL, comments, etc.
+ *
+ * The NONE and ALL symbols are convenient shorthands for assigning values,
+ * but be careful about using them in tests.  For example, a test like
+ * "if (dobj->dump == DUMP_COMPONENT_NONE)" is probably wrong; you likely want
+ * "if (!(dobj->dump & DUMP_COMPONENT_DEFINITION))" instead.  This is because
+ * we aren't too careful about the values of irrelevant bits, as indeed can be
+ * seen in the definition of DUMP_COMPONENT_ALL.  It's also possible that an
+ * object has only subsidiary bits such as DUMP_COMPONENT_ACL set, leading to
+ * unexpected behavior of a test against NONE.
  */
 typedef uint32 DumpComponents;
 #define DUMP_COMPONENT_NONE			(0)
@@ -101,6 +113,7 @@ typedef uint32 DumpComponents;
 #define DUMP_COMPONENT_ACL			(1 << 4)
 #define DUMP_COMPONENT_POLICY		(1 << 5)
 #define DUMP_COMPONENT_USERMAP		(1 << 6)
+#define DUMP_COMPONENT_STATISTICS	(1 << 7)
 #define DUMP_COMPONENT_ALL			(0xFFFF)
 
 /*
@@ -128,6 +141,7 @@ typedef uint32 DumpComponents;
 #define DUMP_COMPONENTS_REQUIRING_LOCK (\
 		DUMP_COMPONENT_DEFINITION |\
 		DUMP_COMPONENT_DATA |\
+		DUMP_COMPONENT_STATISTICS |\
 		DUMP_COMPONENT_POLICY)
 
 typedef struct _dumpableObject
@@ -208,7 +222,9 @@ typedef struct _typeInfo
 	bool		isDefined;		/* true if typisdefined */
 	/* If needed, we'll create a "shell type" entry for it; link that here: */
 	struct _shellTypeInfo *shellType;	/* shell-type entry, or NULL */
-	/* If it's a domain, we store links to its constraints here: */
+	/* If it's a domain, its not-null constraint is here: */
+	struct _constraintInfo *notnull;
+	/* If it's a domain, we store links to its CHECK constraints here: */
 	int			nDomChecks;
 	struct _constraintInfo *domChecks;
 } TypeInfo;
@@ -244,6 +260,8 @@ typedef struct _oprInfo
 	DumpableObject dobj;
 	const char *rolname;
 	char		oprkind;
+	Oid			oprleft;
+	Oid			oprright;
 	Oid			oprcode;
 } OprInfo;
 
@@ -257,12 +275,14 @@ typedef struct _accessMethodInfo
 typedef struct _opclassInfo
 {
 	DumpableObject dobj;
+	Oid			opcmethod;
 	const char *rolname;
 } OpclassInfo;
 
 typedef struct _opfamilyInfo
 {
 	DumpableObject dobj;
+	Oid			opfmethod;
 	const char *rolname;
 } OpfamilyInfo;
 
@@ -270,6 +290,7 @@ typedef struct _collInfo
 {
 	DumpableObject dobj;
 	const char *rolname;
+	int			collencoding;
 } CollInfo;
 
 typedef struct _convInfo
@@ -314,7 +335,7 @@ typedef struct _tableInfo
 	Oid			owning_tab;		/* OID of table owning sequence */
 	int			owning_col;		/* attr # of column owning sequence */
 	bool		is_identity_sequence;
-	int			relpages;		/* table's size in pages (from pg_class) */
+	int32		relpages;		/* table's size in pages (from pg_class) */
 	int			toastpages;		/* toast table's size in pages, if any */
 
 	bool		interesting;	/* true if need to collect more data */
@@ -351,10 +372,13 @@ typedef struct _tableInfo
 									 * there isn't one on this column. If
 									 * empty string, unnamed constraint
 									 * (pre-v17) */
+	char	  **notnull_comment;	/* comment thereof */
+	bool	   *notnull_invalid;	/* true for NOT NULL NOT VALID */
 	bool	   *notnull_noinh;	/* NOT NULL is NO INHERIT */
 	bool	   *notnull_islocal;	/* true if NOT NULL has local definition */
 	struct _attrDefInfo **attrdefs; /* DEFAULT expressions */
 	struct _constraintInfo *checkexprs; /* CHECK constraints */
+	struct _relStatsInfo *stats;	/* only set for matviews */
 	bool		needs_override; /* has GENERATED ALWAYS AS IDENTITY */
 	char	   *amname;			/* relation access method */
 
@@ -421,6 +445,25 @@ typedef struct _indexAttachInfo
 	IndxInfo   *partitionIdx;	/* link to index on partition */
 } IndexAttachInfo;
 
+typedef struct _relStatsInfo
+{
+	DumpableObject dobj;
+	Oid			relid;
+	int32		relpages;
+	char	   *reltuples;
+	int32		relallvisible;
+	int32		relallfrozen;
+	char		relkind;		/* 'r', 'm', 'i', etc */
+
+	/*
+	 * indAttNames/nindAttNames are populated only if the relation is an index
+	 * with at least one expression column; we don't need them otherwise.
+	 */
+	char	  **indAttNames;	/* attnames of the index, in order */
+	int32		nindAttNames;	/* number of attnames stored (can be 0) */
+	teSection	section;		/* stats may appear in data or post-data */
+} RelStatsInfo;
+
 typedef struct _statsExtInfo
 {
 	DumpableObject dobj;
@@ -464,6 +507,8 @@ typedef struct _evttriggerInfo
  * struct ConstraintInfo is used for all constraint types.  However we
  * use a different objType for foreign key constraints, to make it easier
  * to sort them the way we want.
+ *
+ * Not-null constraints don't need this, unless they are NOT VALID.
  *
  * Note: condeferrable and condeferred are currently only valid for
  * unique/primary-key constraints.  Otherwise that info is in condef.
@@ -625,12 +670,14 @@ typedef struct _PublicationInfo
 	DumpableObject dobj;
 	const char *rolname;
 	bool		puballtables;
+	bool		puballsequences;
 	bool		pubinsert;
 	bool		pubupdate;
 	bool		pubdelete;
 	bool		pubtruncate;
 	bool		pubviaroot;
-	bool		pubgencols;
+	PublishGencolsType pubgencols_type;
+	SimplePtrList except_tables;
 } PublicationInfo;
 
 /*
@@ -672,9 +719,13 @@ typedef struct _SubscriptionInfo
 	bool		subpasswordrequired;
 	bool		subrunasowner;
 	bool		subfailover;
+	bool		subretaindeadtuples;
+	int			submaxretention;
+	char	   *subservername;
 	char	   *subconninfo;
 	char	   *subslotname;
 	char	   *subsynccommit;
+	char	   *subwalrcvtimeout;
 	char	   *subpublications;
 	char	   *suborigin;
 	char	   *suboriginremotelsn;
@@ -720,6 +771,7 @@ extern TableInfo *findTableByOid(Oid oid);
 extern TypeInfo *findTypeByOid(Oid oid);
 extern FuncInfo *findFuncByOid(Oid oid);
 extern OprInfo *findOprByOid(Oid oid);
+extern AccessMethodInfo *findAccessMethodByOid(Oid oid);
 extern CollInfo *findCollationByOid(Oid oid);
 extern NamespaceInfo *findNamespaceByOid(Oid oid);
 extern ExtensionInfo *findExtensionByOid(Oid oid);
@@ -781,6 +833,6 @@ extern void getPublicationNamespaces(Archive *fout);
 extern void getPublicationTables(Archive *fout, TableInfo tblinfo[],
 								 int numTables);
 extern void getSubscriptions(Archive *fout);
-extern void getSubscriptionTables(Archive *fout);
+extern void getSubscriptionRelations(Archive *fout);
 
 #endif							/* PG_DUMP_H */

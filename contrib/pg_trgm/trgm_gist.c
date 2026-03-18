@@ -106,7 +106,7 @@ makesign(BITVECP sign, TRGM *a, int siglen)
 	SETBIT(sign, SIGLENBIT(siglen));	/* set last unused bit */
 	for (k = 0; k < len; k++)
 	{
-		CPTRGM(((char *) &tmp), ptr + k);
+		CPTRGM(&tmp, ptr + k);
 		HASH(sign, tmp, siglen);
 	}
 }
@@ -124,7 +124,7 @@ gtrgm_compress(PG_FUNCTION_ARGS)
 		text	   *val = DatumGetTextPP(entry->key);
 
 		res = generate_trgm(VARDATA_ANY(val), VARSIZE_ANY_EXHDR(val));
-		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(res),
 					  entry->rel, entry->page,
 					  entry->offset, false);
@@ -143,7 +143,7 @@ gtrgm_compress(PG_FUNCTION_ARGS)
 		}
 
 		res = gtrgm_alloc(true, siglen, sign);
-		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(res),
 					  entry->rel, entry->page,
 					  entry->offset, false);
@@ -163,7 +163,7 @@ gtrgm_decompress(PG_FUNCTION_ARGS)
 	if (key != (text *) DatumGetPointer(entry->key))
 	{
 		/* need to pass back the decompressed item */
-		retval = palloc(sizeof(GISTENTRY));
+		retval = palloc_object(GISTENTRY);
 		gistentryinit(*retval, PointerGetDatum(key),
 					  entry->rel, entry->page, entry->offset, entry->leafkey);
 		PG_RETURN_POINTER(retval);
@@ -186,7 +186,7 @@ cnt_sml_sign_common(TRGM *qtrg, BITVECP sign, int siglen)
 
 	for (k = 0; k < len; k++)
 	{
-		CPTRGM(((char *) &tmp), ptr + k);
+		CPTRGM(&tmp, ptr + k);
 		count += GETBIT(sign, HASHVAL(tmp, siglen));
 	}
 
@@ -199,8 +199,9 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	text	   *query = PG_GETARG_TEXT_P(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	int			siglen = GET_SIGLEN();
 	TRGM	   *key = (TRGM *) DatumGetPointer(entry->key);
@@ -228,7 +229,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 	if (cache == NULL ||
 		cache->strategy != strategy ||
 		VARSIZE(cache->query) != querysize ||
-		memcmp((char *) cache->query, (char *) query, querysize) != 0)
+		memcmp(cache->query, query, querysize) != 0)
 	{
 		gtrgm_consistent_cache *newcache;
 		TrgmPackedGraph *graph = NULL;
@@ -247,7 +248,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 #ifndef IGNORECASE
 				elog(ERROR, "cannot handle ~~* with case-sensitive trigrams");
 #endif
-				/* FALL THRU */
+				pg_fallthrough;
 			case LikeStrategyNumber:
 				qtrg = generate_wildcard_trgm(VARDATA(query),
 											  querysize - VARHDRSZ);
@@ -256,7 +257,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 #ifndef IGNORECASE
 				elog(ERROR, "cannot handle ~* with case-sensitive trigrams");
 #endif
-				/* FALL THRU */
+				pg_fallthrough;
 			case RegExpStrategyNumber:
 				qtrg = createTrgmNFA(query, PG_GET_COLLATION(),
 									 &graph, fcinfo->flinfo->fn_mcxt);
@@ -284,12 +285,12 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 		newcache->strategy = strategy;
 		newcache->query = (text *)
 			((char *) newcache + MAXALIGN(sizeof(gtrgm_consistent_cache)));
-		memcpy((char *) newcache->query, (char *) query, querysize);
+		memcpy(newcache->query, query, querysize);
 		if (qtrg)
 		{
 			newcache->trigrams = (TRGM *)
 				((char *) newcache->query + MAXALIGN(querysize));
-			memcpy((char *) newcache->trigrams, (char *) qtrg, qtrgsize);
+			memcpy((char *) newcache->trigrams, qtrg, qtrgsize);
 			/* release qtrg in case it was made in fn_mcxt */
 			pfree(qtrg);
 		}
@@ -344,7 +345,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 #ifndef IGNORECASE
 			elog(ERROR, "cannot handle ~~* with case-sensitive trigrams");
 #endif
-			/* FALL THRU */
+			pg_fallthrough;
 		case LikeStrategyNumber:
 		case EqualStrategyNumber:
 			/* Wildcard and equal search are inexact */
@@ -373,7 +374,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 				res = true;
 				for (k = 0; k < len; k++)
 				{
-					CPTRGM(((char *) &tmp), ptr + k);
+					CPTRGM(&tmp, ptr + k);
 					if (!GETBIT(sign, HASHVAL(tmp, siglen)))
 					{
 						res = false;
@@ -386,7 +387,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 #ifndef IGNORECASE
 			elog(ERROR, "cannot handle ~* with case-sensitive trigrams");
 #endif
-			/* FALL THRU */
+			pg_fallthrough;
 		case RegExpStrategyNumber:
 			/* Regexp search is inexact */
 			*recheck = true;
@@ -426,7 +427,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 					check = (bool *) palloc(len * sizeof(bool));
 					for (k = 0; k < len; k++)
 					{
-						CPTRGM(((char *) &tmp), ptr + k);
+						CPTRGM(&tmp, ptr + k);
 						check[k] = GETBIT(sign, HASHVAL(tmp, siglen));
 					}
 					res = trigramsMatchGraph(cache->graph, check);
@@ -454,8 +455,9 @@ gtrgm_distance(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	text	   *query = PG_GETARG_TEXT_P(1);
 	StrategyNumber strategy = (StrategyNumber) PG_GETARG_UINT16(2);
-
-	/* Oid		subtype = PG_GETARG_OID(3); */
+#ifdef NOT_USED
+	Oid			subtype = PG_GETARG_OID(3);
+#endif
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
 	int			siglen = GET_SIGLEN();
 	TRGM	   *key = (TRGM *) DatumGetPointer(entry->key);
@@ -552,7 +554,7 @@ unionkey(BITVECP sbase, TRGM *add, int siglen)
 
 		for (i = 0; i < ARRNELEM(add); i++)
 		{
-			CPTRGM(((char *) &tmp), ptr + i);
+			CPTRGM(&tmp, ptr + i);
 			HASH(sbase, tmp, siglen);
 		}
 	}
@@ -699,9 +701,12 @@ gtrgm_penalty(PG_FUNCTION_ARGS)
 	if (ISARRKEY(newval))
 	{
 		char	   *cache = (char *) fcinfo->flinfo->fn_extra;
-		TRGM	   *cachedVal = (TRGM *) (cache + MAXALIGN(siglen));
+		TRGM	   *cachedVal = NULL;
 		Size		newvalsize = VARSIZE(newval);
 		BITVECP		sign;
+
+		if (cache != NULL)
+			cachedVal = (TRGM *) (cache + MAXALIGN(siglen));
 
 		/*
 		 * Cache the sign data across multiple calls with the same newval.
@@ -820,7 +825,7 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 	SPLITCOST  *costvector;
 
 	/* cache the sign data for each existing item */
-	cache = (CACHESIGN *) palloc(sizeof(CACHESIGN) * (maxoff + 1));
+	cache = palloc_array(CACHESIGN, maxoff + 1);
 	cache_sign = palloc(siglen * (maxoff + 1));
 
 	for (k = FirstOffsetNumber; k <= maxoff; k = OffsetNumberNext(k))
@@ -864,7 +869,7 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 	union_r = GETSIGN(datum_r);
 
 	/* sort before ... */
-	costvector = (SPLITCOST *) palloc(sizeof(SPLITCOST) * maxoff);
+	costvector = palloc_array(SPLITCOST, maxoff);
 	for (j = FirstOffsetNumber; j <= maxoff; j = OffsetNumberNext(j))
 	{
 		costvector[j - 1].pos = j;

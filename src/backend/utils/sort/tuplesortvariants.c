@@ -9,7 +9,7 @@
  * could be easily added here, another module, or even an extension.
  *
  *
- * Copyright (c) 2022-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2022-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/sort/tuplesortvariants.c
@@ -20,15 +20,20 @@
 #include "postgres.h"
 
 #include "access/brin_tuple.h"
+#include "access/gin.h"
+#include "access/gin_tuple.h"
 #include "access/hash.h"
 #include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "catalog/index.h"
+#include "catalog/pg_collation.h"
 #include "executor/executor.h"
 #include "pg_trace.h"
+#include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/tuplesort.h"
 
 
@@ -46,6 +51,8 @@ static void removeabbrev_index(Tuplesortstate *state, SortTuple *stups,
 							   int count);
 static void removeabbrev_index_brin(Tuplesortstate *state, SortTuple *stups,
 									int count);
+static void removeabbrev_index_gin(Tuplesortstate *state, SortTuple *stups,
+								   int count);
 static void removeabbrev_datum(Tuplesortstate *state, SortTuple *stups,
 							   int count);
 static int	comparetup_heap(const SortTuple *a, const SortTuple *b,
@@ -74,6 +81,8 @@ static int	comparetup_index_hash_tiebreak(const SortTuple *a, const SortTuple *b
 										   Tuplesortstate *state);
 static int	comparetup_index_brin(const SortTuple *a, const SortTuple *b,
 								  Tuplesortstate *state);
+static int	comparetup_index_gin(const SortTuple *a, const SortTuple *b,
+								 Tuplesortstate *state);
 static void writetup_index(Tuplesortstate *state, LogicalTape *tape,
 						   SortTuple *stup);
 static void readtup_index(Tuplesortstate *state, SortTuple *stup,
@@ -82,6 +91,10 @@ static void writetup_index_brin(Tuplesortstate *state, LogicalTape *tape,
 								SortTuple *stup);
 static void readtup_index_brin(Tuplesortstate *state, SortTuple *stup,
 							   LogicalTape *tape, unsigned int len);
+static void writetup_index_gin(Tuplesortstate *state, LogicalTape *tape,
+							   SortTuple *stup);
+static void readtup_index_gin(Tuplesortstate *state, SortTuple *stup,
+							  LogicalTape *tape, unsigned int len);
 static int	comparetup_datum(const SortTuple *a, const SortTuple *b,
 							 Tuplesortstate *state);
 static int	comparetup_datum_tiebreak(const SortTuple *a, const SortTuple *b,
@@ -254,7 +267,7 @@ tuplesort_begin_cluster(TupleDesc tupDesc,
 	Assert(indexRel->rd_rel->relam == BTREE_AM_OID);
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
-	arg = (TuplesortClusterArg *) palloc0(sizeof(TuplesortClusterArg));
+	arg = palloc0_object(TuplesortClusterArg);
 
 	if (trace_sort)
 		elog(LOG,
@@ -319,7 +332,7 @@ tuplesort_begin_cluster(TupleDesc tupDesc,
 	{
 		SortSupport sortKey = base->sortKeys + i;
 		ScanKey		scanKey = indexScanKey->scankeys + i;
-		int16		strategy;
+		bool		reverse;
 
 		sortKey->ssup_cxt = CurrentMemoryContext;
 		sortKey->ssup_collation = scanKey->sk_collation;
@@ -331,10 +344,9 @@ tuplesort_begin_cluster(TupleDesc tupDesc,
 
 		Assert(sortKey->ssup_attno != 0);
 
-		strategy = (scanKey->sk_flags & SK_BT_DESC) != 0 ?
-			BTGreaterStrategyNumber : BTLessStrategyNumber;
+		reverse = (scanKey->sk_flags & SK_BT_DESC) != 0;
 
-		PrepareSortSupportFromIndexRel(indexRel, strategy, sortKey);
+		PrepareSortSupportFromIndexRel(indexRel, reverse, sortKey);
 	}
 
 	pfree(indexScanKey);
@@ -362,7 +374,7 @@ tuplesort_begin_index_btree(Relation heapRel,
 	int			i;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
-	arg = (TuplesortIndexBTreeArg *) palloc(sizeof(TuplesortIndexBTreeArg));
+	arg = palloc_object(TuplesortIndexBTreeArg);
 
 	if (trace_sort)
 		elog(LOG,
@@ -402,7 +414,7 @@ tuplesort_begin_index_btree(Relation heapRel,
 	{
 		SortSupport sortKey = base->sortKeys + i;
 		ScanKey		scanKey = indexScanKey->scankeys + i;
-		int16		strategy;
+		bool		reverse;
 
 		sortKey->ssup_cxt = CurrentMemoryContext;
 		sortKey->ssup_collation = scanKey->sk_collation;
@@ -414,10 +426,9 @@ tuplesort_begin_index_btree(Relation heapRel,
 
 		Assert(sortKey->ssup_attno != 0);
 
-		strategy = (scanKey->sk_flags & SK_BT_DESC) != 0 ?
-			BTGreaterStrategyNumber : BTLessStrategyNumber;
+		reverse = (scanKey->sk_flags & SK_BT_DESC) != 0;
 
-		PrepareSortSupportFromIndexRel(indexRel, strategy, sortKey);
+		PrepareSortSupportFromIndexRel(indexRel, reverse, sortKey);
 	}
 
 	pfree(indexScanKey);
@@ -444,7 +455,7 @@ tuplesort_begin_index_hash(Relation heapRel,
 	TuplesortIndexHashArg *arg;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
-	arg = (TuplesortIndexHashArg *) palloc(sizeof(TuplesortIndexHashArg));
+	arg = palloc_object(TuplesortIndexHashArg);
 
 	if (trace_sort)
 		elog(LOG,
@@ -493,7 +504,7 @@ tuplesort_begin_index_gist(Relation heapRel,
 	int			i;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
-	arg = (TuplesortIndexBTreeArg *) palloc(sizeof(TuplesortIndexBTreeArg));
+	arg = palloc_object(TuplesortIndexBTreeArg);
 
 	if (trace_sort)
 		elog(LOG,
@@ -569,6 +580,92 @@ tuplesort_begin_index_brin(int workMem,
 }
 
 Tuplesortstate *
+tuplesort_begin_index_gin(Relation heapRel,
+						  Relation indexRel,
+						  int workMem, SortCoordinate coordinate,
+						  int sortopt)
+{
+	Tuplesortstate *state = tuplesort_begin_common(workMem, coordinate,
+												   sortopt);
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	MemoryContext oldcontext;
+	int			i;
+	TupleDesc	desc = RelationGetDescr(indexRel);
+
+	oldcontext = MemoryContextSwitchTo(base->maincontext);
+
+#ifdef TRACE_SORT
+	if (trace_sort)
+		elog(LOG,
+			 "begin index sort: workMem = %d, randomAccess = %c",
+			 workMem,
+			 sortopt & TUPLESORT_RANDOMACCESS ? 't' : 'f');
+#endif
+
+	/*
+	 * Multi-column GIN indexes expand the row into a separate index entry for
+	 * attribute, and that's what we write into the tuplesort. But we still
+	 * need to initialize sortsupport for all the attributes.
+	 */
+	base->nKeys = IndexRelationGetNumberOfKeyAttributes(indexRel);
+
+	/* Prepare SortSupport data for each column */
+	base->sortKeys = (SortSupport) palloc0(base->nKeys *
+										   sizeof(SortSupportData));
+
+	for (i = 0; i < base->nKeys; i++)
+	{
+		SortSupport sortKey = base->sortKeys + i;
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+		Oid			cmpFunc;
+
+		sortKey->ssup_cxt = CurrentMemoryContext;
+		sortKey->ssup_collation = indexRel->rd_indcollation[i];
+		sortKey->ssup_nulls_first = false;
+		sortKey->ssup_attno = i + 1;
+		sortKey->abbreviate = false;
+
+		Assert(sortKey->ssup_attno != 0);
+
+		if (!OidIsValid(sortKey->ssup_collation))
+			sortKey->ssup_collation = DEFAULT_COLLATION_OID;
+
+		/*
+		 * If the compare proc isn't specified in the opclass definition, look
+		 * up the index key type's default btree comparator.
+		 */
+		cmpFunc = index_getprocid(indexRel, i + 1, GIN_COMPARE_PROC);
+		if (cmpFunc == InvalidOid)
+		{
+			TypeCacheEntry *typentry;
+
+			typentry = lookup_type_cache(att->atttypid,
+										 TYPECACHE_CMP_PROC_FINFO);
+			if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_FUNCTION),
+						 errmsg("could not identify a comparison function for type %s",
+								format_type_be(att->atttypid))));
+
+			cmpFunc = typentry->cmp_proc_finfo.fn_oid;
+		}
+
+		PrepareSortSupportComparisonShim(cmpFunc, sortKey);
+	}
+
+	base->removeabbrev = removeabbrev_index_gin;
+	base->comparetup = comparetup_index_gin;
+	base->writetup = writetup_index_gin;
+	base->readtup = readtup_index_gin;
+	base->haveDatum1 = false;
+	base->arg = NULL;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	return state;
+}
+
+Tuplesortstate *
 tuplesort_begin_datum(Oid datumType, Oid sortOperator, Oid sortCollation,
 					  bool nullsFirstFlag, int workMem,
 					  SortCoordinate coordinate, int sortopt)
@@ -582,7 +679,7 @@ tuplesort_begin_datum(Oid datumType, Oid sortOperator, Oid sortCollation,
 	bool		typbyval;
 
 	oldcontext = MemoryContextSwitchTo(base->maincontext);
-	arg = (TuplesortDatumArg *) palloc(sizeof(TuplesortDatumArg));
+	arg = palloc_object(TuplesortDatumArg);
 
 	if (trace_sort)
 		elog(LOG,
@@ -614,7 +711,7 @@ tuplesort_begin_datum(Oid datumType, Oid sortOperator, Oid sortCollation,
 	base->tuples = !typbyval;
 
 	/* Prepare SortSupport data */
-	base->sortKeys = (SortSupport) palloc0(sizeof(SortSupportData));
+	base->sortKeys = palloc0_object(SortSupportData);
 
 	base->sortKeys->ssup_cxt = CurrentMemoryContext;
 	base->sortKeys->ssup_collation = sortCollation;
@@ -736,7 +833,7 @@ tuplesort_putheaptuple(Tuplesortstate *state, HeapTuple tup)
  */
 void
 tuplesort_putindextuplevalues(Tuplesortstate *state, Relation rel,
-							  ItemPointer self, const Datum *values,
+							  const ItemPointerData *self, const Datum *values,
 							  const bool *isnull)
 {
 	SortTuple	stup;
@@ -786,7 +883,7 @@ tuplesort_putbrintuple(Tuplesortstate *state, BrinTuple *tuple, Size size)
 	memcpy(&bstup->tuple, tuple, size);
 
 	stup.tuple = bstup;
-	stup.datum1 = tuple->bt_blkno;
+	stup.datum1 = UInt32GetDatum(tuple->bt_blkno);
 	stup.isnull1 = false;
 
 	/* GetMemoryChunkSpace is not supported for bump contexts */
@@ -794,6 +891,37 @@ tuplesort_putbrintuple(Tuplesortstate *state, BrinTuple *tuple, Size size)
 		tuplen = MAXALIGN(BRINSORTTUPLE_SIZE(size));
 	else
 		tuplen = GetMemoryChunkSpace(bstup);
+
+	tuplesort_puttuple_common(state, &stup,
+							  base->sortKeys &&
+							  base->sortKeys->abbrev_converter &&
+							  !stup.isnull1, tuplen);
+
+	MemoryContextSwitchTo(oldcontext);
+}
+
+void
+tuplesort_putgintuple(Tuplesortstate *state, GinTuple *tuple, Size size)
+{
+	SortTuple	stup;
+	GinTuple   *ctup;
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	MemoryContext oldcontext = MemoryContextSwitchTo(base->tuplecontext);
+	Size		tuplen;
+
+	/* copy the GinTuple into the right memory context */
+	ctup = palloc(size);
+	memcpy(ctup, tuple, size);
+
+	stup.tuple = ctup;
+	stup.datum1 = (Datum) 0;
+	stup.isnull1 = false;
+
+	/* GetMemoryChunkSpace is not supported for bump contexts */
+	if (TupleSortUseBumpTupleCxt(base->sortopt))
+		tuplen = MAXALIGN(size);
+	else
+		tuplen = GetMemoryChunkSpace(ctup);
 
 	tuplesort_puttuple_common(state, &stup,
 							  base->sortKeys &&
@@ -892,7 +1020,7 @@ tuplesort_gettupleslot(Tuplesortstate *state, bool forward, bool copy,
 			*abbrev = stup.datum1;
 
 		if (copy)
-			stup.tuple = heap_copy_minimal_tuple((MinimalTuple) stup.tuple);
+			stup.tuple = heap_copy_minimal_tuple((MinimalTuple) stup.tuple, 0);
 
 		ExecStoreMinimalTuple((MinimalTuple) stup.tuple, slot, copy);
 		return true;
@@ -975,6 +1103,29 @@ tuplesort_getbrintuple(Tuplesortstate *state, Size *len, bool forward)
 	return &btup->tuple;
 }
 
+GinTuple *
+tuplesort_getgintuple(Tuplesortstate *state, Size *len, bool forward)
+{
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	MemoryContext oldcontext = MemoryContextSwitchTo(base->sortcontext);
+	SortTuple	stup;
+	GinTuple   *tup;
+
+	if (!tuplesort_gettuple_common(state, forward, &stup))
+		stup.tuple = NULL;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	if (!stup.tuple)
+		return NULL;
+
+	tup = (GinTuple *) stup.tuple;
+
+	*len = tup->tuplen;
+
+	return tup;
+}
+
 /*
  * Fetch the next Datum in either forward or back direction.
  * Returns false if no more datums.
@@ -998,7 +1149,6 @@ tuplesort_getbrintuple(Tuplesortstate *state, Size *len, bool forward)
  * efficient, but only safe for callers that are prepared to have any
  * subsequent manipulation of the tuplesort's state invalidate slot contents.
  * For byval Datums, the value of the 'copy' parameter has no effect.
-
  */
 bool
 tuplesort_getdatum(Tuplesortstate *state, bool forward, bool copy,
@@ -1703,7 +1853,7 @@ removeabbrev_index_brin(Tuplesortstate *state, SortTuple *stups, int count)
 		BrinSortTuple *tuple;
 
 		tuple = stups[i].tuple;
-		stups[i].datum1 = tuple->tuple.bt_blkno;
+		stups[i].datum1 = UInt32GetDatum(tuple->tuple.bt_blkno);
 	}
 }
 
@@ -1760,7 +1910,70 @@ readtup_index_brin(Tuplesortstate *state, SortTuple *stup,
 	stup->tuple = tuple;
 
 	/* set up first-column key value, which is block number */
-	stup->datum1 = tuple->tuple.bt_blkno;
+	stup->datum1 = UInt32GetDatum(tuple->tuple.bt_blkno);
+}
+
+/*
+ * Routines specialized for GIN case
+ */
+
+static void
+removeabbrev_index_gin(Tuplesortstate *state, SortTuple *stups, int count)
+{
+	Assert(false);
+	elog(ERROR, "removeabbrev_index_gin not implemented");
+}
+
+static int
+comparetup_index_gin(const SortTuple *a, const SortTuple *b,
+					 Tuplesortstate *state)
+{
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+
+	Assert(!TuplesortstateGetPublic(state)->haveDatum1);
+
+	return _gin_compare_tuples((GinTuple *) a->tuple,
+							   (GinTuple *) b->tuple,
+							   base->sortKeys);
+}
+
+static void
+writetup_index_gin(Tuplesortstate *state, LogicalTape *tape, SortTuple *stup)
+{
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	GinTuple   *tuple = (GinTuple *) stup->tuple;
+	unsigned int tuplen = tuple->tuplen;
+
+	tuplen = tuplen + sizeof(tuplen);
+	LogicalTapeWrite(tape, &tuplen, sizeof(tuplen));
+	LogicalTapeWrite(tape, tuple, tuple->tuplen);
+	if (base->sortopt & TUPLESORT_RANDOMACCESS) /* need trailing length word? */
+		LogicalTapeWrite(tape, &tuplen, sizeof(tuplen));
+}
+
+static void
+readtup_index_gin(Tuplesortstate *state, SortTuple *stup,
+				  LogicalTape *tape, unsigned int len)
+{
+	GinTuple   *tuple;
+	TuplesortPublic *base = TuplesortstateGetPublic(state);
+	unsigned int tuplen = len - sizeof(unsigned int);
+
+	/*
+	 * Allocate space for the GIN sort tuple, which already has the proper
+	 * length included in the header.
+	 */
+	tuple = (GinTuple *) tuplesort_readtup_alloc(state, tuplen);
+
+	tuple->tuplen = tuplen;
+
+	LogicalTapeReadExact(tape, tuple, tuplen);
+	if (base->sortopt & TUPLESORT_RANDOMACCESS) /* need trailing length word? */
+		LogicalTapeReadExact(tape, &tuplen, sizeof(tuplen));
+	stup->tuple = tuple;
+
+	/* no abbreviations (FIXME maybe use attrnum for this?) */
+	stup->datum1 = (Datum) 0;
 }
 
 /*

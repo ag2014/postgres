@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -47,7 +47,9 @@ note "setting up PostgreSQL instance";
 
 my $node = PostgreSQL::Test::Cluster->new('node');
 $node->init;
-$node->append_conf('postgresql.conf', "log_connections = on\n");
+$node->append_conf('postgresql.conf', "log_connections = all\n");
+# Needed to allow connect_fails to inspect postmaster log:
+$node->append_conf('postgresql.conf', "log_min_messages = debug2");
 $node->start;
 
 $node->safe_psql('postgres', 'CREATE USER test0;');

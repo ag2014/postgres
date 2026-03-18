@@ -49,7 +49,7 @@
  * by re-setting the page's page_dirty flag.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/slru.c
@@ -71,6 +71,7 @@
 #include "storage/fd.h"
 #include "storage/shmem.h"
 #include "utils/guc.h"
+#include "utils/wait_event.h"
 
 /*
  * Converts segment number to the filename of the segment.
@@ -100,8 +101,7 @@ SlruFileName(SlruCtl ctl, char *path, int64 segno)
 		 * that in the future we can't decrease SLRU_PAGES_PER_SEGMENT easily.
 		 */
 		Assert(segno >= 0 && segno <= INT64CONST(0xFFFFFFFFFFFFFFF));
-		return snprintf(path, MAXPGPATH, "%s/%015llX", ctl->Dir,
-						(long long) segno);
+		return snprintf(path, MAXPGPATH, "%s/%015" PRIX64, ctl->Dir, segno);
 	}
 	else
 	{
@@ -182,7 +182,8 @@ static void SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata);
 static bool SlruPhysicalReadPage(SlruCtl ctl, int64 pageno, int slotno);
 static bool SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno,
 								  SlruWriteAll fdata);
-static void SlruReportIOError(SlruCtl ctl, int64 pageno, TransactionId xid);
+static void SlruReportIOError(SlruCtl ctl, int64 pageno,
+							  const void *opaque_data);
 static int	SlruSelectLRUPage(SlruCtl ctl, int64 pageno);
 
 static bool SlruScanDirCbDeleteCutoff(SlruCtl ctl, char *filename,
@@ -247,6 +248,7 @@ SimpleLruAutotuneBuffers(int divisor, int max)
  * buffer_tranche_id: tranche ID to use for the SLRU's per-buffer LWLocks.
  * bank_tranche_id: tranche ID to use for the bank LWLocks.
  * sync_handler: which set of functions to use to handle sync requests
+ * long_segment_names: use short or long segment names
  */
 void
 SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
@@ -258,6 +260,9 @@ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 	int			nbanks = nslots / SLRU_BANK_SIZE;
 
 	Assert(nslots <= SLRU_MAX_ALLOWED_BUFFERS);
+
+	Assert(ctl->PagePrecedes != NULL);
+	Assert(ctl->errdetail_for_io_error != NULL);
 
 	shared = (SlruShared) ShmemInitStruct(name,
 										  SimpleLruShmemSize(nslots, nlsns),
@@ -343,7 +348,7 @@ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 	ctl->shared = shared;
 	ctl->sync_handler = sync_handler;
 	ctl->long_segment_names = long_segment_names;
-	ctl->bank_mask = (nslots / SLRU_BANK_SIZE) - 1;
+	ctl->nbanks = nbanks;
 	strlcpy(ctl->Dir, subdir, sizeof(ctl->Dir));
 }
 
@@ -401,15 +406,15 @@ SimpleLruZeroPage(SlruCtl ctl, int64 pageno)
 	/*
 	 * Assume this page is now the latest active page.
 	 *
-	 * Note that because both this routine and SlruSelectLRUPage run with
-	 * ControlLock held, it is not possible for this to be zeroing a page that
-	 * SlruSelectLRUPage is going to evict simultaneously.  Therefore, there's
-	 * no memory barrier here.
+	 * Note that because both this routine and SlruSelectLRUPage run with a
+	 * SLRU bank lock held, it is not possible for this to be zeroing a page
+	 * that SlruSelectLRUPage is going to evict simultaneously.  Therefore,
+	 * there's no memory barrier here.
 	 */
 	pg_atomic_write_u64(&shared->latest_page_number, pageno);
 
 	/* update the stats counter of zeroed pages */
-	pgstat_count_slru_page_zeroed(shared->slru_stats_idx);
+	pgstat_count_slru_blocks_zeroed(shared->slru_stats_idx);
 
 	return slotno;
 }
@@ -432,6 +437,31 @@ SimpleLruZeroLSNs(SlruCtl ctl, int slotno)
 	if (shared->lsn_groups_per_page > 0)
 		MemSet(&shared->group_lsn[slotno * shared->lsn_groups_per_page], 0,
 			   shared->lsn_groups_per_page * sizeof(XLogRecPtr));
+}
+
+/*
+ * This is a convenience wrapper for the common case of zeroing a page and
+ * immediately flushing it to disk.
+ *
+ * SLRU bank lock is acquired and released here.
+ */
+void
+SimpleLruZeroAndWritePage(SlruCtl ctl, int64 pageno)
+{
+	int			slotno;
+	LWLock	   *lock;
+
+	lock = SimpleLruGetBankLock(ctl, pageno);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+
+	/* Create and zero the page */
+	slotno = SimpleLruZeroPage(ctl, pageno);
+
+	/* Make sure it's written out */
+	SimpleLruWritePage(ctl, slotno);
+	Assert(!ctl->shared->page_dirty[slotno]);
+
+	LWLockRelease(lock);
 }
 
 /*
@@ -490,8 +520,9 @@ SimpleLruWaitIO(SlruCtl ctl, int slotno)
  * that modification of the page is safe.  If write_ok is false then we
  * will not return the page until it is not undergoing active I/O.
  *
- * The passed-in xid is used only for error reporting, and may be
- * InvalidTransactionId if no specific xid is associated with the action.
+ * On error, the passed-in 'opaque_data' is passed to the
+ * 'errdetail_for_io_error' callback, to provide details on the operation that
+ * failed.  It is only used for error reporting.
  *
  * Return value is the shared-buffer slot number now holding the page.
  * The buffer's LRU access info is updated.
@@ -500,7 +531,7 @@ SimpleLruWaitIO(SlruCtl ctl, int slotno)
  */
 int
 SimpleLruReadPage(SlruCtl ctl, int64 pageno, bool write_ok,
-				  TransactionId xid)
+				  const void *opaque_data)
 {
 	SlruShared	shared = ctl->shared;
 	LWLock	   *banklock = SimpleLruGetBankLock(ctl, pageno);
@@ -536,7 +567,7 @@ SimpleLruReadPage(SlruCtl ctl, int64 pageno, bool write_ok,
 			SlruRecentlyUsed(shared, slotno);
 
 			/* update the stats counter of pages found in the SLRU */
-			pgstat_count_slru_page_hit(shared->slru_stats_idx);
+			pgstat_count_slru_blocks_hit(shared->slru_stats_idx);
 
 			return slotno;
 		}
@@ -576,12 +607,12 @@ SimpleLruReadPage(SlruCtl ctl, int64 pageno, bool write_ok,
 
 		/* Now it's okay to ereport if we failed */
 		if (!ok)
-			SlruReportIOError(ctl, pageno, xid);
+			SlruReportIOError(ctl, pageno, opaque_data);
 
 		SlruRecentlyUsed(shared, slotno);
 
 		/* update the stats counter of pages not found in SLRU */
-		pgstat_count_slru_page_read(shared->slru_stats_idx);
+		pgstat_count_slru_blocks_read(shared->slru_stats_idx);
 
 		return slotno;
 	}
@@ -592,8 +623,9 @@ SimpleLruReadPage(SlruCtl ctl, int64 pageno, bool write_ok,
  * The page number must correspond to an already-initialized page.
  * The caller must intend only read-only access to the page.
  *
- * The passed-in xid is used only for error reporting, and may be
- * InvalidTransactionId if no specific xid is associated with the action.
+ * On error, the passed-in 'opaque_data' is passed to the
+ * 'errdetail_for_io_error' callback, to provide details on the operation that
+ * failed.  It is only used for error reporting.
  *
  * Return value is the shared-buffer slot number now holding the page.
  * The buffer's LRU access info is updated.
@@ -602,11 +634,11 @@ SimpleLruReadPage(SlruCtl ctl, int64 pageno, bool write_ok,
  * It is unspecified whether the lock will be shared or exclusive.
  */
 int
-SimpleLruReadPage_ReadOnly(SlruCtl ctl, int64 pageno, TransactionId xid)
+SimpleLruReadPage_ReadOnly(SlruCtl ctl, int64 pageno, const void *opaque_data)
 {
 	SlruShared	shared = ctl->shared;
 	LWLock	   *banklock = SimpleLruGetBankLock(ctl, pageno);
-	int			bankno = pageno & ctl->bank_mask;
+	int			bankno = pageno % ctl->nbanks;
 	int			bankstart = bankno * SLRU_BANK_SIZE;
 	int			bankend = bankstart + SLRU_BANK_SIZE;
 
@@ -620,11 +652,11 @@ SimpleLruReadPage_ReadOnly(SlruCtl ctl, int64 pageno, TransactionId xid)
 			shared->page_number[slotno] == pageno &&
 			shared->page_status[slotno] != SLRU_PAGE_READ_IN_PROGRESS)
 		{
-			/* See comments for SlruRecentlyUsed macro */
+			/* See comments for SlruRecentlyUsed() */
 			SlruRecentlyUsed(shared, slotno);
 
 			/* update the stats counter of pages found in the SLRU */
-			pgstat_count_slru_page_hit(shared->slru_stats_idx);
+			pgstat_count_slru_blocks_hit(shared->slru_stats_idx);
 
 			return slotno;
 		}
@@ -634,7 +666,7 @@ SimpleLruReadPage_ReadOnly(SlruCtl ctl, int64 pageno, TransactionId xid)
 	LWLockRelease(banklock);
 	LWLockAcquire(banklock, LW_EXCLUSIVE);
 
-	return SimpleLruReadPage(ctl, pageno, true, xid);
+	return SimpleLruReadPage(ctl, pageno, true, opaque_data);
 }
 
 /*
@@ -714,7 +746,7 @@ SlruInternalWritePage(SlruCtl ctl, int slotno, SlruWriteAll fdata)
 
 	/* Now it's okay to ereport if we failed */
 	if (!ok)
-		SlruReportIOError(ctl, pageno, InvalidTransactionId);
+		SlruReportIOError(ctl, pageno, NULL);
 
 	/* If part of a checkpoint, count this as a SLRU buffer written. */
 	if (fdata)
@@ -754,7 +786,7 @@ SimpleLruDoesPhysicalPageExist(SlruCtl ctl, int64 pageno)
 	off_t		endpos;
 
 	/* update the stats counter of checked pages */
-	pgstat_count_slru_page_exists(ctl->shared->slru_stats_idx);
+	pgstat_count_slru_blocks_exists(ctl->shared->slru_stats_idx);
 
 	SlruFileName(ctl, path, segno);
 
@@ -768,14 +800,14 @@ SimpleLruDoesPhysicalPageExist(SlruCtl ctl, int64 pageno)
 		/* report error normally */
 		slru_errcause = SLRU_OPEN_FAILED;
 		slru_errno = errno;
-		SlruReportIOError(ctl, pageno, 0);
+		SlruReportIOError(ctl, pageno, NULL);
 	}
 
 	if ((endpos = lseek(fd, 0, SEEK_END)) < 0)
 	{
 		slru_errcause = SLRU_SEEK_FAILED;
 		slru_errno = errno;
-		SlruReportIOError(ctl, pageno, 0);
+		SlruReportIOError(ctl, pageno, NULL);
 	}
 
 	result = endpos >= (off_t) (offset + BLCKSZ);
@@ -883,7 +915,7 @@ SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno, SlruWriteAll fdata)
 	int			fd = -1;
 
 	/* update the stats counter of written pages */
-	pgstat_count_slru_page_written(shared->slru_stats_idx);
+	pgstat_count_slru_blocks_written(shared->slru_stats_idx);
 
 	/*
 	 * Honor the write-WAL-before-data rule, if appropriate, so that we do not
@@ -912,7 +944,7 @@ SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno, SlruWriteAll fdata)
 				max_lsn = this_lsn;
 		}
 
-		if (!XLogRecPtrIsInvalid(max_lsn))
+		if (XLogRecPtrIsValid(max_lsn))
 		{
 			/*
 			 * As noted above, elog(ERROR) is not acceptable here, so if
@@ -1045,7 +1077,7 @@ SlruPhysicalWritePage(SlruCtl ctl, int64 pageno, int slotno, SlruWriteAll fdata)
  * SlruPhysicalWritePage.  Call this after cleaning up shared-memory state.
  */
 static void
-SlruReportIOError(SlruCtl ctl, int64 pageno, TransactionId xid)
+SlruReportIOError(SlruCtl ctl, int64 pageno, const void *opaque_data)
 {
 	int64		segno = pageno / SLRU_PAGES_PER_SEGMENT;
 	int			rpageno = pageno % SLRU_PAGES_PER_SEGMENT;
@@ -1059,54 +1091,55 @@ SlruReportIOError(SlruCtl ctl, int64 pageno, TransactionId xid)
 		case SLRU_OPEN_FAILED:
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not access status of transaction %u", xid),
-					 errdetail("Could not open file \"%s\": %m.", path)));
+					 errmsg("could not open file \"%s\": %m", path),
+					 opaque_data ? ctl->errdetail_for_io_error(opaque_data) : 0));
 			break;
 		case SLRU_SEEK_FAILED:
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not access status of transaction %u", xid),
-					 errdetail("Could not seek in file \"%s\" to offset %d: %m.",
-							   path, offset)));
+					 errmsg("could not seek in file \"%s\" to offset %d: %m",
+							path, offset),
+					 opaque_data ? ctl->errdetail_for_io_error(opaque_data) : 0));
 			break;
 		case SLRU_READ_FAILED:
 			if (errno)
 				ereport(ERROR,
 						(errcode_for_file_access(),
-						 errmsg("could not access status of transaction %u", xid),
-						 errdetail("Could not read from file \"%s\" at offset %d: %m.",
-								   path, offset)));
+						 errmsg("could not read from file \"%s\" at offset %d: %m",
+								path, offset),
+						 opaque_data ? ctl->errdetail_for_io_error(opaque_data) : 0));
 			else
 				ereport(ERROR,
-						(errmsg("could not access status of transaction %u", xid),
-						 errdetail("Could not read from file \"%s\" at offset %d: read too few bytes.", path, offset)));
+						(errmsg("could not read from file \"%s\" at offset %d: read too few bytes",
+								path, offset),
+						 opaque_data ? ctl->errdetail_for_io_error(opaque_data) : 0));
 			break;
 		case SLRU_WRITE_FAILED:
 			if (errno)
 				ereport(ERROR,
 						(errcode_for_file_access(),
-						 errmsg("could not access status of transaction %u", xid),
-						 errdetail("Could not write to file \"%s\" at offset %d: %m.",
-								   path, offset)));
+						 errmsg("Could not write to file \"%s\" at offset %d: %m",
+								path, offset),
+						 opaque_data ? ctl->errdetail_for_io_error(opaque_data) : 0));
 			else
 				ereport(ERROR,
-						(errmsg("could not access status of transaction %u", xid),
-						 errdetail("Could not write to file \"%s\" at offset %d: wrote too few bytes.",
-								   path, offset)));
+						(errmsg("Could not write to file \"%s\" at offset %d: wrote too few bytes.",
+								path, offset),
+						 opaque_data ? ctl->errdetail_for_io_error(opaque_data) : 0));
 			break;
 		case SLRU_FSYNC_FAILED:
 			ereport(data_sync_elevel(ERROR),
 					(errcode_for_file_access(),
-					 errmsg("could not access status of transaction %u", xid),
-					 errdetail("Could not fsync file \"%s\": %m.",
-							   path)));
+					 errmsg("could not fsync file \"%s\": %m",
+							path),
+					 opaque_data ? ctl->errdetail_for_io_error(opaque_data) : 0));
 			break;
 		case SLRU_CLOSE_FAILED:
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not access status of transaction %u", xid),
-					 errdetail("Could not close file \"%s\": %m.",
-							   path)));
+					 errmsg("could not close file \"%s\": %m",
+							path),
+					 opaque_data ? ctl->errdetail_for_io_error(opaque_data) : 0));
 			break;
 		default:
 			/* can't get here, we trust */
@@ -1180,7 +1213,7 @@ SlruSelectLRUPage(SlruCtl ctl, int64 pageno)
 		int			bestinvalidslot = 0;	/* keep compiler quiet */
 		int			best_invalid_delta = -1;
 		int64		best_invalid_page_number = 0;	/* keep compiler quiet */
-		int			bankno = pageno & ctl->bank_mask;
+		int			bankno = pageno % ctl->nbanks;
 		int			bankstart = bankno * SLRU_BANK_SIZE;
 		int			bankend = bankstart + SLRU_BANK_SIZE;
 
@@ -1386,7 +1419,7 @@ SimpleLruWriteAll(SlruCtl ctl, bool allow_redirtied)
 		}
 	}
 	if (!ok)
-		SlruReportIOError(ctl, pageno, InvalidTransactionId);
+		SlruReportIOError(ctl, pageno, NULL);
 
 	/* Ensure that directory entries for new files are on disk. */
 	if (ctl->sync_handler != SYNC_HANDLER_NONE)

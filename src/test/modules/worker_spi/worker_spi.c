@@ -13,7 +13,7 @@
  * "delta" type.  Delta rows will be deleted by this worker and their values
  * aggregated into the total.
  *
- * Copyright (c) 2013-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/test/modules/worker_spi/worker_spi.c
@@ -30,7 +30,7 @@
 
 /* these headers are used by this particular worker's code */
 #include "access/xact.h"
-#include "commands/dbcommands.h"
+#include "catalog/pg_database.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "lib/stringinfo.h"
@@ -39,12 +39,13 @@
 #include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/snapmgr.h"
+#include "utils/wait_event.h"
 
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(worker_spi_launch);
 
-PGDLLEXPORT void worker_spi_main(Datum main_arg) pg_attribute_noreturn();
+PGDLLEXPORT pg_noreturn void worker_spi_main(Datum main_arg);
 
 /* GUC variables */
 static int	worker_spi_naptime = 10;
@@ -142,7 +143,7 @@ worker_spi_main(Datum main_arg)
 	char	   *p;
 	bits32		flags = 0;
 
-	table = palloc(sizeof(worktable));
+	table = palloc_object(worktable);
 	sprintf(name, "schema%d", index);
 	table->schema = pstrdup(name);
 	table->name = pstrdup("counted");
@@ -168,16 +169,6 @@ worker_spi_main(Datum main_arg)
 	else
 		BackgroundWorkerInitializeConnection(worker_spi_database,
 											 worker_spi_role, flags);
-
-	/*
-	 * Disable parallel query for workers started with
-	 * BGWORKER_BYPASS_ALLOWCONN or BGWORKER_BYPASS_ROLELOGINCHECK so as these
-	 * don't attempt connections using a database or a role that may not allow
-	 * that.
-	 */
-	if ((flags & (BGWORKER_BYPASS_ALLOWCONN | BGWORKER_BYPASS_ROLELOGINCHECK)))
-		SetConfigOption("max_parallel_workers_per_gather", "0",
-						PGC_USERSET, PGC_S_OVERRIDE);
 
 	elog(LOG, "%s initialized with %s.%s",
 		 MyBgworkerEntry->bgw_name, table->schema, table->name);
@@ -414,10 +405,15 @@ worker_spi_launch(PG_FUNCTION_ARGS)
 	Size		ndim;
 	int			nelems;
 	Datum	   *datum_flags;
+	bool		interruptible = PG_GETARG_BOOL(4);
 
 	memset(&worker, 0, sizeof(worker));
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
 		BGWORKER_BACKEND_DATABASE_CONNECTION;
+
+	if (interruptible)
+		worker.bgw_flags |= BGWORKER_INTERRUPTIBLE;
+
 	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
 	worker.bgw_restart_time = BGW_NEVER_RESTART;
 	sprintf(worker.bgw_library_name, "worker_spi");

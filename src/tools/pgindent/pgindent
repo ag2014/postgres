@@ -1,6 +1,13 @@
 #!/usr/bin/perl
 
-# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
+
+# Program to maintain uniform layout style in our C code.
+# Exit codes:
+#   0 -- all OK
+#   1 -- error invoking pgindent, nothing done
+#   2 -- --check mode and at least one file requires changes
+#   3 -- pg_bsd_indent failed on at least one file
 
 use strict;
 use warnings FATAL => 'all';
@@ -66,11 +73,14 @@ if ($sourcedir)
 # might make them so.  For the moment we just hardwire a list of names
 # to add and a list of names to exclude; eventually this may need to be
 # easier to configure.  Note that the typedefs need trailing newlines.
-my @additional = ("bool\n");
+my @additional = map { "$_\n" } qw(
+  bool regex_t regmatch_t regoff
+);
 
 my %excluded = map { +"$_\n" => 1 } qw(
-  ANY FD_SET U abs allocfunc boolean date digit ilist interval iterator other
-  pointer printfunc reference string timestamp type wrap
+  FD_SET LookupSet boolean date duration
+  element_type inquiry iterator other
+  pointer reference rep string timestamp type wrap
 );
 
 # globals
@@ -175,7 +185,7 @@ sub process_exclude
 		while (my $line = <$eh>)
 		{
 			chomp $line;
-			next if $line =~ m/^#/;
+			next if $line =~ m/^#/ || $line eq "";
 			my $rgx = qr!$line!;
 			@files = grep { $_ !~ /$rgx/ } @files if $rgx;
 		}
@@ -408,6 +418,7 @@ foreach my $source_filename (@files)
 	if ($source eq "")
 	{
 		print STDERR "Failure in $source_filename: " . $error_message . "\n";
+		$status = 3;
 		next;
 	}
 
@@ -428,7 +439,7 @@ foreach my $source_filename (@files)
 
 			if ($check)
 			{
-				$status = 2;
+				$status ||= 2;
 				last unless $diff;
 			}
 		}

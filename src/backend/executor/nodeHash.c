@@ -3,7 +3,7 @@
  * nodeHash.c
  *	  Routines to hash relations for hashjoin
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -32,11 +32,11 @@
 #include "commands/tablespace.h"
 #include "executor/executor.h"
 #include "executor/hashjoin.h"
+#include "executor/instrument.h"
 #include "executor/nodeHash.h"
 #include "executor/nodeHashjoin.h"
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
-#include "utils/dynahash.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
@@ -259,7 +259,7 @@ MultiExecParallelHash(HashState *node)
 			 * way, wait for everyone to arrive here so we can proceed.
 			 */
 			BarrierArriveAndWait(build_barrier, WAIT_EVENT_HASH_BUILD_ALLOCATE);
-			/* Fall through. */
+			pg_fallthrough;
 
 		case PHJ_BUILD_HASH_INNER:
 
@@ -340,7 +340,7 @@ MultiExecParallelHash(HashState *node)
 	 */
 	hashtable->curbatch = -1;
 	hashtable->nbuckets = pstate->nbuckets;
-	hashtable->log2_nbuckets = my_log2(hashtable->nbuckets);
+	hashtable->log2_nbuckets = pg_ceil_log2_32(hashtable->nbuckets);
 	hashtable->totalTuples = pstate->total_tuples;
 
 	/*
@@ -480,7 +480,7 @@ ExecHashTableCreate(HashState *state)
 							&nbuckets, &nbatch, &num_skew_mcvs);
 
 	/* nbuckets must be a power of 2 */
-	log2_nbuckets = my_log2(nbuckets);
+	log2_nbuckets = pg_ceil_log2_32(nbuckets);
 	Assert(nbuckets == (1 << log2_nbuckets));
 
 	/*
@@ -848,6 +848,96 @@ ExecChooseHashTableSize(double ntuples, int tupwidth, bool useskew,
 		nbatch = pg_nextpower2_32(Max(2, minbatch));
 	}
 
+	/*
+	 * Optimize the total amount of memory consumed by the hash node.
+	 *
+	 * The nbatch calculation above focuses on the in-memory hash table,
+	 * assuming no per-batch overhead. But each batch may have two files, each
+	 * with a BLCKSZ buffer. For large nbatch values these buffers may use
+	 * significantly more memory than the hash table.
+	 *
+	 * The total memory usage may be expressed by this formula:
+	 *
+	 * (inner_rel_bytes / nbatch) + (2 * nbatch * BLCKSZ)
+	 *
+	 * where (inner_rel_bytes / nbatch) is the size of the in-memory hash
+	 * table and (2 * nbatch * BLCKSZ) is the amount of memory used by file
+	 * buffers.
+	 *
+	 * The nbatch calculation however ignores the second part. And for very
+	 * large inner_rel_bytes, there may be no nbatch that keeps total memory
+	 * usage under the budget (work_mem * hash_mem_multiplier). To deal with
+	 * that, we will adjust nbatch to minimize total memory consumption across
+	 * both the hashtable and file buffers.
+	 *
+	 * As we increase the size of the hashtable, the number of batches
+	 * decreases, and the total memory usage follows a U-shaped curve. We find
+	 * the minimum nbatch by "walking back" -- checking if halving nbatch
+	 * would lower the total memory usage. We stop when it no longer helps.
+	 *
+	 * We only reduce the number of batches. Adding batches reduces memory
+	 * usage only when most of the memory is used by the hash table, with
+	 * total memory usage within the limit or not far from it. We don't want
+	 * to start batching when not needed, even if that would reduce memory
+	 * usage.
+	 *
+	 * While growing the hashtable, we also adjust the number of buckets to
+	 * maintain a load factor of NTUP_PER_BUCKET while squeezing tuples back
+	 * from batches into the hashtable.
+	 *
+	 * Note that we can only change nbuckets during initial hashtable sizing.
+	 * Once we start building the hash, nbuckets is fixed (we may still grow
+	 * the hash table).
+	 *
+	 * We double several parameters (space_allowed, nbuckets, num_skew_mcvs),
+	 * which introduces a risk of overflow. We avoid this by exiting the loop.
+	 * We could do something smarter (e.g. capping nbuckets and continue), but
+	 * the complexity is not worth it. Such cases are extremely rare, and this
+	 * is a best-effort attempt to reduce memory usage.
+	 */
+	while (nbatch > 1)
+	{
+		/* Check that buckets won't overflow MaxAllocSize */
+		if (nbuckets > (MaxAllocSize / sizeof(HashJoinTuple) / 2))
+			break;
+
+		/* num_skew_mcvs should be less than nbuckets */
+		Assert((*num_skew_mcvs) < (INT_MAX / 2));
+
+		/*
+		 * Check that space_allowed won't overflow SIZE_MAX.
+		 *
+		 * We don't use hash_table_bytes here, because it does not include the
+		 * skew buckets. And we want to limit the overall memory limit.
+		 */
+		if ((*space_allowed) > (SIZE_MAX / 2))
+			break;
+
+		/*
+		 * Will halving the number of batches and doubling the size of the
+		 * hashtable reduce overall memory usage?
+		 *
+		 * This is the same as (S = space_allowed):
+		 *
+		 * (S + 2 * nbatch * BLCKSZ) < (S * 2 + nbatch * BLCKSZ)
+		 *
+		 * but avoiding intermediate overflow.
+		 */
+		if (nbatch < (*space_allowed) / BLCKSZ)
+			break;
+
+		/*
+		 * MaxAllocSize is sufficiently small that we are not worried about
+		 * overflowing nbuckets.
+		 */
+		nbuckets *= 2;
+
+		*num_skew_mcvs = (*num_skew_mcvs) * 2;
+		*space_allowed = (*space_allowed) * 2;
+
+		nbatch /= 2;
+	}
+
 	Assert(nbuckets > 0);
 	Assert(nbatch > 0);
 
@@ -891,6 +981,47 @@ ExecHashTableDestroy(HashJoinTable hashtable)
 }
 
 /*
+ * Consider adjusting the allowed hash table size, depending on the number
+ * of batches, to minimize the overall memory usage (for both the hashtable
+ * and batch files).
+ *
+ * We're adjusting the size of the hash table, not the (optimal) number of
+ * buckets. We can't change that once we start building the hash, due to how
+ * ExecHashGetBucketAndBatch calculates batchno/bucketno from the hash. This
+ * means the load factor may not be optimal, but we're in damage control so
+ * we accept slower lookups. It's still much better than batch explosion.
+ *
+ * Returns true if we chose to increase the batch size (and thus we don't
+ * need to add batches), and false if we should increase nbatch.
+ */
+static bool
+ExecHashIncreaseBatchSize(HashJoinTable hashtable)
+{
+	/*
+	 * How much additional memory would doubling nbatch use? Each batch may
+	 * require two buffered files (inner/outer), with a BLCKSZ buffer.
+	 */
+	size_t		batchSpace = (hashtable->nbatch * 2 * (size_t) BLCKSZ);
+
+	/*
+	 * Compare the new space needed for doubling nbatch and for enlarging the
+	 * in-memory hash table. If doubling the hash table needs less memory,
+	 * just do that. Otherwise, continue with doubling the nbatch.
+	 *
+	 * We're either doubling spaceAllowed or batchSpace, so which of those
+	 * increases the memory usage the least is the same as comparing the
+	 * values directly.
+	 */
+	if (hashtable->spaceAllowed <= batchSpace)
+	{
+		hashtable->spaceAllowed *= 2;
+		return true;
+	}
+
+	return false;
+}
+
+/*
  * ExecHashIncreaseNumBatches
  *		increase the original number of batches in order to reduce
  *		current memory consumption
@@ -911,6 +1042,10 @@ ExecHashIncreaseNumBatches(HashJoinTable hashtable)
 
 	/* safety check to avoid overflow */
 	if (oldnbatch > Min(INT_MAX / 2, MaxAllocSize / (sizeof(void *) * 2)))
+		return;
+
+	/* consider increasing size of the in-memory hash table instead */
+	if (ExecHashIncreaseBatchSize(hashtable))
 		return;
 
 	nbatch = oldnbatch * 2;
@@ -1196,13 +1331,13 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
 				/* All other participants just flush their tuples to disk. */
 				ExecParallelHashCloseBatchAccessors(hashtable);
 			}
-			/* Fall through. */
+			pg_fallthrough;
 
 		case PHJ_GROW_BATCHES_REALLOCATE:
 			/* Wait for the above to be finished. */
 			BarrierArriveAndWait(&pstate->grow_batches_barrier,
 								 WAIT_EVENT_HASH_GROW_BATCHES_REALLOCATE);
-			/* Fall through. */
+			pg_fallthrough;
 
 		case PHJ_GROW_BATCHES_REPARTITION:
 			/* Make sure that we have the current dimensions and buckets. */
@@ -1215,7 +1350,7 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
 			/* Wait for the above to be finished. */
 			BarrierArriveAndWait(&pstate->grow_batches_barrier,
 								 WAIT_EVENT_HASH_GROW_BATCHES_REPARTITION);
-			/* Fall through. */
+			pg_fallthrough;
 
 		case PHJ_GROW_BATCHES_DECIDE:
 
@@ -1277,7 +1412,7 @@ ExecParallelHashIncreaseNumBatches(HashJoinTable hashtable)
 				dsa_free(hashtable->area, pstate->old_batches);
 				pstate->old_batches = InvalidDsaPointer;
 			}
-			/* Fall through. */
+			pg_fallthrough;
 
 		case PHJ_GROW_BATCHES_FINISH:
 			/* Wait for the above to complete. */
@@ -1555,13 +1690,13 @@ ExecParallelHashIncreaseNumBuckets(HashJoinTable hashtable)
 				/* Clear the flag. */
 				pstate->growth = PHJ_GROWTH_OK;
 			}
-			/* Fall through. */
+			pg_fallthrough;
 
 		case PHJ_GROW_BUCKETS_REALLOCATE:
 			/* Wait for the above to complete. */
 			BarrierArriveAndWait(&pstate->grow_buckets_barrier,
 								 WAIT_EVENT_HASH_GROW_BUCKETS_REALLOCATE);
-			/* Fall through. */
+			pg_fallthrough;
 
 		case PHJ_GROW_BUCKETS_REINSERT:
 			/* Reinsert all tuples into the hash table. */
@@ -3370,7 +3505,7 @@ ExecParallelHashTableSetCurrentBatch(HashJoinTable hashtable, int batchno)
 		dsa_get_address(hashtable->area,
 						hashtable->batches[batchno].shared->buckets);
 	hashtable->nbuckets = hashtable->parallel_state->nbuckets;
-	hashtable->log2_nbuckets = my_log2(hashtable->nbuckets);
+	hashtable->log2_nbuckets = pg_ceil_log2_32(hashtable->nbuckets);
 	hashtable->current_chunk = NULL;
 	hashtable->current_chunk_shared = InvalidDsaPointer;
 	hashtable->batches[batchno].at_least_one_chunk = false;

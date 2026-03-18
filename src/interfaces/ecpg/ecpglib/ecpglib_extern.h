@@ -52,7 +52,7 @@ struct ECPGgeneric_bytea
 struct ECPGtype_information_cache
 {
 	struct ECPGtype_information_cache *next;
-	int			oid;
+	Oid			oid;
 	enum ARRAY_TYPE isarray;
 };
 
@@ -175,7 +175,7 @@ void		ecpg_free(void *ptr);
 bool		ecpg_init(const struct connection *con,
 					  const char *connection_name,
 					  const int lineno);
-char	   *ecpg_strdup(const char *string, int lineno);
+char	   *ecpg_strdup(const char *string, int lineno, bool *alloc_failed);
 const char *ecpg_type_name(enum ECPGttype typ);
 int			ecpg_dynamic_type(Oid type);
 int			sqlda_dynamic_type(Oid type, enum COMPAT_MODE compat);

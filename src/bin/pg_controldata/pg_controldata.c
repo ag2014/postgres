@@ -1,7 +1,7 @@
 /*
  * pg_controldata
  *
- * reads the data from $PGDATA/global/pg_control
+ * reads the data from the control file located at $PGDATA/XLOG_CONTROL_FILE.
  *
  * copyright (c) Oliver Elphick <olly@lfix.co.uk>, 2001;
  * license: BSD
@@ -97,6 +97,7 @@ main(int argc, char *argv[])
 	bool		crc_ok;
 	char	   *DataDir = NULL;
 	time_t		time_tmp;
+	struct tm  *tm_tmp;
 	char		pgctime_str[128];
 	char		ckpttime_str[128];
 	char		mock_auth_nonce_str[MOCK_AUTH_NONCE_LEN * 2 + 1];
@@ -166,7 +167,14 @@ main(int argc, char *argv[])
 
 	/* get a copy of the control file */
 	ControlFile = get_controlfile(DataDir, &crc_ok);
-	if (!crc_ok)
+	if (ControlFile->pg_control_version != PG_CONTROL_VERSION)
+	{
+		pg_log_warning("control file version (%u) does not match the version understood by this program (%u)",
+					   ControlFile->pg_control_version, PG_CONTROL_VERSION);
+		pg_log_warning_detail("Either the control file has been created with a different version of PostgreSQL, "
+							  "or it is corrupt.  The results below are untrustworthy.");
+	}
+	else if (!crc_ok)
 	{
 		pg_log_warning("calculated CRC checksum does not match value stored in control file");
 		pg_log_warning_detail("Either the control file is corrupt, or it has a different layout than this program "
@@ -196,20 +204,30 @@ main(int argc, char *argv[])
 	 * about %c
 	 */
 	time_tmp = (time_t) ControlFile->time;
-	strftime(pgctime_str, sizeof(pgctime_str), strftime_fmt,
-			 localtime(&time_tmp));
+	tm_tmp = localtime(&time_tmp);
+
+	if (tm_tmp != NULL)
+		strftime(pgctime_str, sizeof(pgctime_str), strftime_fmt, tm_tmp);
+	else
+		snprintf(pgctime_str, sizeof(pgctime_str), _("???"));
+
 	time_tmp = (time_t) ControlFile->checkPointCopy.time;
-	strftime(ckpttime_str, sizeof(ckpttime_str), strftime_fmt,
-			 localtime(&time_tmp));
+	tm_tmp = localtime(&time_tmp);
+
+	if (tm_tmp != NULL)
+		strftime(ckpttime_str, sizeof(ckpttime_str), strftime_fmt, tm_tmp);
+	else
+		snprintf(ckpttime_str, sizeof(ckpttime_str), _("???"));
 
 	/*
 	 * Calculate name of the WAL file containing the latest checkpoint's REDO
 	 * start point.
 	 *
-	 * A corrupted control file could report a WAL segment size of 0, and to
-	 * guard against division by zero, we need to treat that specially.
+	 * A corrupted control file could report a WAL segment size of 0 or
+	 * negative value, and to guard against division by zero, we need to treat
+	 * that specially.
 	 */
-	if (WalSegSz != 0)
+	if (WalSegSz > 0)
 	{
 		XLogSegNo	segno;
 
@@ -228,15 +246,15 @@ main(int argc, char *argv[])
 		   ControlFile->pg_control_version);
 	printf(_("Catalog version number:               %u\n"),
 		   ControlFile->catalog_version_no);
-	printf(_("Database system identifier:           %llu\n"),
-		   (unsigned long long) ControlFile->system_identifier);
+	printf(_("Database system identifier:           %" PRIu64 "\n"),
+		   ControlFile->system_identifier);
 	printf(_("Database cluster state:               %s\n"),
 		   dbState(ControlFile->state));
 	printf(_("pg_control last modified:             %s\n"),
 		   pgctime_str);
-	printf(_("Latest checkpoint location:           %X/%X\n"),
+	printf(_("Latest checkpoint location:           %X/%08X\n"),
 		   LSN_FORMAT_ARGS(ControlFile->checkPoint));
-	printf(_("Latest checkpoint's REDO location:    %X/%X\n"),
+	printf(_("Latest checkpoint's REDO location:    %X/%08X\n"),
 		   LSN_FORMAT_ARGS(ControlFile->checkPointCopy.redo));
 	printf(_("Latest checkpoint's REDO WAL file:    %s\n"),
 		   xlogfilename);
@@ -253,7 +271,7 @@ main(int argc, char *argv[])
 		   ControlFile->checkPointCopy.nextOid);
 	printf(_("Latest checkpoint's NextMultiXactId:  %u\n"),
 		   ControlFile->checkPointCopy.nextMulti);
-	printf(_("Latest checkpoint's NextMultiOffset:  %u\n"),
+	printf(_("Latest checkpoint's NextMultiOffset:  %" PRIu64 "\n"),
 		   ControlFile->checkPointCopy.nextMultiOffset);
 	printf(_("Latest checkpoint's oldestXID:        %u\n"),
 		   ControlFile->checkPointCopy.oldestXid);
@@ -271,15 +289,15 @@ main(int argc, char *argv[])
 		   ControlFile->checkPointCopy.newestCommitTsXid);
 	printf(_("Time of latest checkpoint:            %s\n"),
 		   ckpttime_str);
-	printf(_("Fake LSN counter for unlogged rels:   %X/%X\n"),
+	printf(_("Fake LSN counter for unlogged rels:   %X/%08X\n"),
 		   LSN_FORMAT_ARGS(ControlFile->unloggedLSN));
-	printf(_("Minimum recovery ending location:     %X/%X\n"),
+	printf(_("Minimum recovery ending location:     %X/%08X\n"),
 		   LSN_FORMAT_ARGS(ControlFile->minRecoveryPoint));
 	printf(_("Min recovery ending loc's timeline:   %u\n"),
 		   ControlFile->minRecoveryPointTLI);
-	printf(_("Backup start location:                %X/%X\n"),
+	printf(_("Backup start location:                %X/%08X\n"),
 		   LSN_FORMAT_ARGS(ControlFile->backupStartPoint));
-	printf(_("Backup end location:                  %X/%X\n"),
+	printf(_("Backup end location:                  %X/%08X\n"),
 		   LSN_FORMAT_ARGS(ControlFile->backupEndPoint));
 	printf(_("End-of-backup record required:        %s\n"),
 		   ControlFile->backupEndRequired ? _("yes") : _("no"));
@@ -306,6 +324,8 @@ main(int argc, char *argv[])
 		   ControlFile->blcksz);
 	printf(_("Blocks per segment of large relation: %u\n"),
 		   ControlFile->relseg_size);
+	printf(_("Pages per SLRU segment:               %u\n"),
+		   ControlFile->slru_pages_per_segment);
 	printf(_("WAL block size:                       %u\n"),
 		   ControlFile->xlog_blcksz);
 	printf(_("Bytes per WAL segment:                %u\n"),
@@ -325,6 +345,8 @@ main(int argc, char *argv[])
 		   (ControlFile->float8ByVal ? _("by value") : _("by reference")));
 	printf(_("Data page checksum version:           %u\n"),
 		   ControlFile->data_checksum_version);
+	printf(_("Default char data signedness:         %s\n"),
+		   (ControlFile->default_char_signedness ? _("signed") : _("unsigned")));
 	printf(_("Mock authentication nonce:            %s\n"),
 		   mock_auth_nonce_str);
 	return 0;

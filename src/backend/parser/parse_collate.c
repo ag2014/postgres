@@ -29,7 +29,7 @@
  * at runtime.  If we knew exactly which functions require collation
  * information, we could throw those errors at parse time instead.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -546,6 +546,7 @@ assign_collations_walker(Node *node, assign_collations_context *context)
 		case T_CaseTestExpr:
 		case T_SetToDefault:
 		case T_CurrentOfExpr:
+		case T_GraphPropertyRef:
 
 			/*
 			 * General case for childless expression nodes.  These should

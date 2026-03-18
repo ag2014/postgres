@@ -9,7 +9,7 @@
  * contains variables.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -76,6 +76,7 @@ static bool pull_varattnos_walker(Node *node, pull_varattnos_context *context);
 static bool pull_vars_walker(Node *node, pull_vars_context *context);
 static bool contain_var_clause_walker(Node *node, void *context);
 static bool contain_vars_of_level_walker(Node *node, int *sublevels_up);
+static bool contain_vars_returning_old_or_new_walker(Node *node, void *context);
 static bool locate_var_of_level_walker(Node *node,
 									   locate_var_of_level_context *context);
 static bool pull_var_clause_walker(Node *node,
@@ -493,6 +494,49 @@ contain_vars_of_level_walker(Node *node, int *sublevels_up)
 
 
 /*
+ * contain_vars_returning_old_or_new
+ *	  Recursively scan a clause to discover whether it contains any Var nodes
+ *	  (of the current query level) whose varreturningtype is VAR_RETURNING_OLD
+ *	  or VAR_RETURNING_NEW.
+ *
+ *	  Returns true if any found.
+ *
+ * Any ReturningExprs are also detected --- if an OLD/NEW Var was rewritten,
+ * we still regard this as a clause that returns OLD/NEW values.
+ *
+ * Does not examine subqueries, therefore must only be used after reduction
+ * of sublinks to subplans!
+ */
+bool
+contain_vars_returning_old_or_new(Node *node)
+{
+	return contain_vars_returning_old_or_new_walker(node, NULL);
+}
+
+static bool
+contain_vars_returning_old_or_new_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		if (((Var *) node)->varlevelsup == 0 &&
+			((Var *) node)->varreturningtype != VAR_RETURNING_DEFAULT)
+			return true;		/* abort the tree traversal and return true */
+		return false;
+	}
+	if (IsA(node, ReturningExpr))
+	{
+		if (((ReturningExpr *) node)->retlevelsup == 0)
+			return true;		/* abort the tree traversal and return true */
+		return false;
+	}
+	return expression_tree_walker(node, contain_vars_returning_old_or_new_walker,
+								  context);
+}
+
+
+/*
  * locate_var_of_level
  *	  Find the parse location of any Var of the specified query level.
  *
@@ -732,14 +776,6 @@ pull_var_clause_walker(Node *node, pull_var_clause_context *context)
  * PlaceHolderVar or constructed from those, we can just add the
  * varnullingrels bits to the existing nullingrels field(s); otherwise
  * we have to add a PlaceHolderVar wrapper.
- *
- * NOTE: this is also used by the parser, to expand join alias Vars before
- * checking GROUP BY validity.  For that use-case, root will be NULL, which
- * is why we have to pass the Query separately.  We need the root itself only
- * for making PlaceHolderVars.  We can avoid making PlaceHolderVars in the
- * parser's usage because it won't be dealing with arbitrary expressions:
- * so long as adjust_standard_join_alias_expression can handle everything
- * the parser would make as a join alias expression, we're OK.
  */
 Node *
 flatten_join_alias_vars(PlannerInfo *root, Query *query, Node *node)
@@ -756,6 +792,44 @@ flatten_join_alias_vars(PlannerInfo *root, Query *query, Node *node)
 	context.root = root;
 	context.query = query;
 	context.sublevels_up = 0;
+	/* flag whether join aliases could possibly contain SubLinks */
+	context.possible_sublink = query->hasSubLinks;
+	/* if hasSubLinks is already true, no need to work hard */
+	context.inserted_sublink = query->hasSubLinks;
+
+	return flatten_join_alias_vars_mutator(node, &context);
+}
+
+/*
+ * flatten_join_alias_for_parser
+ *
+ * This variant of flatten_join_alias_vars is used by the parser, to expand
+ * join alias Vars before checking GROUP BY validity.  In that case we lack
+ * a root structure.  Fortunately, we'd only need the root for making
+ * PlaceHolderVars.  We can avoid making PlaceHolderVars in the parser's
+ * usage because it won't be dealing with arbitrary expressions: so long as
+ * adjust_standard_join_alias_expression can handle everything the parser
+ * would make as a join alias expression, we're OK.
+ *
+ * The "node" might be part of a sub-query of the Query whose join alias
+ * Vars are to be expanded.  "sublevels_up" indicates how far below the
+ * given query we are starting.
+ */
+Node *
+flatten_join_alias_for_parser(Query *query, Node *node, int sublevels_up)
+{
+	flatten_join_alias_vars_context context;
+
+	/*
+	 * We do not expect this to be applied to the whole Query, only to
+	 * expressions or LATERAL subqueries.  Hence, if the top node is a Query,
+	 * it's okay to immediately increment sublevels_up.
+	 */
+	Assert(node != (Node *) query);
+
+	context.root = NULL;
+	context.query = query;
+	context.sublevels_up = sublevels_up;
 	/* flag whether join aliases could possibly contain SubLinks */
 	context.possible_sublink = query->hasSubLinks;
 	/* if hasSubLinks is already true, no need to work hard */
@@ -914,11 +988,12 @@ flatten_join_alias_vars_mutator(Node *node,
  * existing nullingrels field(s); otherwise we have to add a PlaceHolderVar
  * wrapper.
  *
- * NOTE: this is also used by ruleutils.c, to deparse one query parsetree back
- * to source text.  For that use-case, root will be NULL, which is why we have
- * to pass the Query separately.  We need the root itself only for preserving
- * varnullingrels.  We can avoid preserving varnullingrels in the ruleutils.c's
- * usage because it does not make any difference to the deparsed source text.
+ * NOTE: root may be passed as NULL, which is why we have to pass the Query
+ * separately.  We need the root itself only for preserving varnullingrels.
+ * Callers can safely pass NULL if preserving varnullingrels is unnecessary for
+ * their specific use case (e.g., deparsing source text, or scanning for
+ * volatile functions), or if it is already guaranteed that the query cannot
+ * contain grouping sets.
  */
 Node *
 flatten_group_exprs(PlannerInfo *root, Query *query, Node *node)

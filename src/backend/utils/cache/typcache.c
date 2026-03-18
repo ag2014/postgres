@@ -31,7 +31,7 @@
  * constraint changes are also tracked properly.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -235,8 +235,8 @@ shared_record_table_compare(const void *a, const void *b, size_t size,
 							void *arg)
 {
 	dsa_area   *area = (dsa_area *) arg;
-	SharedRecordTableKey *k1 = (SharedRecordTableKey *) a;
-	SharedRecordTableKey *k2 = (SharedRecordTableKey *) b;
+	const SharedRecordTableKey *k1 = a;
+	const SharedRecordTableKey *k2 = b;
 	TupleDesc	t1;
 	TupleDesc	t2;
 
@@ -259,8 +259,8 @@ shared_record_table_compare(const void *a, const void *b, size_t size,
 static uint32
 shared_record_table_hash(const void *a, size_t size, void *arg)
 {
-	dsa_area   *area = (dsa_area *) arg;
-	SharedRecordTableKey *k = (SharedRecordTableKey *) a;
+	dsa_area   *area = arg;
+	const SharedRecordTableKey *k = a;
 	TupleDesc	t;
 
 	if (k->shared)
@@ -337,9 +337,12 @@ static bool multirange_element_has_hashing(TypeCacheEntry *typentry);
 static bool multirange_element_has_extended_hashing(TypeCacheEntry *typentry);
 static void cache_multirange_element_properties(TypeCacheEntry *typentry);
 static void TypeCacheRelCallback(Datum arg, Oid relid);
-static void TypeCacheTypCallback(Datum arg, int cacheid, uint32 hashvalue);
-static void TypeCacheOpcCallback(Datum arg, int cacheid, uint32 hashvalue);
-static void TypeCacheConstrCallback(Datum arg, int cacheid, uint32 hashvalue);
+static void TypeCacheTypCallback(Datum arg, SysCacheIdentifier cacheid,
+								 uint32 hashvalue);
+static void TypeCacheOpcCallback(Datum arg, SysCacheIdentifier cacheid,
+								 uint32 hashvalue);
+static void TypeCacheConstrCallback(Datum arg, SysCacheIdentifier cacheid,
+									uint32 hashvalue);
 static void load_enum_cache_data(TypeCacheEntry *tcache);
 static EnumItem *find_enumitem(TypeCacheEnumData *enumdata, Oid arg);
 static int	enum_oid_cmp(const void *left, const void *right);
@@ -499,6 +502,7 @@ lookup_type_cache(Oid type_id, int flags)
 		typentry->typrelid = typtup->typrelid;
 		typentry->typsubscript = typtup->typsubscript;
 		typentry->typelem = typtup->typelem;
+		typentry->typarray = typtup->typarray;
 		typentry->typcollation = typtup->typcollation;
 		typentry->flags |= TCFLAGS_HAVE_PG_TYPE_DATA;
 
@@ -544,6 +548,7 @@ lookup_type_cache(Oid type_id, int flags)
 		typentry->typrelid = typtup->typrelid;
 		typentry->typsubscript = typtup->typsubscript;
 		typentry->typelem = typtup->typelem;
+		typentry->typarray = typtup->typarray;
 		typentry->typcollation = typtup->typcollation;
 		typentry->flags |= TCFLAGS_HAVE_PG_TYPE_DATA;
 
@@ -950,7 +955,7 @@ lookup_type_cache(Oid type_id, int flags)
 		load_domaintype_info(typentry);
 	}
 
-	INJECTION_POINT("typecache-before-rel-type-cache-insert");
+	INJECTION_POINT("typecache-before-rel-type-cache-insert", NULL);
 
 	Assert(in_progress_offset + 1 == in_progress_list_len);
 	in_progress_list_len--;
@@ -1169,9 +1174,6 @@ load_domaintype_info(TypeCacheEntry *typentry)
 				elog(ERROR, "domain \"%s\" constraint \"%s\" has NULL conbin",
 					 NameStr(typTup->typname), NameStr(c->conname));
 
-			/* Convert conbin to C string in caller context */
-			constring = TextDatumGetCString(val);
-
 			/* Create the DomainConstraintCache object and context if needed */
 			if (dcc == NULL)
 			{
@@ -1187,9 +1189,8 @@ load_domaintype_info(TypeCacheEntry *typentry)
 				dcc->dccRefCount = 0;
 			}
 
-			/* Create node trees in DomainConstraintCache's context */
-			oldcxt = MemoryContextSwitchTo(dcc->dccContext);
-
+			/* Convert conbin to a node tree, still in caller's context */
+			constring = TextDatumGetCString(val);
 			check_expr = (Expr *) stringToNode(constring);
 
 			/*
@@ -1204,10 +1205,13 @@ load_domaintype_info(TypeCacheEntry *typentry)
 			 */
 			check_expr = expression_planner(check_expr);
 
+			/* Create only the minimally needed stuff in dccContext */
+			oldcxt = MemoryContextSwitchTo(dcc->dccContext);
+
 			r = makeNode(DomainConstraintState);
 			r->constrainttype = DOM_CONSTRAINT_CHECK;
 			r->name = pstrdup(NameStr(c->conname));
-			r->check_expr = check_expr;
+			r->check_expr = copyObject(check_expr);
 			r->check_exprstate = NULL;
 
 			MemoryContextSwitchTo(oldcxt);
@@ -1481,10 +1485,14 @@ UpdateDomainConstraintRef(DomainConstraintRef *ref)
 /*
  * DomainHasConstraints --- utility routine to check if a domain has constraints
  *
+ * Returns true if the domain has any constraints at all.  If has_volatile
+ * is not NULL, also checks whether any CHECK constraint contains a volatile
+ * expression and sets *has_volatile accordingly.
+ *
  * This is defined to return false, not fail, if type is not a domain.
  */
 bool
-DomainHasConstraints(Oid type_id)
+DomainHasConstraints(Oid type_id, bool *has_volatile)
 {
 	TypeCacheEntry *typentry;
 
@@ -1494,7 +1502,26 @@ DomainHasConstraints(Oid type_id)
 	 */
 	typentry = lookup_type_cache(type_id, TYPECACHE_DOMAIN_CONSTR_INFO);
 
-	return (typentry->domainData != NULL);
+	if (typentry->domainData == NULL)
+		return false;
+
+	if (has_volatile)
+	{
+		*has_volatile = false;
+
+		foreach_node(DomainConstraintState, constrstate,
+					 typentry->domainData->constraints)
+		{
+			if (constrstate->constrainttype == DOM_CONSTRAINT_CHECK &&
+				contain_volatile_functions((Node *) constrstate->check_expr))
+			{
+				*has_volatile = true;
+				break;
+			}
+		}
+	}
+
+	return true;
 }
 
 
@@ -2012,7 +2039,7 @@ lookup_rowtype_tupdesc_domain(Oid type_id, int32 typmod, bool noError)
 static uint32
 record_type_typmod_hash(const void *data, size_t size)
 {
-	RecordCacheEntry *entry = (RecordCacheEntry *) data;
+	const RecordCacheEntry *entry = data;
 
 	return hashRowType(entry->tupdesc);
 }
@@ -2023,8 +2050,8 @@ record_type_typmod_hash(const void *data, size_t size)
 static int
 record_type_typmod_compare(const void *a, const void *b, size_t size)
 {
-	RecordCacheEntry *left = (RecordCacheEntry *) a;
-	RecordCacheEntry *right = (RecordCacheEntry *) b;
+	const RecordCacheEntry *left = a;
+	const RecordCacheEntry *right = b;
 
 	return equalRowTypes(left->tupdesc, right->tupdesc) ? 0 : 1;
 }
@@ -2393,7 +2420,10 @@ InvalidateCompositeTypeCacheEntry(TypeCacheEntry *typentry)
 	/* Reset equality/comparison/hashing validity information */
 	typentry->flags &= ~TCFLAGS_OPERATOR_FLAGS;
 
-	/* Call delete_rel_type_cache() if we actually cleared something */
+	/*
+	 * Call delete_rel_type_cache_if_needed() if we actually cleared
+	 * something.
+	 */
 	if (hadTupDescOrOpclass)
 		delete_rel_type_cache_if_needed(typentry);
 }
@@ -2425,7 +2455,7 @@ TypeCacheRelCallback(Datum arg, Oid relid)
 		RelIdToTypeIdCacheEntry *relentry;
 
 		/*
-		 * Find an RelIdToTypeIdCacheHash entry, which should exist as soon as
+		 * Find a RelIdToTypeIdCacheHash entry, which should exist as soon as
 		 * corresponding typcache entry has something to clean.
 		 */
 		relentry = (RelIdToTypeIdCacheEntry *) hash_search(RelIdToTypeIdCacheHash,
@@ -2508,7 +2538,7 @@ TypeCacheRelCallback(Datum arg, Oid relid)
  * it as needing to be reloaded.
  */
 static void
-TypeCacheTypCallback(Datum arg, int cacheid, uint32 hashvalue)
+TypeCacheTypCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	HASH_SEQ_STATUS status;
 	TypeCacheEntry *typentry;
@@ -2540,7 +2570,7 @@ TypeCacheTypCallback(Datum arg, int cacheid, uint32 hashvalue)
 							 TCFLAGS_CHECKED_DOMAIN_CONSTRAINTS);
 
 		/*
-		 * Call delete_rel_type_cache() if we cleaned
+		 * Call delete_rel_type_cache_if_needed() if we cleaned
 		 * TCFLAGS_HAVE_PG_TYPE_DATA flag previously.
 		 */
 		if (hadPgTypeData)
@@ -2565,7 +2595,7 @@ TypeCacheTypCallback(Datum arg, int cacheid, uint32 hashvalue)
  * of members are not going to get cached here.
  */
 static void
-TypeCacheOpcCallback(Datum arg, int cacheid, uint32 hashvalue)
+TypeCacheOpcCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	HASH_SEQ_STATUS status;
 	TypeCacheEntry *typentry;
@@ -2574,8 +2604,17 @@ TypeCacheOpcCallback(Datum arg, int cacheid, uint32 hashvalue)
 	hash_seq_init(&status, TypeCacheHash);
 	while ((typentry = (TypeCacheEntry *) hash_seq_search(&status)) != NULL)
 	{
+		bool		hadOpclass = (typentry->flags & TCFLAGS_OPERATOR_FLAGS);
+
 		/* Reset equality/comparison/hashing validity information */
 		typentry->flags &= ~TCFLAGS_OPERATOR_FLAGS;
+
+		/*
+		 * Call delete_rel_type_cache_if_needed() if we actually cleared some
+		 * of TCFLAGS_OPERATOR_FLAGS.
+		 */
+		if (hadOpclass)
+			delete_rel_type_cache_if_needed(typentry);
 	}
 }
 
@@ -2594,7 +2633,7 @@ TypeCacheOpcCallback(Datum arg, int cacheid, uint32 hashvalue)
  * approach to domain constraints.
  */
 static void
-TypeCacheConstrCallback(Datum arg, int cacheid, uint32 hashvalue)
+TypeCacheConstrCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 {
 	TypeCacheEntry *typentry;
 
@@ -2751,7 +2790,7 @@ load_enum_cache_data(TypeCacheEntry *tcache)
 	 * through.
 	 */
 	maxitems = 64;
-	items = (EnumItem *) palloc(sizeof(EnumItem) * maxitems);
+	items = palloc_array(EnumItem, maxitems);
 	numitems = 0;
 
 	/* Scan pg_enum for the members of the target enum type. */

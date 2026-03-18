@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -386,11 +386,12 @@ $node->start;
 
 # Check that pg_amcheck runs against the uncorrupted table without error.
 $node->command_ok(
-	[ 'pg_amcheck', '-p', $port, 'postgres' ],
+	[ 'pg_amcheck', '--port' => $port, 'postgres' ],
 	'pg_amcheck test table, prior to corruption');
 
 # Check that pg_amcheck runs against the uncorrupted table and index without error.
-$node->command_ok([ 'pg_amcheck', '-p', $port, 'postgres' ],
+$node->command_ok(
+	[ 'pg_amcheck', '--port' => $port, 'postgres' ],
 	'pg_amcheck test table and index, prior to corruption');
 
 $node->stop;
@@ -528,7 +529,7 @@ for (my $tupidx = 0; $tupidx < $ROWCOUNT; $tupidx++)
 		$tup->{t_infomask2} |= HEAP_NATTS_MASK;
 
 		push @expected,
-		  qr/${$header}number of attributes 2047 exceeds maximum expected for table 3/;
+		  qr/${$header}number of attributes 2047 exceeds maximum 3 expected for table/;
 	}
 	elsif ($offnum == 10)
 	{
@@ -551,7 +552,7 @@ for (my $tupidx = 0; $tupidx < $ROWCOUNT; $tupidx++)
 		$tup->{t_hoff} = 32;
 
 		push @expected,
-		  qr/${$header}number of attributes 67 exceeds maximum expected for table 3/;
+		  qr/${$header}number of attributes 67 exceeds maximum 3 expected for table/;
 	}
 	elsif ($offnum == 12)
 	{
@@ -754,7 +755,7 @@ $node->start;
 # Run pg_amcheck against the corrupt table with epoch=0, comparing actual
 # corruption messages against the expected messages
 $node->command_checks_all(
-	[ 'pg_amcheck', '--no-dependent-indexes', '-p', $port, 'postgres' ],
+	[ 'pg_amcheck', '--no-dependent-indexes', '--port' => $port, 'postgres' ],
 	2, [@expected], [], 'Expected corruption message output');
 $node->safe_psql(
 	'postgres', qq(

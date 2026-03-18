@@ -22,7 +22,7 @@
  * tuples (unless buffering mode is disabled).
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -346,7 +346,7 @@ gistbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	/*
 	 * Return statistics
 	 */
-	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
+	result = palloc_object(IndexBuildResult);
 
 	result->heap_tuples = reltuples;
 	result->index_tuples = (double) buildstate.indtuples;
@@ -409,7 +409,7 @@ gist_indexsortbuild(GISTBuildState *state)
 	state->bulkstate = smgr_bulk_start_rel(state->indexrel, MAIN_FORKNUM);
 
 	/* Allocate a temporary buffer for the first leaf page batch. */
-	levelstate = palloc0(sizeof(GistSortedBuildLevelState));
+	levelstate = palloc0_object(GistSortedBuildLevelState);
 	levelstate->pages[0] = palloc(BLCKSZ);
 	levelstate->parent = NULL;
 	gistinitpage(levelstate->pages[0], F_LEAF);
@@ -526,7 +526,7 @@ gist_indexsortbuild_levelstate_flush(GISTBuildState *state,
 	else
 	{
 		/* Create split layout from single page */
-		dist = (SplitPageLayout *) palloc0(sizeof(SplitPageLayout));
+		dist = palloc0_object(SplitPageLayout);
 		union_tuple = gistunion(state->indexrel, itvec, vect_len,
 								state->giststate);
 		dist->itup = union_tuple;
@@ -558,7 +558,7 @@ gist_indexsortbuild_levelstate_flush(GISTBuildState *state,
 		{
 			IndexTuple	thistup = (IndexTuple) data;
 
-			if (PageAddItem(target, (Item) data, IndexTupleSize(thistup), i + FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+			if (PageAddItem(target, data, IndexTupleSize(thistup), i + FirstOffsetNumber, false, false) == InvalidOffsetNumber)
 				elog(ERROR, "failed to add item to index page in \"%s\"", RelationGetRelationName(state->indexrel));
 
 			data += IndexTupleSize(thistup);
@@ -597,7 +597,7 @@ gist_indexsortbuild_levelstate_flush(GISTBuildState *state,
 		parent = levelstate->parent;
 		if (parent == NULL)
 		{
-			parent = palloc0(sizeof(GistSortedBuildLevelState));
+			parent = palloc0_object(GistSortedBuildLevelState);
 			parent->pages[0] = palloc(BLCKSZ);
 			parent->parent = NULL;
 			gistinitpage(parent->pages[0], 0);
@@ -657,10 +657,12 @@ gistInitBuffering(GISTBuildState *buildstate)
 	itupMinSize = (Size) MAXALIGN(sizeof(IndexTupleData));
 	for (i = 0; i < index->rd_att->natts; i++)
 	{
-		if (TupleDescAttr(index->rd_att, i)->attlen < 0)
+		CompactAttribute *attr = TupleDescCompactAttr(index->rd_att, i);
+
+		if (attr->attlen < 0)
 			itupMinSize += VARHDRSZ;
 		else
-			itupMinSize += TupleDescAttr(index->rd_att, i)->attlen;
+			itupMinSize += attr->attlen;
 	}
 
 	/* Calculate average and maximal number of index tuples which fit to page */
@@ -967,7 +969,7 @@ gistProcessItup(GISTBuildState *buildstate, IndexTuple itup,
 		buffer = ReadBuffer(indexrel, blkno);
 		LockBuffer(buffer, GIST_EXCLUSIVE);
 
-		page = (Page) BufferGetPage(buffer);
+		page = BufferGetPage(buffer);
 		childoffnum = gistchoose(indexrel, page, itup, giststate);
 		iid = PageGetItemId(page, childoffnum);
 		idxtuple = (IndexTuple) PageGetItem(page, iid);
@@ -1152,7 +1154,7 @@ gistbufferinginserttuples(GISTBuildState *buildstate, Buffer buffer, int level,
 
 		/* Create an array of all the downlink tuples */
 		ndownlinks = list_length(splitinfo);
-		downlinks = (IndexTuple *) palloc(sizeof(IndexTuple) * ndownlinks);
+		downlinks = palloc_array(IndexTuple, ndownlinks);
 		i = 0;
 		foreach(lc, splitinfo)
 		{
@@ -1446,7 +1448,7 @@ gistGetMaxLevel(Relation index)
 		 * pro forma.
 		 */
 		LockBuffer(buffer, GIST_SHARE);
-		page = (Page) BufferGetPage(buffer);
+		page = BufferGetPage(buffer);
 
 		if (GistPageIsLeaf(page))
 		{

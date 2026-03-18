@@ -5,7 +5,7 @@
  *	  (pg_parameter_acl).
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_parameter_acl.h
@@ -20,13 +20,15 @@
 #define PG_PARAMETER_ACL_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_parameter_acl_d.h"
+#include "catalog/pg_parameter_acl_d.h" /* IWYU pragma: export */
 
 /* ----------------
  *		pg_parameter_acl definition.  cpp turns this into
  *		typedef struct FormData_pg_parameter_acl
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_parameter_acl,6243,ParameterAclRelationId) BKI_SHARED_RELATION
 {
 	Oid			oid;			/* oid */
@@ -39,6 +41,8 @@ CATALOG(pg_parameter_acl,6243,ParameterAclRelationId) BKI_SHARED_RELATION
 	aclitem		paracl[1] BKI_DEFAULT(_null_);
 #endif
 } FormData_pg_parameter_acl;
+
+END_CATALOG_STRUCT
 
 
 /* ----------------

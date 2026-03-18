@@ -3,7 +3,7 @@
  * hash.c
  *	  Implementation of Margo Seltzer's Hashing package for postgres.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -21,6 +21,7 @@
 #include "access/hash.h"
 #include "access/hash_xlog.h"
 #include "access/relscan.h"
+#include "access/stratnum.h"
 #include "access/tableam.h"
 #include "access/xloginsert.h"
 #include "commands/progress.h"
@@ -29,6 +30,7 @@
 #include "nodes/execnodes.h"
 #include "optimizer/plancat.h"
 #include "pgstat.h"
+#include "storage/read_stream.h"
 #include "utils/fmgrprotos.h"
 #include "utils/index_selfuncs.h"
 #include "utils/rel.h"
@@ -41,12 +43,23 @@ typedef struct
 	Relation	heapRel;		/* heap relation descriptor */
 } HashBuildState;
 
+/* Working state for streaming reads in hashbulkdelete */
+typedef struct
+{
+	HashMetaPage metap;			/* cached metapage for BUCKET_TO_BLKNO */
+	Bucket		next_bucket;	/* next bucket to prefetch */
+	Bucket		max_bucket;		/* stop when next_bucket > max_bucket */
+} HashBulkDeleteStreamPrivate;
+
 static void hashbuildCallback(Relation index,
 							  ItemPointer tid,
 							  Datum *values,
 							  bool *isnull,
 							  bool tupleIsAlive,
 							  void *state);
+static BlockNumber hash_bulkdelete_read_stream_cb(ReadStream *stream,
+												  void *callback_private_data,
+												  void *per_buffer_data);
 
 
 /*
@@ -56,57 +69,63 @@ static void hashbuildCallback(Relation index,
 Datum
 hashhandler(PG_FUNCTION_ARGS)
 {
-	IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
+	static const IndexAmRoutine amroutine = {
+		.type = T_IndexAmRoutine,
+		.amstrategies = HTMaxStrategyNumber,
+		.amsupport = HASHNProcs,
+		.amoptsprocnum = HASHOPTIONS_PROC,
+		.amcanorder = false,
+		.amcanorderbyop = false,
+		.amcanhash = true,
+		.amconsistentequality = true,
+		.amconsistentordering = false,
+		.amcanbackward = true,
+		.amcanunique = false,
+		.amcanmulticol = false,
+		.amoptionalkey = false,
+		.amsearcharray = false,
+		.amsearchnulls = false,
+		.amstorage = false,
+		.amclusterable = false,
+		.ampredlocks = true,
+		.amcanparallel = false,
+		.amcanbuildparallel = false,
+		.amcaninclude = false,
+		.amusemaintenanceworkmem = false,
+		.amsummarizing = false,
+		.amparallelvacuumoptions =
+		VACUUM_OPTION_PARALLEL_BULKDEL,
+		.amkeytype = INT4OID,
 
-	amroutine->amstrategies = HTMaxStrategyNumber;
-	amroutine->amsupport = HASHNProcs;
-	amroutine->amoptsprocnum = HASHOPTIONS_PROC;
-	amroutine->amcanorder = false;
-	amroutine->amcanorderbyop = false;
-	amroutine->amcanbackward = true;
-	amroutine->amcanunique = false;
-	amroutine->amcanmulticol = false;
-	amroutine->amoptionalkey = false;
-	amroutine->amsearcharray = false;
-	amroutine->amsearchnulls = false;
-	amroutine->amstorage = false;
-	amroutine->amclusterable = false;
-	amroutine->ampredlocks = true;
-	amroutine->amcanparallel = false;
-	amroutine->amcanbuildparallel = false;
-	amroutine->amcaninclude = false;
-	amroutine->amusemaintenanceworkmem = false;
-	amroutine->amsummarizing = false;
-	amroutine->amparallelvacuumoptions =
-		VACUUM_OPTION_PARALLEL_BULKDEL;
-	amroutine->amkeytype = INT4OID;
+		.ambuild = hashbuild,
+		.ambuildempty = hashbuildempty,
+		.aminsert = hashinsert,
+		.aminsertcleanup = NULL,
+		.ambulkdelete = hashbulkdelete,
+		.amvacuumcleanup = hashvacuumcleanup,
+		.amcanreturn = NULL,
+		.amcostestimate = hashcostestimate,
+		.amgettreeheight = NULL,
+		.amoptions = hashoptions,
+		.amproperty = NULL,
+		.ambuildphasename = NULL,
+		.amvalidate = hashvalidate,
+		.amadjustmembers = hashadjustmembers,
+		.ambeginscan = hashbeginscan,
+		.amrescan = hashrescan,
+		.amgettuple = hashgettuple,
+		.amgetbitmap = hashgetbitmap,
+		.amendscan = hashendscan,
+		.ammarkpos = NULL,
+		.amrestrpos = NULL,
+		.amestimateparallelscan = NULL,
+		.aminitparallelscan = NULL,
+		.amparallelrescan = NULL,
+		.amtranslatestrategy = hashtranslatestrategy,
+		.amtranslatecmptype = hashtranslatecmptype,
+	};
 
-	amroutine->ambuild = hashbuild;
-	amroutine->ambuildempty = hashbuildempty;
-	amroutine->aminsert = hashinsert;
-	amroutine->aminsertcleanup = NULL;
-	amroutine->ambulkdelete = hashbulkdelete;
-	amroutine->amvacuumcleanup = hashvacuumcleanup;
-	amroutine->amcanreturn = NULL;
-	amroutine->amcostestimate = hashcostestimate;
-	amroutine->amgettreeheight = NULL;
-	amroutine->amoptions = hashoptions;
-	amroutine->amproperty = NULL;
-	amroutine->ambuildphasename = NULL;
-	amroutine->amvalidate = hashvalidate;
-	amroutine->amadjustmembers = hashadjustmembers;
-	amroutine->ambeginscan = hashbeginscan;
-	amroutine->amrescan = hashrescan;
-	amroutine->amgettuple = hashgettuple;
-	amroutine->amgetbitmap = hashgetbitmap;
-	amroutine->amendscan = hashendscan;
-	amroutine->ammarkpos = NULL;
-	amroutine->amrestrpos = NULL;
-	amroutine->amestimateparallelscan = NULL;
-	amroutine->aminitparallelscan = NULL;
-	amroutine->amparallelrescan = NULL;
-
-	PG_RETURN_POINTER(amroutine);
+	PG_RETURN_POINTER(&amroutine);
 }
 
 /*
@@ -120,7 +139,7 @@ hashbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	double		reltuples;
 	double		allvisfrac;
 	uint32		num_buckets;
-	long		sort_threshold;
+	Size		sort_threshold;
 	HashBuildState buildstate;
 
 	/*
@@ -155,13 +174,13 @@ hashbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * one page.  Also, "initial index size" accounting does not include the
 	 * metapage, nor the first bitmap page.
 	 */
-	sort_threshold = (maintenance_work_mem * 1024L) / BLCKSZ;
+	sort_threshold = (maintenance_work_mem * (Size) 1024) / BLCKSZ;
 	if (index->rd_rel->relpersistence != RELPERSISTENCE_TEMP)
 		sort_threshold = Min(sort_threshold, NBuffers);
 	else
 		sort_threshold = Min(sort_threshold, NLocBuffer);
 
-	if (num_buckets >= (uint32) sort_threshold)
+	if (num_buckets >= sort_threshold)
 		buildstate.spool = _h_spoolinit(heap, index, num_buckets);
 	else
 		buildstate.spool = NULL;
@@ -187,7 +206,7 @@ hashbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	/*
 	 * Return statistics
 	 */
-	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
+	result = palloc_object(IndexBuildResult);
 
 	result->heap_tuples = reltuples;
 	result->index_tuples = buildstate.indtuples;
@@ -312,8 +331,7 @@ hashgettuple(IndexScanDesc scan, ScanDirection dir)
 			 * entries.
 			 */
 			if (so->killedItems == NULL)
-				so->killedItems = (int *)
-					palloc(MaxIndexTuplesPerPage * sizeof(int));
+				so->killedItems = palloc_array(int, MaxIndexTuplesPerPage);
 
 			if (so->numKilled < MaxIndexTuplesPerPage)
 				so->killedItems[so->numKilled++] = so->currPos.itemIndex;
@@ -375,7 +393,7 @@ hashbeginscan(Relation rel, int nkeys, int norderbys)
 
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 
-	so = (HashScanOpaque) palloc(sizeof(HashScanOpaqueData));
+	so = (HashScanOpaque) palloc_object(HashScanOpaqueData);
 	HashScanPosInvalidate(so->currPos);
 	so->hashso_bucket_buf = InvalidBuffer;
 	so->hashso_split_bucket_buf = InvalidBuffer;
@@ -446,6 +464,27 @@ hashendscan(IndexScanDesc scan)
 }
 
 /*
+ * Read stream callback for hashbulkdelete.
+ *
+ * Returns the block number of the primary page for the next bucket to
+ * vacuum, using the BUCKET_TO_BLKNO mapping from the cached metapage.
+ */
+static BlockNumber
+hash_bulkdelete_read_stream_cb(ReadStream *stream,
+							   void *callback_private_data,
+							   void *per_buffer_data)
+{
+	HashBulkDeleteStreamPrivate *p = callback_private_data;
+	Bucket		bucket;
+
+	if (p->next_bucket > p->max_bucket)
+		return InvalidBlockNumber;
+
+	bucket = p->next_bucket++;
+	return BUCKET_TO_BLKNO(p->metap, bucket);
+}
+
+/*
  * Bulk deletion of all index entries pointing to a set of heap tuples.
  * The set of target tuples is specified via a callback routine that tells
  * whether any given heap tuple (identified by ItemPointer) is being deleted.
@@ -469,6 +508,8 @@ hashbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	Buffer		metabuf = InvalidBuffer;
 	HashMetaPage metap;
 	HashMetaPage cachedmetap;
+	HashBulkDeleteStreamPrivate stream_private;
+	ReadStream *stream = NULL;
 
 	tuples_removed = 0;
 	num_index_tuples = 0;
@@ -489,7 +530,25 @@ hashbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	cur_bucket = 0;
 	cur_maxbucket = orig_maxbucket;
 
-loop_top:
+	/* Set up streaming read for primary bucket pages */
+	stream_private.metap = cachedmetap;
+	stream_private.next_bucket = cur_bucket;
+	stream_private.max_bucket = cur_maxbucket;
+
+	/*
+	 * It is safe to use batchmode as hash_bulkdelete_read_stream_cb takes no
+	 * locks.
+	 */
+	stream = read_stream_begin_relation(READ_STREAM_MAINTENANCE |
+										READ_STREAM_USE_BATCHING,
+										info->strategy,
+										rel,
+										MAIN_FORKNUM,
+										hash_bulkdelete_read_stream_cb,
+										&stream_private,
+										0);
+
+bucket_loop:
 	while (cur_bucket <= cur_maxbucket)
 	{
 		BlockNumber bucket_blkno;
@@ -509,7 +568,8 @@ loop_top:
 		 * We need to acquire a cleanup lock on the primary bucket page to out
 		 * wait concurrent scans before deleting the dead tuples.
 		 */
-		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, info->strategy);
+		buf = read_stream_next_buffer(stream, NULL);
+		Assert(BufferIsValid(buf));
 		LockBufferForCleanup(buf);
 		_hash_checkpage(rel, buf, LH_BUCKET_PAGE);
 
@@ -540,6 +600,16 @@ loop_top:
 			{
 				cachedmetap = _hash_getcachedmetap(rel, &metabuf, true);
 				Assert(cachedmetap != NULL);
+
+				/*
+				 * Reset stream with updated metadata for remaining buckets.
+				 * The BUCKET_TO_BLKNO mapping depends on hashm_spares[],
+				 * which may have changed.
+				 */
+				stream_private.metap = cachedmetap;
+				stream_private.next_bucket = cur_bucket + 1;
+				stream_private.max_bucket = cur_maxbucket;
+				read_stream_reset(stream);
 			}
 		}
 
@@ -572,8 +642,18 @@ loop_top:
 		cachedmetap = _hash_getcachedmetap(rel, &metabuf, true);
 		Assert(cachedmetap != NULL);
 		cur_maxbucket = cachedmetap->hashm_maxbucket;
-		goto loop_top;
+
+		/* Reset stream to process additional buckets from split */
+		stream_private.metap = cachedmetap;
+		stream_private.next_bucket = cur_bucket;
+		stream_private.max_bucket = cur_maxbucket;
+		read_stream_reset(stream);
+		goto bucket_loop;
 	}
+
+	/* Stream should be exhausted since we processed all buckets */
+	Assert(read_stream_next_buffer(stream, NULL) == InvalidBuffer);
+	read_stream_end(stream);
 
 	/* Okay, we're really done.  Update tuple count in metapage. */
 	START_CRIT_SECTION();
@@ -613,7 +693,7 @@ loop_top:
 		xlrec.ntuples = metap->hashm_ntuples;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, SizeOfHashUpdateMetaPage);
+		XLogRegisterData(&xlrec, SizeOfHashUpdateMetaPage);
 
 		XLogRegisterBuffer(0, metabuf, REGBUF_STANDARD);
 
@@ -627,7 +707,7 @@ loop_top:
 
 	/* return statistics */
 	if (stats == NULL)
-		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+		stats = palloc0_object(IndexBulkDeleteResult);
 	stats->estimated_count = false;
 	stats->num_index_tuples = num_index_tuples;
 	stats->tuples_removed += tuples_removed;
@@ -713,7 +793,7 @@ hashbucketcleanup(Relation rel, Bucket cur_bucket, Buffer bucket_buf,
 		bool		retain_pin = false;
 		bool		clear_dead_marking = false;
 
-		vacuum_delay_point();
+		vacuum_delay_point(false);
 
 		page = BufferGetPage(buf);
 		opaque = HashPageGetOpaque(page);
@@ -820,7 +900,7 @@ hashbucketcleanup(Relation rel, Bucket cur_bucket, Buffer bucket_buf,
 				xlrec.is_primary_bucket_page = (buf == bucket_buf);
 
 				XLogBeginInsert();
-				XLogRegisterData((char *) &xlrec, SizeOfHashDelete);
+				XLogRegisterData(&xlrec, SizeOfHashDelete);
 
 				/*
 				 * bucket buffer was not changed, but still needs to be
@@ -835,7 +915,7 @@ hashbucketcleanup(Relation rel, Bucket cur_bucket, Buffer bucket_buf,
 				}
 
 				XLogRegisterBuffer(1, buf, REGBUF_STANDARD);
-				XLogRegisterBufData(1, (char *) deletable,
+				XLogRegisterBufData(1, deletable,
 									ndeletable * sizeof(OffsetNumber));
 
 				recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_DELETE);
@@ -921,4 +1001,20 @@ hashbucketcleanup(Relation rel, Bucket cur_bucket, Buffer bucket_buf,
 							bstrategy);
 	else
 		LockBuffer(bucket_buf, BUFFER_LOCK_UNLOCK);
+}
+
+CompareType
+hashtranslatestrategy(StrategyNumber strategy, Oid opfamily)
+{
+	if (strategy == HTEqualStrategyNumber)
+		return COMPARE_EQ;
+	return COMPARE_INVALID;
+}
+
+StrategyNumber
+hashtranslatecmptype(CompareType cmptype, Oid opfamily)
+{
+	if (cmptype == COMPARE_EQ)
+		return HTEqualStrategyNumber;
+	return InvalidStrategy;
 }

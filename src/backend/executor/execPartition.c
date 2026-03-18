@@ -3,7 +3,7 @@
  * execPartition.c
  *	  Support routines for partitioning.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,6 +15,8 @@
 
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupconvert.h"
+#include "catalog/index.h"
 #include "catalog/partition.h"
 #include "executor/execPartition.h"
 #include "executor/executor.h"
@@ -27,6 +29,7 @@
 #include "partitioning/partprune.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/acl.h"
+#include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/partcache.h"
 #include "utils/rls.h"
@@ -173,29 +176,32 @@ static void FormPartitionKeyDatum(PartitionDispatch pd,
 								  EState *estate,
 								  Datum *values,
 								  bool *isnull);
-static int	get_partition_for_tuple(PartitionDispatch pd, Datum *values,
-									bool *isnull);
+static int	get_partition_for_tuple(PartitionDispatch pd, const Datum *values,
+									const bool *isnull);
 static char *ExecBuildSlotPartitionKeyDescription(Relation rel,
-												  Datum *values,
-												  bool *isnull,
+												  const Datum *values,
+												  const bool *isnull,
 												  int maxfieldlen);
 static List *adjust_partition_colnos(List *colnos, ResultRelInfo *leaf_part_rri);
 static List *adjust_partition_colnos_using_map(List *colnos, AttrMap *attrMap);
-static PartitionPruneState *CreatePartitionPruneState(PlanState *planstate,
-													  PartitionPruneInfo *pruneinfo);
+static PartitionPruneState *CreatePartitionPruneState(EState *estate,
+													  PartitionPruneInfo *pruneinfo,
+													  Bitmapset **all_leafpart_rtis);
 static void InitPartitionPruneContext(PartitionPruneContext *context,
 									  List *pruning_steps,
 									  PartitionDesc partdesc,
 									  PartitionKey partkey,
 									  PlanState *planstate,
 									  ExprContext *econtext);
-static void PartitionPruneFixSubPlanMap(PartitionPruneState *prunestate,
-										Bitmapset *initially_valid_subplans,
-										int n_total_subplans);
+static void InitExecPartitionPruneContexts(PartitionPruneState *prunestate,
+										   PlanState *parent_plan,
+										   Bitmapset *initially_valid_subplans,
+										   int n_total_subplans);
 static void find_matching_subplans_recurse(PartitionPruningData *prunedata,
 										   PartitionedRelPruningData *pprune,
 										   bool initial_prune,
-										   Bitmapset **validsubplans);
+										   Bitmapset **validsubplans,
+										   Bitmapset **validsubplan_rtis);
 
 
 /*
@@ -223,7 +229,7 @@ ExecSetupPartitionTupleRouting(EState *estate, Relation rel)
 	 * The reason for this is that a common case is for INSERT to insert a
 	 * single tuple into a partitioned table and this must be fast.
 	 */
-	proute = (PartitionTupleRouting *) palloc0(sizeof(PartitionTupleRouting));
+	proute = palloc0_object(PartitionTupleRouting);
 	proute->partition_root = rel;
 	proute->memcxt = CurrentMemoryContext;
 	/* Rest of members initialized by zeroing */
@@ -357,8 +363,12 @@ ExecFindPartition(ModifyTableState *mtstate,
 											   true, false);
 				if (rri)
 				{
+					ModifyTable *node = (ModifyTable *) mtstate->ps.plan;
+
 					/* Verify this ResultRelInfo allows INSERTs */
-					CheckValidResultRel(rri, CMD_INSERT, NIL);
+					CheckValidResultRel(rri, CMD_INSERT,
+										node ? node->onConflictAction : ONCONFLICT_NONE,
+										NIL);
 
 					/*
 					 * Initialize information needed to insert this and
@@ -484,6 +494,65 @@ ExecFindPartition(ModifyTableState *mtstate,
 }
 
 /*
+ * IsIndexCompatibleAsArbiter
+ *		Return true if two indexes are identical for INSERT ON CONFLICT
+ *		purposes.
+ *
+ * Only indexes of the same relation are supported.
+ */
+static bool
+IsIndexCompatibleAsArbiter(Relation arbiterIndexRelation,
+						   IndexInfo *arbiterIndexInfo,
+						   Relation indexRelation,
+						   IndexInfo *indexInfo)
+{
+	Assert(arbiterIndexRelation->rd_index->indrelid == indexRelation->rd_index->indrelid);
+
+	/* must match whether they're unique */
+	if (arbiterIndexInfo->ii_Unique != indexInfo->ii_Unique)
+		return false;
+
+	/* No support currently for comparing exclusion indexes. */
+	if (arbiterIndexInfo->ii_ExclusionOps != NULL ||
+		indexInfo->ii_ExclusionOps != NULL)
+		return false;
+
+	/* the "nulls not distinct" criterion must match */
+	if (arbiterIndexInfo->ii_NullsNotDistinct !=
+		indexInfo->ii_NullsNotDistinct)
+		return false;
+
+	/* number of key attributes must match */
+	if (arbiterIndexInfo->ii_NumIndexKeyAttrs !=
+		indexInfo->ii_NumIndexKeyAttrs)
+		return false;
+
+	for (int i = 0; i < arbiterIndexInfo->ii_NumIndexKeyAttrs; i++)
+	{
+		if (arbiterIndexRelation->rd_indcollation[i] !=
+			indexRelation->rd_indcollation[i])
+			return false;
+
+		if (arbiterIndexRelation->rd_opfamily[i] !=
+			indexRelation->rd_opfamily[i])
+			return false;
+
+		if (arbiterIndexRelation->rd_index->indkey.values[i] !=
+			indexRelation->rd_index->indkey.values[i])
+			return false;
+	}
+
+	if (list_difference(RelationGetIndexExpressions(arbiterIndexRelation),
+						RelationGetIndexExpressions(indexRelation)) != NIL)
+		return false;
+
+	if (list_difference(RelationGetIndexPredicate(arbiterIndexRelation),
+						RelationGetIndexPredicate(indexRelation)) != NIL)
+		return false;
+	return true;
+}
+
+/*
  * ExecInitPartitionInfo
  *		Lock the partition and initialize ResultRelInfo.  Also setup other
  *		information for the partition and store it in the next empty slot in
@@ -524,7 +593,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 	 * partition-key becomes a DELETE+INSERT operation, so this check is still
 	 * required when the operation is CMD_UPDATE.
 	 */
-	CheckValidResultRel(leaf_part_rri, CMD_INSERT, NIL);
+	CheckValidResultRel(leaf_part_rri, CMD_INSERT,
+						node ? node->onConflictAction : ONCONFLICT_NONE, NIL);
 
 	/*
 	 * Open partition indices.  The user may have asked to check for conflicts
@@ -681,61 +751,159 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 	{
 		TupleDesc	partrelDesc = RelationGetDescr(partrel);
 		ExprContext *econtext = mtstate->ps.ps_ExprContext;
-		ListCell   *lc;
 		List	   *arbiterIndexes = NIL;
+		int			additional_arbiters = 0;
 
 		/*
 		 * If there is a list of arbiter indexes, map it to a list of indexes
-		 * in the partition.  We do that by scanning the partition's index
-		 * list and searching for ancestry relationships to each index in the
-		 * ancestor table.
+		 * in the partition.  We also add any "identical indexes" to any of
+		 * those, to cover the case where one of them is concurrently being
+		 * reindexed.
 		 */
 		if (rootResultRelInfo->ri_onConflictArbiterIndexes != NIL)
 		{
-			List	   *childIdxs;
+			List	   *unparented_idxs = NIL,
+					   *arbiters_listidxs = NIL,
+					   *ancestors_seen = NIL;
 
-			childIdxs = RelationGetIndexList(leaf_part_rri->ri_RelationDesc);
-
-			foreach(lc, childIdxs)
+			for (int listidx = 0; listidx < leaf_part_rri->ri_NumIndices; listidx++)
 			{
-				Oid			childIdx = lfirst_oid(lc);
+				Oid			indexoid;
 				List	   *ancestors;
-				ListCell   *lc2;
 
-				ancestors = get_partition_ancestors(childIdx);
-				foreach(lc2, rootResultRelInfo->ri_onConflictArbiterIndexes)
+				/*
+				 * If one of this index's ancestors is in the root's arbiter
+				 * list, then use this index as arbiter for this partition.
+				 * Otherwise, if this index has no parent, track it for later,
+				 * in case REINDEX CONCURRENTLY is working on one of the
+				 * arbiters.
+				 *
+				 * However, if two indexes appear to have the same parent,
+				 * treat the second of these as if it had no parent.  This
+				 * sounds counterintuitive, but it can happen if a transaction
+				 * running REINDEX CONCURRENTLY commits right between those
+				 * two indexes are checked by another process in this loop.
+				 * This will have the effect of also treating that second
+				 * index as arbiter.
+				 *
+				 * XXX get_partition_ancestors scans pg_inherits, which is not
+				 * only slow, but also means the catalog snapshot can get
+				 * invalidated each time through the loop (cf.
+				 * GetNonHistoricCatalogSnapshot).  Consider a syscache or
+				 * some other way to cache?
+				 */
+				indexoid = RelationGetRelid(leaf_part_rri->ri_IndexRelationDescs[listidx]);
+				ancestors = get_partition_ancestors(indexoid);
+				INJECTION_POINT("exec-init-partition-after-get-partition-ancestors", NULL);
+
+				if (ancestors != NIL &&
+					!list_member_oid(ancestors_seen, linitial_oid(ancestors)))
 				{
-					if (list_member_oid(ancestors, lfirst_oid(lc2)))
-						arbiterIndexes = lappend_oid(arbiterIndexes, childIdx);
+					foreach_oid(parent_idx, rootResultRelInfo->ri_onConflictArbiterIndexes)
+					{
+						if (list_member_oid(ancestors, parent_idx))
+						{
+							ancestors_seen = lappend_oid(ancestors_seen, linitial_oid(ancestors));
+							arbiterIndexes = lappend_oid(arbiterIndexes, indexoid);
+							arbiters_listidxs = lappend_int(arbiters_listidxs, listidx);
+							break;
+						}
+					}
 				}
+				else
+					unparented_idxs = lappend_int(unparented_idxs, listidx);
+
 				list_free(ancestors);
 			}
+
+			/*
+			 * If we found any indexes with no ancestors, it's possible that
+			 * some arbiter index is undergoing concurrent reindex.  Match all
+			 * unparented indexes against arbiters; add unparented matching
+			 * ones as "additional arbiters".
+			 *
+			 * This is critical so that all concurrent transactions use the
+			 * same set as arbiters during REINDEX CONCURRENTLY, to avoid
+			 * spurious "duplicate key" errors.
+			 */
+			if (unparented_idxs && arbiterIndexes)
+			{
+				foreach_int(unparented_i, unparented_idxs)
+				{
+					Relation	unparented_rel;
+					IndexInfo  *unparented_ii;
+
+					unparented_rel = leaf_part_rri->ri_IndexRelationDescs[unparented_i];
+					unparented_ii = leaf_part_rri->ri_IndexRelationInfo[unparented_i];
+
+					Assert(!list_member_oid(arbiterIndexes,
+											unparented_rel->rd_index->indexrelid));
+
+					/* Ignore indexes not ready */
+					if (!unparented_ii->ii_ReadyForInserts)
+						continue;
+
+					foreach_int(arbiter_i, arbiters_listidxs)
+					{
+						Relation	arbiter_rel;
+						IndexInfo  *arbiter_ii;
+
+						arbiter_rel = leaf_part_rri->ri_IndexRelationDescs[arbiter_i];
+						arbiter_ii = leaf_part_rri->ri_IndexRelationInfo[arbiter_i];
+
+						/*
+						 * If the non-ancestor index is compatible with the
+						 * arbiter, use the non-ancestor as arbiter too.
+						 */
+						if (IsIndexCompatibleAsArbiter(arbiter_rel,
+													   arbiter_ii,
+													   unparented_rel,
+													   unparented_ii))
+						{
+							arbiterIndexes = lappend_oid(arbiterIndexes,
+														 unparented_rel->rd_index->indexrelid);
+							additional_arbiters++;
+							break;
+						}
+					}
+				}
+			}
+			list_free(unparented_idxs);
+			list_free(arbiters_listidxs);
+			list_free(ancestors_seen);
 		}
 
 		/*
-		 * If the resulting lists are of inequal length, something is wrong.
-		 * (This shouldn't happen, since arbiter index selection should not
-		 * pick up an invalid index.)
+		 * We expect to find as many arbiter indexes on this partition as the
+		 * root has, plus however many "additional arbiters" (to wit: those
+		 * being concurrently rebuilt) we found.
 		 */
 		if (list_length(rootResultRelInfo->ri_onConflictArbiterIndexes) !=
-			list_length(arbiterIndexes))
+			list_length(arbiterIndexes) - additional_arbiters)
 			elog(ERROR, "invalid arbiter index list");
 		leaf_part_rri->ri_onConflictArbiterIndexes = arbiterIndexes;
 
 		/*
-		 * In the DO UPDATE case, we have some more state to initialize.
+		 * In the DO UPDATE and DO SELECT cases, we have some more state to
+		 * initialize.
 		 */
-		if (node->onConflictAction == ONCONFLICT_UPDATE)
+		if (node->onConflictAction == ONCONFLICT_UPDATE ||
+			node->onConflictAction == ONCONFLICT_SELECT)
 		{
-			OnConflictSetState *onconfl = makeNode(OnConflictSetState);
+			OnConflictActionState *onconfl = makeNode(OnConflictActionState);
 			TupleConversionMap *map;
 
 			map = ExecGetRootToChildMap(leaf_part_rri, estate);
 
-			Assert(node->onConflictSet != NIL);
+			Assert(node->onConflictSet != NIL ||
+				   node->onConflictAction == ONCONFLICT_SELECT);
 			Assert(rootResultRelInfo->ri_onConflict != NULL);
 
 			leaf_part_rri->ri_onConflict = onconfl;
+
+			/* Lock strength for DO SELECT [FOR UPDATE/SHARE] */
+			onconfl->oc_LockStrength =
+				rootResultRelInfo->ri_onConflict->oc_LockStrength;
 
 			/*
 			 * Need a separate existing slot for each partition, as the
@@ -749,7 +917,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 			/*
 			 * If the partition's tuple descriptor matches exactly the root
 			 * parent (the common case), we can re-use most of the parent's ON
-			 * CONFLICT SET state, skipping a bunch of work.  Otherwise, we
+			 * CONFLICT action state, skipping a bunch of work.  Otherwise, we
 			 * need to create state specific to this partition.
 			 */
 			if (map == NULL)
@@ -757,7 +925,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 				/*
 				 * It's safe to reuse these from the partition root, as we
 				 * only process one tuple at a time (therefore we won't
-				 * overwrite needed data in slots), and the results of
+				 * overwrite needed data in slots), and the results of any
 				 * projections are independent of the underlying storage.
 				 * Projections and where clauses themselves don't store state
 				 * / are independent of the underlying storage.
@@ -771,65 +939,80 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 			}
 			else
 			{
-				List	   *onconflset;
-				List	   *onconflcols;
-
 				/*
-				 * Translate expressions in onConflictSet to account for
-				 * different attribute numbers.  For that, map partition
-				 * varattnos twice: first to catch the EXCLUDED
-				 * pseudo-relation (INNER_VAR), and second to handle the main
-				 * target relation (firstVarno).
+				 * For ON CONFLICT DO UPDATE, translate expressions in
+				 * onConflictSet to account for different attribute numbers.
+				 * For that, map partition varattnos twice: first to catch the
+				 * EXCLUDED pseudo-relation (INNER_VAR), and second to handle
+				 * the main target relation (firstVarno).
 				 */
-				onconflset = copyObject(node->onConflictSet);
-				if (part_attmap == NULL)
-					part_attmap =
-						build_attrmap_by_name(RelationGetDescr(partrel),
-											  RelationGetDescr(firstResultRel),
-											  false);
-				onconflset = (List *)
-					map_variable_attnos((Node *) onconflset,
-										INNER_VAR, 0,
-										part_attmap,
-										RelationGetForm(partrel)->reltype,
-										&found_whole_row);
-				/* We ignore the value of found_whole_row. */
-				onconflset = (List *)
-					map_variable_attnos((Node *) onconflset,
-										firstVarno, 0,
-										part_attmap,
-										RelationGetForm(partrel)->reltype,
-										&found_whole_row);
-				/* We ignore the value of found_whole_row. */
+				if (node->onConflictAction == ONCONFLICT_UPDATE)
+				{
+					List	   *onconflset;
+					List	   *onconflcols;
 
-				/* Finally, adjust the target colnos to match the partition. */
-				onconflcols = adjust_partition_colnos(node->onConflictCols,
-													  leaf_part_rri);
+					onconflset = copyObject(node->onConflictSet);
+					if (part_attmap == NULL)
+						part_attmap =
+							build_attrmap_by_name(RelationGetDescr(partrel),
+												  RelationGetDescr(firstResultRel),
+												  false);
+					onconflset = (List *)
+						map_variable_attnos((Node *) onconflset,
+											INNER_VAR, 0,
+											part_attmap,
+											RelationGetForm(partrel)->reltype,
+											&found_whole_row);
+					/* We ignore the value of found_whole_row. */
+					onconflset = (List *)
+						map_variable_attnos((Node *) onconflset,
+											firstVarno, 0,
+											part_attmap,
+											RelationGetForm(partrel)->reltype,
+											&found_whole_row);
+					/* We ignore the value of found_whole_row. */
 
-				/* create the tuple slot for the UPDATE SET projection */
-				onconfl->oc_ProjSlot =
-					table_slot_create(partrel,
-									  &mtstate->ps.state->es_tupleTable);
+					/*
+					 * Finally, adjust the target colnos to match the
+					 * partition.
+					 */
+					onconflcols = adjust_partition_colnos(node->onConflictCols,
+														  leaf_part_rri);
 
-				/* build UPDATE SET projection state */
-				onconfl->oc_ProjInfo =
-					ExecBuildUpdateProjection(onconflset,
-											  true,
-											  onconflcols,
-											  partrelDesc,
-											  econtext,
-											  onconfl->oc_ProjSlot,
-											  &mtstate->ps);
+					/* create the tuple slot for the UPDATE SET projection */
+					onconfl->oc_ProjSlot =
+						table_slot_create(partrel,
+										  &mtstate->ps.state->es_tupleTable);
+
+					/* build UPDATE SET projection state */
+					onconfl->oc_ProjInfo =
+						ExecBuildUpdateProjection(onconflset,
+												  true,
+												  onconflcols,
+												  partrelDesc,
+												  econtext,
+												  onconfl->oc_ProjSlot,
+												  &mtstate->ps);
+				}
 
 				/*
-				 * If there is a WHERE clause, initialize state where it will
-				 * be evaluated, mapping the attribute numbers appropriately.
-				 * As with onConflictSet, we need to map partition varattnos
-				 * to the partition's tupdesc.
+				 * For both ON CONFLICT DO UPDATE and ON CONFLICT DO SELECT,
+				 * there may be a WHERE clause.  If so, initialize state where
+				 * it will be evaluated, mapping the attribute numbers
+				 * appropriately.  As with onConflictSet, we need to map
+				 * partition varattnos twice, to catch both the EXCLUDED
+				 * pseudo-relation (INNER_VAR), and the main target relation
+				 * (firstVarno).
 				 */
 				if (node->onConflictWhere)
 				{
 					List	   *clause;
+
+					if (part_attmap == NULL)
+						part_attmap =
+							build_attrmap_by_name(RelationGetDescr(partrel),
+												  RelationGetDescr(firstResultRel),
+												  false);
 
 					clause = copyObject((List *) node->onConflictWhere);
 					clause = (List *)
@@ -847,7 +1030,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 											&found_whole_row);
 					/* We ignore the value of found_whole_row. */
 					onconfl->oc_WhereClause =
-						ExecInitQual((List *) clause, &mtstate->ps);
+						ExecInitQual(clause, &mtstate->ps);
 				}
 			}
 		}
@@ -872,7 +1055,7 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 	 * reference and make copy for this relation, converting stuff that
 	 * references attribute numbers to match this relation's.
 	 *
-	 * This duplicates much of the logic in ExecInitMerge(), so something
+	 * This duplicates much of the logic in ExecInitMerge(), so if something
 	 * changes there, look here too.
 	 */
 	if (node && node->operation == CMD_MERGE)
@@ -952,6 +1135,8 @@ ExecInitPartitionInfo(ModifyTableState *mtstate, EState *estate,
 												  NULL);
 					break;
 				case CMD_DELETE:
+				case CMD_NOTHING:
+					/* Nothing to do */
 					break;
 
 				default:
@@ -1055,10 +1240,8 @@ ExecInitRoutingInfo(ModifyTableState *mtstate,
 		if (proute->max_partitions == 0)
 		{
 			proute->max_partitions = 8;
-			proute->partitions = (ResultRelInfo **)
-				palloc(sizeof(ResultRelInfo *) * proute->max_partitions);
-			proute->is_borrowed_rel = (bool *)
-				palloc(sizeof(bool) * proute->max_partitions);
+			proute->partitions = palloc_array(ResultRelInfo *, proute->max_partitions);
+			proute->is_borrowed_rel = palloc_array(bool, proute->max_partitions);
 		}
 		else
 		{
@@ -1173,10 +1356,8 @@ ExecInitPartitionDispatchInfo(EState *estate,
 		if (proute->max_dispatch == 0)
 		{
 			proute->max_dispatch = 4;
-			proute->partition_dispatch_info = (PartitionDispatch *)
-				palloc(sizeof(PartitionDispatch) * proute->max_dispatch);
-			proute->nonleaf_partitions = (ResultRelInfo **)
-				palloc(sizeof(ResultRelInfo *) * proute->max_dispatch);
+			proute->partition_dispatch_info = palloc_array(PartitionDispatch, proute->max_dispatch);
+			proute->nonleaf_partitions = palloc_array(ResultRelInfo *, proute->max_dispatch);
 		}
 		else
 		{
@@ -1386,7 +1567,7 @@ FormPartitionKeyDatum(PartitionDispatch pd,
  * found or -1 if none found.
  */
 static int
-get_partition_for_tuple(PartitionDispatch pd, Datum *values, bool *isnull)
+get_partition_for_tuple(PartitionDispatch pd, const Datum *values, const bool *isnull)
 {
 	int			bound_offset = -1;
 	int			part_index = -1;
@@ -1607,8 +1788,8 @@ get_partition_for_tuple(PartitionDispatch pd, Datum *values, bool *isnull)
  */
 static char *
 ExecBuildSlotPartitionKeyDescription(Relation rel,
-									 Datum *values,
-									 bool *isnull,
+									 const Datum *values,
+									 const bool *isnull,
 									 int maxfieldlen)
 {
 	StringInfoData buf;
@@ -1762,59 +1943,144 @@ adjust_partition_colnos_using_map(List *colnos, AttrMap *attrMap)
  *
  * Functions:
  *
- * ExecInitPartitionPruning:
- *		Creates the PartitionPruneState required by ExecFindMatchingSubPlans.
- *		Details stored include how to map the partition index returned by the
- *		partition pruning code into subplan indexes.  Also determines the set
- *		of subplans to initialize considering the result of performing initial
- *		pruning steps if any.  Maps in PartitionPruneState are updated to
+ * ExecDoInitialPruning:
+ *		Perform runtime "initial" pruning, if necessary, to determine the set
+ *		of child subnodes that need to be initialized during ExecInitNode() for
+ *		all plan nodes that contain a PartitionPruneInfo.
+ *
+ * ExecInitPartitionExecPruning:
+ *		Updates the PartitionPruneState found at given part_prune_index in
+ *		EState.es_part_prune_states for use during "exec" pruning if required.
+ *		Also returns the set of subplans to initialize that would be stored at
+ *		part_prune_index in EState.es_part_prune_results by
+ *		ExecDoInitialPruning().  Maps in PartitionPruneState are updated to
  *		account for initial pruning possibly having eliminated some of the
  *		subplans.
  *
  * ExecFindMatchingSubPlans:
  *		Returns indexes of matching subplans after evaluating the expressions
  *		that are safe to evaluate at a given point.  This function is first
- *		called during ExecInitPartitionPruning() to find the initially
- *		matching subplans based on performing the initial pruning steps and
- *		then must be called again each time the value of a Param listed in
+ *		called during ExecDoInitialPruning() to find the initially matching
+ *		subplans based on performing the initial pruning steps and then must be
+ *		called again each time the value of a Param listed in
  *		PartitionPruneState's 'execparamids' changes.
  *-------------------------------------------------------------------------
  */
 
+
 /*
- * ExecInitPartitionPruning
- *		Initialize data structure needed for run-time partition pruning and
- *		do initial pruning if needed
+ * ExecDoInitialPruning
+ *		Perform runtime "initial" pruning, if necessary, to determine the set
+ *		of child subnodes that need to be initialized during ExecInitNode() for
+ *		plan nodes that support partition pruning.
+ *
+ * This function iterates over each PartitionPruneInfo entry in
+ * estate->es_part_prune_infos. For each entry, it creates a PartitionPruneState
+ * and adds it to es_part_prune_states.  ExecInitPartitionExecPruning() accesses
+ * these states through their corresponding indexes in es_part_prune_states and
+ * assign each state to the parent node's PlanState, from where it will be used
+ * for "exec" pruning.
+ *
+ * If initial pruning steps exist for a PartitionPruneInfo entry, this function
+ * executes those pruning steps and stores the result as a bitmapset of valid
+ * child subplans, identifying which subplans should be initialized for
+ * execution.  The results are saved in estate->es_part_prune_results.
+ *
+ * If no initial pruning is performed for a given PartitionPruneInfo, a NULL
+ * entry  is still added to es_part_prune_results to maintain alignment with
+ * es_part_prune_infos. This ensures that ExecInitPartitionExecPruning() can
+ * use the same index to retrieve the pruning results.
+ */
+void
+ExecDoInitialPruning(EState *estate)
+{
+	ListCell   *lc;
+
+	foreach(lc, estate->es_part_prune_infos)
+	{
+		PartitionPruneInfo *pruneinfo = lfirst_node(PartitionPruneInfo, lc);
+		PartitionPruneState *prunestate;
+		Bitmapset  *validsubplans = NULL;
+		Bitmapset  *all_leafpart_rtis = NULL;
+		Bitmapset  *validsubplan_rtis = NULL;
+
+		/* Create and save the PartitionPruneState. */
+		prunestate = CreatePartitionPruneState(estate, pruneinfo,
+											   &all_leafpart_rtis);
+		estate->es_part_prune_states = lappend(estate->es_part_prune_states,
+											   prunestate);
+
+		/*
+		 * Perform initial pruning steps, if any, and save the result
+		 * bitmapset or NULL as described in the header comment.
+		 */
+		if (prunestate->do_initial_prune)
+			validsubplans = ExecFindMatchingSubPlans(prunestate, true,
+													 &validsubplan_rtis);
+		else
+			validsubplan_rtis = all_leafpart_rtis;
+
+		estate->es_unpruned_relids = bms_add_members(estate->es_unpruned_relids,
+													 validsubplan_rtis);
+		estate->es_part_prune_results = lappend(estate->es_part_prune_results,
+												validsubplans);
+	}
+}
+
+/*
+ * ExecInitPartitionExecPruning
+ *		Initialize the data structures needed for runtime "exec" partition
+ *		pruning and return the result of initial pruning, if available.
+ *
+ * 'relids' identifies the relation to which both the parent plan and the
+ * PartitionPruneInfo given by 'part_prune_index' belong.
  *
  * On return, *initially_valid_subplans is assigned the set of indexes of
  * child subplans that must be initialized along with the parent plan node.
- * Initial pruning is performed here if needed and in that case only the
- * surviving subplans' indexes are added.
+ * Initial pruning would have been performed by ExecDoInitialPruning(), if
+ * necessary, and the bitmapset of surviving subplans' indexes would have
+ * been stored as the part_prune_index'th element of
+ * EState.es_part_prune_results.
  *
- * If subplans are indeed pruned, subplan_map arrays contained in the returned
- * PartitionPruneState are re-sequenced to not count those, though only if the
- * maps will be needed for subsequent execution pruning passes.
+ * If subplans were indeed pruned during initial pruning, the subplan_map
+ * arrays in the returned PartitionPruneState are re-sequenced to exclude those
+ * subplans, but only if the maps will be needed for subsequent execution
+ * pruning passes.
  */
 PartitionPruneState *
-ExecInitPartitionPruning(PlanState *planstate,
-						 int n_total_subplans,
-						 PartitionPruneInfo *pruneinfo,
-						 Bitmapset **initially_valid_subplans)
+ExecInitPartitionExecPruning(PlanState *planstate,
+							 int n_total_subplans,
+							 int part_prune_index,
+							 Bitmapset *relids,
+							 Bitmapset **initially_valid_subplans)
 {
 	PartitionPruneState *prunestate;
 	EState	   *estate = planstate->state;
+	PartitionPruneInfo *pruneinfo;
 
-	/* We may need an expression context to evaluate partition exprs */
-	ExecAssignExprContext(estate, planstate);
+	/* Obtain the pruneinfo we need. */
+	pruneinfo = list_nth_node(PartitionPruneInfo, estate->es_part_prune_infos,
+							  part_prune_index);
 
-	/* Create the working data structure for pruning */
-	prunestate = CreatePartitionPruneState(planstate, pruneinfo);
+	/* Its relids better match the plan node's or the planner messed up. */
+	if (!bms_equal(relids, pruneinfo->relids))
+		elog(ERROR, "wrong pruneinfo with relids=%s found at part_prune_index=%d contained in plan node with relids=%s",
+			 bmsToString(pruneinfo->relids), part_prune_index,
+			 bmsToString(relids));
 
 	/*
-	 * Perform an initial partition prune pass, if required.
+	 * The PartitionPruneState would have been created by
+	 * ExecDoInitialPruning() and stored as the part_prune_index'th element of
+	 * EState.es_part_prune_states.
 	 */
+	prunestate = list_nth(estate->es_part_prune_states, part_prune_index);
+	Assert(prunestate != NULL);
+
+	/* Use the result of initial pruning done by ExecDoInitialPruning(). */
 	if (prunestate->do_initial_prune)
-		*initially_valid_subplans = ExecFindMatchingSubPlans(prunestate, true);
+		*initially_valid_subplans = list_nth_node(Bitmapset,
+												  estate->es_part_prune_results,
+												  part_prune_index);
 	else
 	{
 		/* No pruning, so we'll need to initialize all subplans */
@@ -1824,22 +2090,21 @@ ExecInitPartitionPruning(PlanState *planstate,
 	}
 
 	/*
-	 * Re-sequence subplan indexes contained in prunestate to account for any
-	 * that were removed above due to initial pruning.  No need to do this if
-	 * no steps were removed.
+	 * The exec pruning state must also be initialized, if needed, before it
+	 * can be used for pruning during execution.
+	 *
+	 * This also re-sequences subplan indexes contained in prunestate to
+	 * account for any that were removed due to initial pruning; refer to the
+	 * condition in InitExecPartitionPruneContexts() that is used to determine
+	 * whether to do this.  If no exec pruning needs to be done, we would thus
+	 * leave the maps to be in an invalid state, but that's ok since that data
+	 * won't be consulted again (cf initial Assert in
+	 * ExecFindMatchingSubPlans).
 	 */
-	if (bms_num_members(*initially_valid_subplans) < n_total_subplans)
-	{
-		/*
-		 * We can safely skip this when !do_exec_prune, even though that
-		 * leaves invalid data in prunestate, because that data won't be
-		 * consulted again (cf initial Assert in ExecFindMatchingSubPlans).
-		 */
-		if (prunestate->do_exec_prune)
-			PartitionPruneFixSubPlanMap(prunestate,
-										*initially_valid_subplans,
-										n_total_subplans);
-	}
+	if (prunestate->do_exec_prune)
+		InitExecPartitionPruneContexts(prunestate, planstate,
+									   *initially_valid_subplans,
+									   n_total_subplans);
 
 	return prunestate;
 }
@@ -1848,7 +2113,11 @@ ExecInitPartitionPruning(PlanState *planstate,
  * CreatePartitionPruneState
  *		Build the data structure required for calling ExecFindMatchingSubPlans
  *
- * 'planstate' is the parent plan node's execution state.
+ * This includes PartitionPruneContexts (stored in each
+ * PartitionedRelPruningData corresponding to a PartitionedRelPruneInfo),
+ * which hold the ExprStates needed to evaluate pruning expressions, and
+ * mapping arrays to convert partition indexes from the pruning logic
+ * into subplan indexes in the parent plan node's list of child subplans.
  *
  * 'pruneinfo' is a PartitionPruneInfo as generated by
  * make_partition_pruneinfo.  Here we build a PartitionPruneState containing a
@@ -1860,16 +2129,32 @@ ExecInitPartitionPruning(PlanState *planstate,
  * stored in each PartitionedRelPruningData can be re-used each time we
  * re-evaluate which partitions match the pruning steps provided in each
  * PartitionedRelPruneInfo.
+ *
+ * Note that only the PartitionPruneContexts for initial pruning are
+ * initialized here. Those required for exec pruning are initialized later in
+ * ExecInitPartitionExecPruning(), as they depend on the availability of the
+ * parent plan node's PlanState.
+ *
+ * If initial pruning steps are to be skipped (e.g., during EXPLAIN
+ * (GENERIC_PLAN)), *all_leafpart_rtis will be populated with the RT indexes of
+ * all leaf partitions whose scanning subnode is included in the parent plan
+ * node's list of child plans. The caller must add these RT indexes to
+ * estate->es_unpruned_relids.
  */
 static PartitionPruneState *
-CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
+CreatePartitionPruneState(EState *estate, PartitionPruneInfo *pruneinfo,
+						  Bitmapset **all_leafpart_rtis)
 {
-	EState	   *estate = planstate->state;
 	PartitionPruneState *prunestate;
 	int			n_part_hierarchies;
 	ListCell   *lc;
 	int			i;
-	ExprContext *econtext = planstate->ps_ExprContext;
+
+	/*
+	 * Expression context that will be used by partkey_datum_from_expr() to
+	 * evaluate expressions for comparison against partition bounds.
+	 */
+	ExprContext *econtext = CreateExprContext(estate);
 
 	/* For data reading, executor always includes detached partitions */
 	if (estate->es_partition_directory == NULL)
@@ -1886,6 +2171,8 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 		palloc(offsetof(PartitionPruneState, partprunedata) +
 			   sizeof(PartitionPruningData *) * n_part_hierarchies);
 
+	/* Save ExprContext for use during InitExecPartitionPruneContexts(). */
+	prunestate->econtext = econtext;
 	prunestate->execparamids = NULL;
 	/* other_subplans can change at runtime, so we need our own copy */
 	prunestate->other_subplans = bms_copy(pruneinfo->other_subplans);
@@ -1934,7 +2221,11 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 			 * because that entry will be held open and locked for the
 			 * duration of this executor run.
 			 */
-			partrel = ExecGetRangeTableRelation(estate, pinfo->rtindex);
+			partrel = ExecGetRangeTableRelation(estate, pinfo->rtindex, false);
+
+			/* Remember for InitExecPartitionPruneContexts(). */
+			pprune->partrel = partrel;
+
 			partkey = RelationGetPartitionKey(partrel);
 			partdesc = PartitionDirectoryLookup(estate->es_partition_directory,
 												partrel);
@@ -1945,8 +2236,8 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 			 * The set of partitions that exist now might not be the same that
 			 * existed when the plan was made.  The normal case is that it is;
 			 * optimize for that case with a quick comparison, and just copy
-			 * the subplan_map and make subpart_map point to the one in
-			 * PruneInfo.
+			 * the subplan_map and make subpart_map, leafpart_rti_map point to
+			 * the ones in PruneInfo.
 			 *
 			 * For the case where they aren't identical, we could have more
 			 * partitions on either side; or even exactly the same number of
@@ -1958,13 +2249,14 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 			 * arrays are in partition bounds order.
 			 */
 			pprune->nparts = partdesc->nparts;
-			pprune->subplan_map = palloc(sizeof(int) * partdesc->nparts);
+			pprune->subplan_map = palloc_array(int, partdesc->nparts);
 
 			if (partdesc->nparts == pinfo->nparts &&
 				memcmp(partdesc->oids, pinfo->relid_map,
 					   sizeof(int) * partdesc->nparts) == 0)
 			{
 				pprune->subpart_map = pinfo->subpart_map;
+				pprune->leafpart_rti_map = pinfo->leafpart_rti_map;
 				memcpy(pprune->subplan_map, pinfo->subplan_map,
 					   sizeof(int) * pinfo->nparts);
 			}
@@ -1984,7 +2276,8 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 				 * attached.  Cope with that by creating a map that skips any
 				 * mismatches.
 				 */
-				pprune->subpart_map = palloc(sizeof(int) * partdesc->nparts);
+				pprune->subpart_map = palloc_array(int, partdesc->nparts);
+				pprune->leafpart_rti_map = palloc_array(int, partdesc->nparts);
 
 				for (pp_idx = 0; pp_idx < partdesc->nparts; pp_idx++)
 				{
@@ -2002,6 +2295,8 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 							pinfo->subplan_map[pd_idx];
 						pprune->subpart_map[pp_idx] =
 							pinfo->subpart_map[pd_idx];
+						pprune->leafpart_rti_map[pp_idx] =
+							pinfo->leafpart_rti_map[pd_idx];
 						pd_idx++;
 						continue;
 					}
@@ -2039,6 +2334,7 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 
 					pprune->subpart_map[pp_idx] = -1;
 					pprune->subplan_map[pp_idx] = -1;
+					pprune->leafpart_rti_map[pp_idx] = 0;
 				}
 			}
 
@@ -2046,17 +2342,21 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 			pprune->present_parts = bms_copy(pinfo->present_parts);
 
 			/*
-			 * Initialize pruning contexts as needed.  Note that we must skip
-			 * execution-time partition pruning in EXPLAIN (GENERIC_PLAN),
-			 * since parameter values may be missing.
+			 * Only initial_context is initialized here.  exec_context is
+			 * initialized during ExecInitPartitionExecPruning() when the
+			 * parent plan's PlanState is available.
+			 *
+			 * Note that we must skip execution-time (both "init" and "exec")
+			 * partition pruning in EXPLAIN (GENERIC_PLAN), since parameter
+			 * values may be missing.
 			 */
 			pprune->initial_pruning_steps = pinfo->initial_pruning_steps;
 			if (pinfo->initial_pruning_steps &&
 				!(econtext->ecxt_estate->es_top_eflags & EXEC_FLAG_EXPLAIN_GENERIC))
 			{
 				InitPartitionPruneContext(&pprune->initial_context,
-										  pinfo->initial_pruning_steps,
-										  partdesc, partkey, planstate,
+										  pprune->initial_pruning_steps,
+										  partdesc, partkey, NULL,
 										  econtext);
 				/* Record whether initial pruning is needed at any level */
 				prunestate->do_initial_prune = true;
@@ -2065,10 +2365,6 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 			if (pinfo->exec_pruning_steps &&
 				!(econtext->ecxt_estate->es_top_eflags & EXEC_FLAG_EXPLAIN_GENERIC))
 			{
-				InitPartitionPruneContext(&pprune->exec_context,
-										  pinfo->exec_pruning_steps,
-										  partdesc, partkey, planstate,
-										  econtext);
 				/* Record whether exec pruning is needed at any level */
 				prunestate->do_exec_prune = true;
 			}
@@ -2079,6 +2375,25 @@ CreatePartitionPruneState(PlanState *planstate, PartitionPruneInfo *pruneinfo)
 			 */
 			prunestate->execparamids = bms_add_members(prunestate->execparamids,
 													   pinfo->execparamids);
+
+			/*
+			 * Return all leaf partition indexes if we're skipping pruning in
+			 * the EXPLAIN (GENERIC_PLAN) case.
+			 */
+			if (pinfo->initial_pruning_steps && !prunestate->do_initial_prune)
+			{
+				int			part_index = -1;
+
+				while ((part_index = bms_next_member(pprune->present_parts,
+													 part_index)) >= 0)
+				{
+					Index		rtindex = pprune->leafpart_rti_map[part_index];
+
+					if (rtindex)
+						*all_leafpart_rtis = bms_add_member(*all_leafpart_rtis,
+															rtindex);
+				}
+			}
 
 			j++;
 		}
@@ -2113,16 +2428,14 @@ InitPartitionPruneContext(PartitionPruneContext *context,
 	context->partsupfunc = partkey->partsupfunc;
 
 	/* We'll look up type-specific support functions as needed */
-	context->stepcmpfuncs = (FmgrInfo *)
-		palloc0(sizeof(FmgrInfo) * n_steps * partnatts);
+	context->stepcmpfuncs = palloc0_array(FmgrInfo, n_steps * partnatts);
 
 	context->ppccontext = CurrentMemoryContext;
 	context->planstate = planstate;
 	context->exprcontext = econtext;
 
 	/* Initialize expression state for each expression we need */
-	context->exprstates = (ExprState **)
-		palloc0(sizeof(ExprState *) * n_steps * partnatts);
+	context->exprstates = palloc0_array(ExprState *, n_steps * partnatts);
 	foreach(lc, pruning_steps)
 	{
 		PartitionPruneStepOp *step = (PartitionPruneStepOp *) lfirst(lc);
@@ -2173,10 +2486,17 @@ InitPartitionPruneContext(PartitionPruneContext *context,
 }
 
 /*
- * PartitionPruneFixSubPlanMap
- *		Fix mapping of partition indexes to subplan indexes contained in
- *		prunestate by considering the new list of subplans that survived
- *		initial pruning
+ * InitExecPartitionPruneContexts
+ *		Initialize exec pruning contexts deferred by CreatePartitionPruneState()
+ *
+ * This function finalizes exec pruning setup for a PartitionPruneState by
+ * initializing contexts for pruning steps that require the parent plan's
+ * PlanState. It iterates over PartitionPruningData entries and sets up the
+ * necessary execution contexts for pruning during query execution.
+ *
+ * Also fix the mapping of partition indexes to subplan indexes contained in
+ * prunestate by considering the new list of subplans that survived initial
+ * pruning.
  *
  * Current values of the indexes present in PartitionPruneState count all the
  * subplans that would be present before initial pruning was done.  If initial
@@ -2187,27 +2507,43 @@ InitPartitionPruneContext(PartitionPruneContext *context,
  * subplans in the post-initial-pruning set.
  */
 static void
-PartitionPruneFixSubPlanMap(PartitionPruneState *prunestate,
-							Bitmapset *initially_valid_subplans,
-							int n_total_subplans)
+InitExecPartitionPruneContexts(PartitionPruneState *prunestate,
+							   PlanState *parent_plan,
+							   Bitmapset *initially_valid_subplans,
+							   int n_total_subplans)
 {
-	int		   *new_subplan_indexes;
+	EState	   *estate;
+	int		   *new_subplan_indexes = NULL;
 	Bitmapset  *new_other_subplans;
 	int			i;
 	int			newidx;
+	bool		fix_subplan_map = false;
+
+	Assert(prunestate->do_exec_prune);
+	Assert(parent_plan != NULL);
+	estate = parent_plan->state;
 
 	/*
-	 * First we must build a temporary array which maps old subplan indexes to
-	 * new ones.  For convenience of initialization, we use 1-based indexes in
-	 * this array and leave pruned items as 0.
+	 * No need to fix subplans maps if initial pruning didn't eliminate any
+	 * subplans.
 	 */
-	new_subplan_indexes = (int *) palloc0(sizeof(int) * n_total_subplans);
-	newidx = 1;
-	i = -1;
-	while ((i = bms_next_member(initially_valid_subplans, i)) >= 0)
+	if (bms_num_members(initially_valid_subplans) < n_total_subplans)
 	{
-		Assert(i < n_total_subplans);
-		new_subplan_indexes[i] = newidx++;
+		fix_subplan_map = true;
+
+		/*
+		 * First we must build a temporary array which maps old subplan
+		 * indexes to new ones.  For convenience of initialization, we use
+		 * 1-based indexes in this array and leave pruned items as 0.
+		 */
+		new_subplan_indexes = palloc0_array(int, n_total_subplans);
+		newidx = 1;
+		i = -1;
+		while ((i = bms_next_member(initially_valid_subplans, i)) >= 0)
+		{
+			Assert(i < n_total_subplans);
+			new_subplan_indexes[i] = newidx++;
+		}
 	}
 
 	/*
@@ -2231,6 +2567,29 @@ PartitionPruneFixSubPlanMap(PartitionPruneState *prunestate,
 			PartitionedRelPruningData *pprune = &prunedata->partrelprunedata[j];
 			int			nparts = pprune->nparts;
 			int			k;
+
+			/* Initialize PartitionPruneContext for exec pruning, if needed. */
+			if (pprune->exec_pruning_steps != NIL)
+			{
+				PartitionKey partkey;
+				PartitionDesc partdesc;
+
+				/*
+				 * See the comment in CreatePartitionPruneState() regarding
+				 * the usage of partdesc and partkey.
+				 */
+				partkey = RelationGetPartitionKey(pprune->partrel);
+				partdesc = PartitionDirectoryLookup(estate->es_partition_directory,
+													pprune->partrel);
+
+				InitPartitionPruneContext(&pprune->exec_context,
+										  pprune->exec_pruning_steps,
+										  partdesc, partkey, parent_plan,
+										  prunestate->econtext);
+			}
+
+			if (!fix_subplan_map)
+				continue;
 
 			/* We just rebuild present_parts from scratch */
 			bms_free(pprune->present_parts);
@@ -2273,19 +2632,22 @@ PartitionPruneFixSubPlanMap(PartitionPruneState *prunestate,
 	}
 
 	/*
-	 * We must also recompute the other_subplans set, since indexes in it may
-	 * change.
+	 * If we fixed subplan maps, we must also recompute the other_subplans
+	 * set, since indexes in it may change.
 	 */
-	new_other_subplans = NULL;
-	i = -1;
-	while ((i = bms_next_member(prunestate->other_subplans, i)) >= 0)
-		new_other_subplans = bms_add_member(new_other_subplans,
-											new_subplan_indexes[i] - 1);
+	if (fix_subplan_map)
+	{
+		new_other_subplans = NULL;
+		i = -1;
+		while ((i = bms_next_member(prunestate->other_subplans, i)) >= 0)
+			new_other_subplans = bms_add_member(new_other_subplans,
+												new_subplan_indexes[i] - 1);
 
-	bms_free(prunestate->other_subplans);
-	prunestate->other_subplans = new_other_subplans;
+		bms_free(prunestate->other_subplans);
+		prunestate->other_subplans = new_other_subplans;
 
-	pfree(new_subplan_indexes);
+		pfree(new_subplan_indexes);
+	}
 }
 
 /*
@@ -2296,10 +2658,15 @@ PartitionPruneFixSubPlanMap(PartitionPruneState *prunestate,
  * Pass initial_prune if PARAM_EXEC Params cannot yet be evaluated.  This
  * differentiates the initial executor-time pruning step from later
  * runtime pruning.
+ *
+ * The caller must pass a non-NULL validsubplan_rtis during initial pruning
+ * to collect the RT indexes of leaf partitions whose subnodes will be
+ * executed.  These RT indexes are later added to EState.es_unpruned_relids.
  */
 Bitmapset *
 ExecFindMatchingSubPlans(PartitionPruneState *prunestate,
-						 bool initial_prune)
+						 bool initial_prune,
+						 Bitmapset **validsubplan_rtis)
 {
 	Bitmapset  *result = NULL;
 	MemoryContext oldcontext;
@@ -2311,6 +2678,7 @@ ExecFindMatchingSubPlans(PartitionPruneState *prunestate,
 	 * evaluated *and* there are steps in which to do so.
 	 */
 	Assert(initial_prune || prunestate->do_exec_prune);
+	Assert(validsubplan_rtis != NULL || !initial_prune);
 
 	/*
 	 * Switch to a temp context to avoid leaking memory in the executor's
@@ -2334,10 +2702,14 @@ ExecFindMatchingSubPlans(PartitionPruneState *prunestate,
 		 */
 		pprune = &prunedata->partrelprunedata[0];
 		find_matching_subplans_recurse(prunedata, pprune, initial_prune,
-									   &result);
+									   &result, validsubplan_rtis);
 
-		/* Expression eval may have used space in ExprContext too */
-		if (pprune->exec_pruning_steps)
+		/*
+		 * Expression eval may have used space in ExprContext too. Avoid
+		 * accessing exec_context during initial pruning, as it is not valid
+		 * at that stage.
+		 */
+		if (!initial_prune && pprune->exec_pruning_steps)
 			ResetExprContext(pprune->exec_context.exprcontext);
 	}
 
@@ -2348,6 +2720,8 @@ ExecFindMatchingSubPlans(PartitionPruneState *prunestate,
 
 	/* Copy result out of the temp context before we reset it */
 	result = bms_copy(result);
+	if (validsubplan_rtis)
+		*validsubplan_rtis = bms_copy(*validsubplan_rtis);
 
 	MemoryContextReset(prunestate->prune_context);
 
@@ -2358,13 +2732,16 @@ ExecFindMatchingSubPlans(PartitionPruneState *prunestate,
  * find_matching_subplans_recurse
  *		Recursive worker function for ExecFindMatchingSubPlans
  *
- * Adds valid (non-prunable) subplan IDs to *validsubplans
+ * Adds valid (non-prunable) subplan IDs to *validsubplans. If
+ * *validsubplan_rtis is non-NULL, it also adds the RT indexes of their
+ * corresponding partitions, but only if they are leaf partitions.
  */
 static void
 find_matching_subplans_recurse(PartitionPruningData *prunedata,
 							   PartitionedRelPruningData *pprune,
 							   bool initial_prune,
-							   Bitmapset **validsubplans)
+							   Bitmapset **validsubplans,
+							   Bitmapset **validsubplan_rtis)
 {
 	Bitmapset  *partset;
 	int			i;
@@ -2391,8 +2768,18 @@ find_matching_subplans_recurse(PartitionPruningData *prunedata,
 	while ((i = bms_next_member(partset, i)) >= 0)
 	{
 		if (pprune->subplan_map[i] >= 0)
+		{
 			*validsubplans = bms_add_member(*validsubplans,
 											pprune->subplan_map[i]);
+
+			/*
+			 * Only report leaf partitions. Non-leaf partitions may appear
+			 * here when they use an unflattened Append or MergeAppend.
+			 */
+			if (validsubplan_rtis && pprune->leafpart_rti_map[i])
+				*validsubplan_rtis = bms_add_member(*validsubplan_rtis,
+													pprune->leafpart_rti_map[i]);
+		}
 		else
 		{
 			int			partidx = pprune->subpart_map[i];
@@ -2400,7 +2787,8 @@ find_matching_subplans_recurse(PartitionPruningData *prunedata,
 			if (partidx >= 0)
 				find_matching_subplans_recurse(prunedata,
 											   &prunedata->partrelprunedata[partidx],
-											   initial_prune, validsubplans);
+											   initial_prune, validsubplans,
+											   validsubplan_rtis);
 			else
 			{
 				/*

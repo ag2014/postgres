@@ -113,7 +113,7 @@ get_int_item(int lineno, void *var, enum ECPGttype vartype, int value)
 			*(short *) var = (short) value;
 			break;
 		case ECPGt_int:
-			*(int *) var = (int) value;
+			*(int *) var = value;
 			break;
 		case ECPGt_long:
 			*(long *) var = (long) value;
@@ -198,7 +198,7 @@ get_char_item(int lineno, void *var, enum ECPGttype vartype, char *value, int va
 		case ECPGt_char:
 		case ECPGt_unsigned_char:
 		case ECPGt_string:
-			strncpy((char *) var, value, varcharsize);
+			strncpy(var, value, varcharsize);
 			break;
 		case ECPGt_varchar:
 			{
@@ -240,8 +240,9 @@ ECPGget_desc(int lineno, const char *desc_name, int index,...)
 				act_tuple;
 	struct variable data_var;
 	struct sqlca_t *sqlca = ECPGget_sqlca();
+	bool		alloc_failed = (sqlca == NULL);
 
-	if (sqlca == NULL)
+	if (alloc_failed)
 	{
 		ecpg_raise(lineno, ECPG_OUT_OF_MEMORY,
 				   ECPG_SQLSTATE_ECPG_OUT_OF_MEMORY, NULL);
@@ -493,7 +494,14 @@ ECPGget_desc(int lineno, const char *desc_name, int index,...)
 #ifdef WIN32
 		stmt.oldthreadlocale = _configthreadlocale(_ENABLE_PER_THREAD_LOCALE);
 #endif
-		stmt.oldlocale = ecpg_strdup(setlocale(LC_NUMERIC, NULL), lineno);
+		stmt.oldlocale = ecpg_strdup(setlocale(LC_NUMERIC, NULL),
+									 lineno, &alloc_failed);
+		if (alloc_failed)
+		{
+			va_end(args);
+			return false;
+		}
+
 		setlocale(LC_NUMERIC, "C");
 #endif
 
@@ -597,7 +605,7 @@ set_desc_attr(struct descriptor_item *desc_item, struct variable *var,
 	}
 
 	ecpg_free(desc_item->data); /* free() takes care of a potential NULL value */
-	desc_item->data = (char *) tobeinserted;
+	desc_item->data = tobeinserted;
 }
 
 

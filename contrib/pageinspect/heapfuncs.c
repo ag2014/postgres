@@ -15,7 +15,7 @@
  * there's hardly any use case for using these without superuser-rights
  * anyway.
  *
- * Copyright (c) 2007-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2007-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/pageinspect/heapfuncs.c
@@ -32,6 +32,7 @@
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "pageinspect.h"
 #include "port/pg_bitutils.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -42,13 +43,14 @@
  * was used to upgrade from an older version, tuples might still have an
  * oid. Seems worthwhile to display that.
  */
-#define HeapTupleHeaderGetOidOld(tup) \
-( \
-	((tup)->t_infomask & HEAP_HASOID_OLD) ? \
-	   *((Oid *) ((char *)(tup) + (tup)->t_hoff - sizeof(Oid))) \
-	: \
-		InvalidOid \
-)
+static inline Oid
+HeapTupleHeaderGetOidOld(const HeapTupleHeaderData *tup)
+{
+	if (tup->t_infomask & HEAP_HASOID_OLD)
+		return *((const Oid *) ((const char *) (tup) + (tup)->t_hoff - sizeof(Oid)));
+	else
+		return InvalidOid;
+}
 
 
 /*
@@ -100,7 +102,7 @@ text_to_bits(char *str, int len)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("invalid character \"%.*s\" in t_bits string",
-							pg_mblen(str + off), str + off)));
+							pg_mblen_cstr(str + off), str + off)));
 
 		if (off % 8 == 7)
 			bits[off / 8] = byte;
@@ -131,29 +133,21 @@ heap_page_items(PG_FUNCTION_ARGS)
 	bytea	   *raw_page = PG_GETARG_BYTEA_P(0);
 	heap_page_items_state *inter_call_data = NULL;
 	FuncCallContext *fctx;
-	int			raw_page_size;
 
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to use raw page functions")));
 
-	raw_page_size = VARSIZE(raw_page) - VARHDRSZ;
-
 	if (SRF_IS_FIRSTCALL())
 	{
 		TupleDesc	tupdesc;
 		MemoryContext mctx;
 
-		if (raw_page_size < SizeOfPageHeaderData)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("input page too small (%d bytes)", raw_page_size)));
-
 		fctx = SRF_FIRSTCALL_INIT();
 		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
 
-		inter_call_data = palloc(sizeof(heap_page_items_state));
+		inter_call_data = palloc_object(heap_page_items_state);
 
 		/* Build a tuple descriptor for our result type */
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -162,7 +156,7 @@ heap_page_items(PG_FUNCTION_ARGS)
 		inter_call_data->tupd = tupdesc;
 
 		inter_call_data->offset = FirstOffsetNumber;
-		inter_call_data->page = VARDATA(raw_page);
+		inter_call_data->page = get_page_from_raw(raw_page);
 
 		fctx->max_calls = PageGetMaxOffsetNumber(inter_call_data->page);
 		fctx->user_fctx = inter_call_data;
@@ -208,14 +202,11 @@ heap_page_items(PG_FUNCTION_ARGS)
 		if (ItemIdHasStorage(id) &&
 			lp_len >= MinHeapTupleSize &&
 			lp_offset == MAXALIGN(lp_offset) &&
-			lp_offset + lp_len <= raw_page_size)
+			lp_offset + lp_len <= BLCKSZ)
 		{
 			HeapTupleHeader tuphdr;
-			bytea	   *tuple_data_bytea;
-			int			tuple_data_len;
 
 			/* Extract information from the tuple header */
-
 			tuphdr = (HeapTupleHeader) PageGetItem(page, id);
 
 			values[4] = UInt32GetDatum(HeapTupleHeaderGetRawXmin(tuphdr));
@@ -227,44 +218,56 @@ heap_page_items(PG_FUNCTION_ARGS)
 			values[9] = UInt32GetDatum(tuphdr->t_infomask);
 			values[10] = UInt8GetDatum(tuphdr->t_hoff);
 
-			/* Copy raw tuple data into bytea attribute */
-			tuple_data_len = lp_len - tuphdr->t_hoff;
-			tuple_data_bytea = (bytea *) palloc(tuple_data_len + VARHDRSZ);
-			SET_VARSIZE(tuple_data_bytea, tuple_data_len + VARHDRSZ);
-			memcpy(VARDATA(tuple_data_bytea), (char *) tuphdr + tuphdr->t_hoff,
-				   tuple_data_len);
-			values[13] = PointerGetDatum(tuple_data_bytea);
-
 			/*
 			 * We already checked that the item is completely within the raw
 			 * page passed to us, with the length given in the line pointer.
-			 * Let's check that t_hoff doesn't point over lp_len, before using
-			 * it to access t_bits and oid.
+			 * But t_hoff could be out of range, so check it before relying on
+			 * it to fetch additional info.
 			 */
 			if (tuphdr->t_hoff >= SizeofHeapTupleHeader &&
 				tuphdr->t_hoff <= lp_len &&
 				tuphdr->t_hoff == MAXALIGN(tuphdr->t_hoff))
 			{
+				int			tuple_data_len;
+				bytea	   *tuple_data_bytea;
+
+				/* Copy null bitmask and OID, if present */
 				if (tuphdr->t_infomask & HEAP_HASNULL)
 				{
-					int			bits_len;
+					int			bitmaplen;
 
-					bits_len =
-						BITMAPLEN(HeapTupleHeaderGetNatts(tuphdr)) * BITS_PER_BYTE;
-					values[11] = CStringGetTextDatum(bits_to_text(tuphdr->t_bits, bits_len));
+					bitmaplen = BITMAPLEN(HeapTupleHeaderGetNatts(tuphdr));
+					/* better range-check the attribute count, too */
+					if (bitmaplen <= tuphdr->t_hoff - SizeofHeapTupleHeader)
+						values[11] =
+							CStringGetTextDatum(bits_to_text(tuphdr->t_bits,
+															 bitmaplen * BITS_PER_BYTE));
+					else
+						nulls[11] = true;
 				}
 				else
 					nulls[11] = true;
 
 				if (tuphdr->t_infomask & HEAP_HASOID_OLD)
-					values[12] = HeapTupleHeaderGetOidOld(tuphdr);
+					values[12] = ObjectIdGetDatum(HeapTupleHeaderGetOidOld(tuphdr));
 				else
 					nulls[12] = true;
+
+				/* Copy raw tuple data into bytea attribute */
+				tuple_data_len = lp_len - tuphdr->t_hoff;
+				tuple_data_bytea = (bytea *) palloc(tuple_data_len + VARHDRSZ);
+				SET_VARSIZE(tuple_data_bytea, tuple_data_len + VARHDRSZ);
+				if (tuple_data_len > 0)
+					memcpy(VARDATA(tuple_data_bytea),
+						   (char *) tuphdr + tuphdr->t_hoff,
+						   tuple_data_len);
+				values[13] = PointerGetDatum(tuple_data_bytea);
 			}
 			else
 			{
 				nulls[11] = true;
 				nulls[12] = true;
+				nulls[13] = true;
 			}
 		}
 		else
@@ -334,11 +337,11 @@ tuple_data_split_internal(Oid relid, char *tupdata,
 
 	for (i = 0; i < nattrs; i++)
 	{
-		Form_pg_attribute attr;
+		CompactAttribute *attr;
 		bool		is_null;
 		bytea	   *attr_data = NULL;
 
-		attr = TupleDescAttr(tupdesc, i);
+		attr = TupleDescCompactAttr(tupdesc, i);
 
 		/*
 		 * Tuple header can specify fewer attributes than tuple descriptor as
@@ -357,8 +360,8 @@ tuple_data_split_internal(Oid relid, char *tupdata,
 
 			if (attr->attlen == -1)
 			{
-				off = att_align_pointer(off, attr->attalign, -1,
-										tupdata + off);
+				off = att_pointer_alignby(off, attr->attalignby, -1,
+										  tupdata + off);
 
 				/*
 				 * As VARSIZE_ANY throws an exception if it can't properly
@@ -376,7 +379,7 @@ tuple_data_split_internal(Oid relid, char *tupdata,
 			}
 			else
 			{
-				off = att_align_nominal(off, attr->attalign);
+				off = att_nominal_alignby(off, attr->attalignby);
 				len = attr->attlen;
 			}
 
@@ -386,7 +389,7 @@ tuple_data_split_internal(Oid relid, char *tupdata,
 						 errmsg("unexpected end of tuple data")));
 
 			if (attr->attlen == -1 && do_detoast)
-				attr_data = pg_detoast_datum_copy((struct varlena *) (tupdata + off));
+				attr_data = pg_detoast_datum_copy((varlena *) (tupdata + off));
 			else
 			{
 				attr_data = (bytea *) palloc(len + VARHDRSZ);
@@ -543,7 +546,7 @@ heap_tuple_infomask_flags(PG_FUNCTION_ARGS)
 	}
 
 	/* build set of raw flags */
-	flags = (Datum *) palloc0(sizeof(Datum) * bitcnt);
+	flags = palloc0_array(Datum, bitcnt);
 
 	/* decode t_infomask */
 	if ((t_infomask & HEAP_HASNULL) != 0)

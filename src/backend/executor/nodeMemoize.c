@@ -3,7 +3,7 @@
  * nodeMemoize.c
  *	  Routines to handle caching of results from parameterized nodes
  *
- * Portions Copyright (c) 2021-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2021-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -66,6 +66,7 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "common/hashfn.h"
 #include "executor/executor.h"
 #include "executor/nodeMemoize.h"
@@ -175,10 +176,10 @@ MemoizeHash_hash(struct memoize_hash *tb, const MemoizeKey *key)
 
 			if (!pslot->tts_isnull[i])	/* treat nulls as having hash key 0 */
 			{
-				Form_pg_attribute attr;
+				CompactAttribute *attr;
 				uint32		hkey;
 
-				attr = TupleDescAttr(pslot->tts_tupleDescriptor, i);
+				attr = TupleDescCompactAttr(pslot->tts_tupleDescriptor, i);
 
 				hkey = datum_image_hash(pslot->tts_values[i], attr->attbyval, attr->attlen);
 
@@ -242,7 +243,7 @@ MemoizeHash_equal(struct memoize_hash *tb, const MemoizeKey *key1,
 
 		for (int i = 0; i < numkeys; i++)
 		{
-			Form_pg_attribute attr;
+			CompactAttribute *attr;
 
 			if (tslot->tts_isnull[i] != pslot->tts_isnull[i])
 			{
@@ -255,7 +256,7 @@ MemoizeHash_equal(struct memoize_hash *tb, const MemoizeKey *key1,
 				continue;
 
 			/* perform binary comparison on the two datums */
-			attr = TupleDescAttr(tslot->tts_tupleDescriptor, i);
+			attr = TupleDescCompactAttr(tslot->tts_tupleDescriptor, i);
 			if (!datum_image_eq(tslot->tts_values[i], pslot->tts_values[i],
 								attr->attbyval, attr->attlen))
 			{
@@ -554,7 +555,7 @@ cache_lookup(MemoizeState *mstate, bool *found)
 	oldcontext = MemoryContextSwitchTo(mstate->tableContext);
 
 	/* Allocate a new key */
-	entry->key = key = (MemoizeKey *) palloc(sizeof(MemoizeKey));
+	entry->key = key = palloc_object(MemoizeKey);
 	key->params = ExecCopySlotMinimalTuple(mstate->probeslot);
 
 	/* Update the total cache memory utilization */
@@ -633,7 +634,7 @@ cache_store_tuple(MemoizeState *mstate, TupleTableSlot *slot)
 
 	oldcontext = MemoryContextSwitchTo(mstate->tableContext);
 
-	tuple = (MemoizeTuple *) palloc(sizeof(MemoizeTuple));
+	tuple = palloc_object(MemoizeTuple);
 	tuple->mintuple = ExecCopySlotMinimalTuple(slot);
 	tuple->next = NULL;
 
@@ -1122,7 +1123,7 @@ ExecEndMemoize(MemoizeState *node)
 		if (node->stats.mem_peak == 0)
 			node->stats.mem_peak = node->mem_used;
 
-		Assert(ParallelWorkerNumber <= node->shared_info->num_workers);
+		Assert(ParallelWorkerNumber < node->shared_info->num_workers);
 		si = &node->shared_info->sinstrument[ParallelWorkerNumber];
 		memcpy(si, &node->stats, sizeof(MemoizeInstrumentation));
 	}

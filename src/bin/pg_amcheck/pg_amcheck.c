@@ -3,7 +3,7 @@
  * pg_amcheck.c
  *		Detects corruption within database relations.
  *
- * Copyright (c) 2017-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2017-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/pg_amcheck/pg_amcheck.c
@@ -26,7 +26,7 @@
 #include "fe_utils/query_utils.h"
 #include "fe_utils/simple_list.h"
 #include "fe_utils/string_utils.h"
-#include "getopt_long.h"		/* pgrminclude ignore */
+#include "getopt_long.h"
 #include "pgtime.h"
 #include "storage/block.h"
 
@@ -560,7 +560,7 @@ main(int argc, char *argv[])
 
 			executeCommand(conn, install_sql, opts.echo);
 			pfree(install_sql);
-			pfree(schema);
+			PQfreemem(schema);
 		}
 
 		/*
@@ -587,6 +587,7 @@ main(int argc, char *argv[])
 			/* Querying the catalog succeeded, but amcheck is missing. */
 			pg_log_warning("skipping database \"%s\": amcheck is not installed",
 						   PQdb(conn));
+			PQclear(result);
 			disconnectDatabase(conn);
 			conn = NULL;
 			continue;
@@ -1337,7 +1338,7 @@ extend_pattern_info_array(PatternInfoArray *pia)
 	PatternInfo *result;
 
 	pia->len++;
-	pia->data = (PatternInfo *) pg_realloc(pia->data, pia->len * sizeof(PatternInfo));
+	pia->data = pg_realloc_array(pia->data, PatternInfo, pia->len);
 	result = &pia->data[pia->len - 1];
 	memset(result, 0, sizeof(*result));
 
@@ -1592,7 +1593,7 @@ compile_database_list(PGconn *conn, SimplePtrList *databases,
 
 	if (initial_dbname)
 	{
-		DatabaseInfo *dat = (DatabaseInfo *) pg_malloc0(sizeof(DatabaseInfo));
+		DatabaseInfo *dat = pg_malloc0_object(DatabaseInfo);
 
 		/* This database is included.  Add to list */
 		if (opts.verbose)
@@ -1737,7 +1738,7 @@ compile_database_list(PGconn *conn, SimplePtrList *databases,
 			if (opts.verbose)
 				pg_log_info("including database \"%s\"", datname);
 
-			dat = (DatabaseInfo *) pg_malloc0(sizeof(DatabaseInfo));
+			dat = pg_malloc0_object(DatabaseInfo);
 			dat->datname = pstrdup(datname);
 			simple_ptr_list_append(databases, dat);
 		}
@@ -2201,7 +2202,7 @@ compile_relation_list_one_db(PGconn *conn, SimplePtrList *relations,
 		{
 			/* Current record pertains to a relation */
 
-			RelationInfo *rel = (RelationInfo *) pg_malloc0(sizeof(RelationInfo));
+			RelationInfo *rel = pg_malloc0_object(RelationInfo);
 
 			Assert(OidIsValid(oid));
 			Assert((is_heap && !is_btree) || (is_btree && !is_heap));

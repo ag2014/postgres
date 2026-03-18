@@ -7,7 +7,7 @@
  *	 ExecProcNode, or ExecEndNode on its subnodes and do the appropriate
  *	 processing.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -73,6 +73,7 @@
 #include "postgres.h"
 
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "executor/nodeAgg.h"
 #include "executor/nodeAppend.h"
 #include "executor/nodeBitmapAnd.h"

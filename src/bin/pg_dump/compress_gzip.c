@@ -3,7 +3,7 @@
  * compress_gzip.c
  *	 Routines for archivers to read or write a gzip compressed data stream.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,7 +18,16 @@
 #include "pg_backup_utils.h"
 
 #ifdef HAVE_LIBZ
-#include "zlib.h"
+#include <zlib.h>
+
+/*
+ * We don't use the gzgetc() macro, because zlib's configuration logic is not
+ * robust enough to guarantee that the macro will have the same ideas about
+ * struct field layout as the library itself does; see for example
+ * https://gnats.netbsd.org/cgi-bin/query-pr-single.pl?number=59711
+ * Instead, #undef the macro and fall back to the underlying function.
+ */
+#undef gzgetc
 
 /*----------------------
  * Compressor API
@@ -48,8 +57,8 @@ DeflateCompressorInit(CompressorState *cs)
 	GzipCompressorState *gzipcs;
 	z_streamp	zp;
 
-	gzipcs = (GzipCompressorState *) pg_malloc0(sizeof(GzipCompressorState));
-	zp = gzipcs->zp = (z_streamp) pg_malloc(sizeof(z_stream));
+	gzipcs = pg_malloc0_object(GzipCompressorState);
+	zp = gzipcs->zp = pg_malloc_object(z_stream);
 	zp->zalloc = Z_NULL;
 	zp->zfree = Z_NULL;
 	zp->opaque = Z_NULL;
@@ -129,7 +138,7 @@ DeflateCompressorCommon(ArchiveHandle *AH, CompressorState *cs, bool flush)
 				 */
 				size_t		len = gzipcs->outsize - zp->avail_out;
 
-				cs->writeF(AH, (char *) out, len);
+				cs->writeF(AH, out, len);
 			}
 			zp->next_out = out;
 			zp->avail_out = gzipcs->outsize;
@@ -169,7 +178,7 @@ ReadDataFromArchiveGzip(ArchiveHandle *AH, CompressorState *cs)
 	char	   *buf;
 	size_t		buflen;
 
-	zp = (z_streamp) pg_malloc(sizeof(z_stream));
+	zp = pg_malloc_object(z_stream);
 	zp->zalloc = Z_NULL;
 	zp->zfree = Z_NULL;
 	zp->opaque = Z_NULL;
@@ -251,34 +260,53 @@ InitCompressorGzip(CompressorState *cs,
  *----------------------
  */
 
-static bool
-Gzip_read(void *ptr, size_t size, size_t *rsize, CompressFileHandle *CFH)
+static size_t
+Gzip_read(void *ptr, size_t size, CompressFileHandle *CFH)
 {
 	gzFile		gzfp = (gzFile) CFH->private_data;
 	int			gzret;
 
+	/* Reading zero bytes must be a no-op */
+	if (size == 0)
+		return 0;
+
 	gzret = gzread(gzfp, ptr, size);
-	if (gzret <= 0 && !gzeof(gzfp))
+
+	/*
+	 * gzread returns zero on EOF as well as some error conditions, and less
+	 * than zero on other error conditions, so we need to inspect for EOF on
+	 * zero.
+	 */
+	if (gzret <= 0)
 	{
 		int			errnum;
-		const char *errmsg = gzerror(gzfp, &errnum);
+		const char *errmsg;
+
+		if (gzret == 0 && gzeof(gzfp))
+			return 0;
+
+		errmsg = gzerror(gzfp, &errnum);
 
 		pg_fatal("could not read from input file: %s",
 				 errnum == Z_ERRNO ? strerror(errno) : errmsg);
 	}
 
-	if (rsize)
-		*rsize = (size_t) gzret;
-
-	return true;
+	return (size_t) gzret;
 }
 
-static bool
+static void
 Gzip_write(const void *ptr, size_t size, CompressFileHandle *CFH)
 {
 	gzFile		gzfp = (gzFile) CFH->private_data;
+	int			errnum;
+	const char *errmsg;
 
-	return gzwrite(gzfp, ptr, size) > 0;
+	if (gzwrite(gzfp, ptr, size) != size)
+	{
+		errmsg = gzerror(gzfp, &errnum);
+		pg_fatal("could not write to file: %s",
+				 errnum == Z_ERRNO ? strerror(errno) : errmsg);
+	}
 }
 
 static int

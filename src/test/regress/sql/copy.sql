@@ -94,6 +94,51 @@ this is just a line full of junk that would error out if parsed
 
 copy copytest4 to stdout (header);
 
+-- test multi-line header line feature
+
+create temp table copytest5 (c1 int);
+
+copy copytest5 from stdin (format csv, header 2);
+this is a first header line.
+this is a second header line.
+1
+2
+\.
+copy copytest5 to stdout (header);
+
+truncate copytest5;
+copy copytest5 from stdin (format csv, header 4);
+this is a first header line.
+this is a second header line.
+1
+2
+\.
+select count(*) from copytest5;
+
+truncate copytest5;
+copy copytest5 from stdin (format csv, header 5);
+this is a first header line.
+this is a second header line.
+1
+2
+\.
+select count(*) from copytest5;
+
+-- test header line feature (given as strings)
+truncate copytest5;
+copy copytest5 from stdin (format csv, header '0');
+1
+2
+\.
+select * from copytest5 order by c1;
+
+truncate copytest5;
+copy copytest5 from stdin (format csv, header '1');
+1
+2
+\.
+select * from copytest5 order by c1;
+
 -- test copy from with a partitioned table
 create table parted_copytest (
 	a int,
@@ -193,7 +238,8 @@ begin
        bytes_processed > 0 as has_bytes_processed,
        bytes_total > 0 as has_bytes_total,
        tuples_processed,
-       tuples_excluded
+       tuples_excluded,
+       tuples_skipped
       from pg_stat_progress_copy
       where pid = pg_backend_pid())
   select into report (to_jsonb(r)) as value
@@ -221,6 +267,13 @@ truncate tab_progress_reporting;
 \set filename :abs_srcdir '/data/emp.data'
 copy tab_progress_reporting from :'filename'
 	where (salary < 2000);
+
+-- Generate COPY FROM report with PIPE, with some skipped tuples.
+copy tab_progress_reporting from stdin(on_error ignore);
+sharon	x	(15,12)	x	sam
+sharon	25	(15,12)	1000	sam
+sharon	y	(15,12)	x	sam
+\.
 
 drop trigger check_after_tab_progress_reporting on tab_progress_reporting;
 drop function notice_after_tab_progress_reporting();
@@ -348,3 +401,36 @@ COPY parted_si(id, data) FROM :'filename';
 SELECT tableoid::regclass, id % 2 = 0 is_even, count(*) from parted_si GROUP BY 1, 2 ORDER BY 1;
 
 DROP TABLE parted_si;
+
+-- ensure COPY FREEZE errors for foreign tables
+begin;
+create foreign data wrapper copytest_wrapper;
+create server copytest_server foreign data wrapper copytest_wrapper;
+create foreign table copytest_foreign_table (a int) server copytest_server;
+copy copytest_foreign_table from stdin (freeze);
+1
+\.
+rollback;
+
+-- Tests for COPY TO with materialized views.
+-- COPY TO should fail for an unpopulated materialized view
+-- but succeed for a populated one.
+CREATE MATERIALIZED VIEW copytest_mv AS SELECT 1 AS id WITH NO DATA;
+COPY copytest_mv(id) TO stdout WITH (header);
+REFRESH MATERIALIZED VIEW copytest_mv;
+COPY copytest_mv(id) TO stdout WITH (header);
+DROP MATERIALIZED VIEW copytest_mv;
+
+-- Tests for COPY TO with partitioned tables.
+-- The child table pp_2 has a different column order than the root table pp.
+-- Check if COPY TO exports tuples as the root table's column order.
+CREATE TABLE pp (id int,val int) PARTITION BY RANGE (id);
+CREATE TABLE pp_1 (val int, id int) PARTITION BY RANGE (id);
+CREATE TABLE pp_2 (id int, val int) PARTITION BY RANGE (id);
+ALTER TABLE pp ATTACH PARTITION pp_1 FOR VALUES FROM (1) TO (5);
+ALTER TABLE pp ATTACH PARTITION pp_2 FOR VALUES FROM (5) TO (10);
+CREATE TABLE pp_15 PARTITION OF pp_1 FOR VALUES FROM (1) TO (5);
+CREATE TABLE pp_510 PARTITION OF pp_2 FOR VALUES FROM (5) TO (10);
+INSERT INTO pp SELECT g, 10 + g FROM generate_series(1,6) g;
+COPY pp TO stdout(header);
+DROP TABLE PP;

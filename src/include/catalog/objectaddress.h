@@ -3,7 +3,7 @@
  * objectaddress.h
  *	  functions for working with object addresses
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/objectaddress.h
@@ -17,6 +17,7 @@
 #include "nodes/parsenodes.h"
 #include "storage/lockdefs.h"
 #include "utils/relcache.h"
+#include "utils/syscache.h"
 
 /*
  * An ObjectAddress represents a database object of any type.
@@ -57,8 +58,8 @@ extern Oid	get_object_namespace(const ObjectAddress *address);
 extern bool is_objectclass_supported(Oid class_id);
 extern const char *get_object_class_descr(Oid class_id);
 extern Oid	get_object_oid_index(Oid class_id);
-extern int	get_object_catcache_oid(Oid class_id);
-extern int	get_object_catcache_name(Oid class_id);
+extern SysCacheIdentifier get_object_catcache_oid(Oid class_id);
+extern SysCacheIdentifier get_object_catcache_name(Oid class_id);
 extern AttrNumber get_object_attnum_oid(Oid class_id);
 extern AttrNumber get_object_attnum_name(Oid class_id);
 extern AttrNumber get_object_attnum_namespace(Oid class_id);
@@ -69,6 +70,10 @@ extern bool get_object_namensp_unique(Oid class_id);
 
 extern HeapTuple get_catalog_object_by_oid(Relation catalog,
 										   AttrNumber oidcol, Oid objectId);
+extern HeapTuple get_catalog_object_by_oid_extended(Relation catalog,
+													AttrNumber oidcol,
+													Oid objectId,
+													bool locktup);
 
 extern char *getObjectDescription(const ObjectAddress *object,
 								  bool missing_ok);

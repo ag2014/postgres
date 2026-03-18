@@ -106,6 +106,12 @@ INSERT INTO rw_view15 (a) VALUES (3) ON CONFLICT (a) DO UPDATE set a = excluded.
 SELECT * FROM rw_view15;
 INSERT INTO rw_view15 (a) VALUES (3) ON CONFLICT (a) DO UPDATE set upper = 'blarg'; -- fails
 SELECT * FROM rw_view15;
+INSERT INTO rw_view15 (a) VALUES (3)
+  ON CONFLICT (a) DO UPDATE SET a = excluded.a WHERE excluded.upper = 'UNSPECIFIED'
+  RETURNING old, new;
+INSERT INTO rw_view15 (a) VALUES (3)
+  ON CONFLICT (a) DO SELECT WHERE excluded.upper = 'UNSPECIFIED' RETURNING old, new;
+
 SELECT * FROM rw_view15;
 ALTER VIEW rw_view15 ALTER COLUMN upper SET DEFAULT 'NOT SET';
 INSERT INTO rw_view15 (a) VALUES (4); -- should fail
@@ -154,7 +160,8 @@ DROP SEQUENCE uv_seq CASCADE;
 CREATE TABLE base_tbl (a int PRIMARY KEY, b text DEFAULT 'Unspecified');
 INSERT INTO base_tbl SELECT i, 'Row ' || i FROM generate_series(-2, 2) g(i);
 
-CREATE VIEW rw_view1 AS SELECT * FROM base_tbl WHERE a>0;
+CREATE VIEW rw_view1 AS
+  SELECT *, 'Const' AS c, (SELECT concat('b: ', b)) AS d FROM base_tbl WHERE a>0;
 
 SELECT table_name, is_insertable_into
   FROM information_schema.tables
@@ -175,13 +182,18 @@ UPDATE rw_view1 SET a=5 WHERE a=4;
 DELETE FROM rw_view1 WHERE b='Row 2';
 SELECT * FROM base_tbl;
 
+SET jit_above_cost = 0;
+
 MERGE INTO rw_view1 t
   USING (VALUES (0, 'ROW 0'), (1, 'ROW 1'),
                 (2, 'ROW 2'), (3, 'ROW 3')) AS v(a,b) ON t.a = v.a
   WHEN MATCHED AND t.a <= 1 THEN UPDATE SET b = v.b
   WHEN MATCHED THEN DELETE
   WHEN NOT MATCHED AND a > 0 THEN INSERT (a) VALUES (v.a)
-  RETURNING merge_action(), v.*, t.*;
+  RETURNING merge_action(), v.*, old, new, old.*, new.*, t.*;
+
+SET jit_above_cost TO DEFAULT;
+
 SELECT * FROM base_tbl ORDER BY a;
 
 MERGE INTO rw_view1 t
@@ -191,7 +203,7 @@ MERGE INTO rw_view1 t
   WHEN MATCHED THEN DELETE
   WHEN NOT MATCHED BY SOURCE THEN DELETE
   WHEN NOT MATCHED AND a > 0 THEN INSERT (a) VALUES (v.a)
-  RETURNING merge_action(), v.*, t.*;
+  RETURNING merge_action(), v.*, old, new, old.*, new.*, t.*;
 SELECT * FROM base_tbl ORDER BY a;
 
 EXPLAIN (costs off) UPDATE rw_view1 SET a=6 WHERE a=5;
@@ -240,8 +252,10 @@ DROP TABLE base_tbl_hist;
 CREATE TABLE base_tbl (a int PRIMARY KEY, b text DEFAULT 'Unspecified');
 INSERT INTO base_tbl SELECT i, 'Row ' || i FROM generate_series(-2, 2) g(i);
 
-CREATE VIEW rw_view1 AS SELECT b AS bb, a AS aa FROM base_tbl WHERE a>0;
-CREATE VIEW rw_view2 AS SELECT aa AS aaa, bb AS bbb FROM rw_view1 WHERE aa<10;
+CREATE VIEW rw_view1 AS
+  SELECT b AS bb, a AS aa, 'Const1' AS c FROM base_tbl WHERE a>0;
+CREATE VIEW rw_view2 AS
+  SELECT aa AS aaa, bb AS bbb, c AS c1, 'Const2' AS c2 FROM rw_view1 WHERE aa<10;
 
 SELECT table_name, is_insertable_into
   FROM information_schema.tables
@@ -268,7 +282,7 @@ MERGE INTO rw_view2 t
   WHEN MATCHED AND aaa = 3 THEN DELETE
   WHEN MATCHED THEN UPDATE SET bbb = v.b
   WHEN NOT MATCHED THEN INSERT (aaa) VALUES (v.a)
-  RETURNING merge_action(), v.*, t.*;
+  RETURNING merge_action(), v.*, (SELECT old), (SELECT (SELECT new)), t.*;
 SELECT * FROM rw_view2 ORDER BY aaa;
 
 MERGE INTO rw_view2 t
@@ -277,7 +291,7 @@ MERGE INTO rw_view2 t
   WHEN MATCHED THEN UPDATE SET bbb = v.b
   WHEN NOT MATCHED THEN INSERT (aaa) VALUES (v.a)
   WHEN NOT MATCHED BY SOURCE THEN UPDATE SET bbb = 'Not matched by source'
-  RETURNING merge_action(), v.*, t.*;
+  RETURNING merge_action(), v.*, old, (SELECT new FROM (VALUES ((SELECT new)))), t.*;
 SELECT * FROM rw_view2 ORDER BY aaa;
 
 EXPLAIN (costs off) UPDATE rw_view2 SET aaa=5 WHERE aaa=4;
@@ -362,10 +376,14 @@ SELECT table_name, column_name, is_updatable
  WHERE table_name LIKE 'rw_view%'
  ORDER BY table_name, ordinal_position;
 
-INSERT INTO rw_view2 VALUES (3, 'Row 3') RETURNING *;
-UPDATE rw_view2 SET b='Row three' WHERE a=3 RETURNING *;
+INSERT INTO rw_view2 VALUES (3, 'Row 3') RETURNING old.*, new.*;
+UPDATE rw_view2 SET b='R3' WHERE a=3 RETURNING old.*, new.*; -- rule returns NEW
+DROP RULE rw_view1_upd_rule ON rw_view1;
+CREATE RULE rw_view1_upd_rule AS ON UPDATE TO rw_view1
+  DO INSTEAD UPDATE base_tbl SET b=NEW.b WHERE a=OLD.a RETURNING *;
+UPDATE rw_view2 SET b='Row three' WHERE a=3 RETURNING old.*, new.*;
 SELECT * FROM rw_view2;
-DELETE FROM rw_view2 WHERE a=3 RETURNING *;
+DELETE FROM rw_view2 WHERE a=3 RETURNING old.*, new.*;
 SELECT * FROM rw_view2;
 
 MERGE INTO rw_view2 t USING (VALUES (3, 'Row 3')) AS v(a,b) ON t.a = v.a
@@ -381,8 +399,10 @@ DROP TABLE base_tbl CASCADE;
 CREATE TABLE base_tbl (a int PRIMARY KEY, b text DEFAULT 'Unspecified');
 INSERT INTO base_tbl SELECT i, 'Row ' || i FROM generate_series(-2, 2) g(i);
 
-CREATE VIEW rw_view1 AS SELECT * FROM base_tbl WHERE a>0 OFFSET 0; -- not updatable without rules/triggers
-CREATE VIEW rw_view2 AS SELECT * FROM rw_view1 WHERE a<10;
+CREATE VIEW rw_view1 AS
+  SELECT *, 'Const1' AS c1 FROM base_tbl WHERE a>0 OFFSET 0; -- not updatable without rules/triggers
+CREATE VIEW rw_view2 AS
+  SELECT *, 'Const2' AS c2 FROM rw_view1 WHERE a<10;
 
 SELECT table_name, is_insertable_into
   FROM information_schema.tables
@@ -407,9 +427,11 @@ $$
 BEGIN
   IF TG_OP = 'INSERT' THEN
     INSERT INTO base_tbl VALUES (NEW.a, NEW.b);
+    NEW.c1 = 'Trigger Const1';
     RETURN NEW;
   ELSIF TG_OP = 'UPDATE' THEN
     UPDATE base_tbl SET b=NEW.b WHERE a=OLD.a;
+    NEW.c1 = 'Trigger Const1';
     RETURN NEW;
   ELSIF TG_OP = 'DELETE' THEN
     DELETE FROM base_tbl WHERE a=OLD.a;
@@ -479,10 +501,10 @@ SELECT table_name, column_name, is_updatable
  WHERE table_name LIKE 'rw_view%'
  ORDER BY table_name, ordinal_position;
 
-INSERT INTO rw_view2 VALUES (3, 'Row 3') RETURNING *;
-UPDATE rw_view2 SET b='Row three' WHERE a=3 RETURNING *;
+INSERT INTO rw_view2 VALUES (3, 'Row 3') RETURNING old.*, new.*;
+UPDATE rw_view2 SET b='Row three' WHERE a=3 RETURNING old.*, new.*;
 SELECT * FROM rw_view2;
-DELETE FROM rw_view2 WHERE a=3 RETURNING *;
+DELETE FROM rw_view2 WHERE a=3 RETURNING old.*, new.*;
 SELECT * FROM rw_view2;
 
 MERGE INTO rw_view2 t
@@ -490,7 +512,7 @@ MERGE INTO rw_view2 t
   WHEN MATCHED AND t.a <= 1 THEN DELETE
   WHEN MATCHED THEN UPDATE SET b = s.b
   WHEN NOT MATCHED AND s.a > 0 THEN INSERT VALUES (s.a, s.b)
-  RETURNING merge_action(), s.*, t.*;
+  RETURNING merge_action(), s.*, old, new, t.*;
 SELECT * FROM base_tbl ORDER BY a;
 
 MERGE INTO rw_view2 t
@@ -498,7 +520,7 @@ MERGE INTO rw_view2 t
   WHEN MATCHED THEN UPDATE SET b = s.b
   WHEN NOT MATCHED AND s.a > 0 THEN INSERT VALUES (s.a, s.b)
   WHEN NOT MATCHED BY SOURCE THEN UPDATE SET b = 'Not matched by source'
-  RETURNING merge_action(), s.*, t.*;
+  RETURNING merge_action(), s.*, old, new, t.*;
 SELECT * FROM base_tbl ORDER BY a;
 
 EXPLAIN (costs off) UPDATE rw_view2 SET a=3 WHERE a=2;
@@ -1834,7 +1856,7 @@ insert into wcowrtest_v2 values (2, 'no such row in sometable');
 drop view wcowrtest_v, wcowrtest_v2;
 drop table wcowrtest, sometable;
 
--- Check INSERT .. ON CONFLICT DO UPDATE works correctly when the view's
+-- Check INSERT .. ON CONFLICT DO SELECT/UPDATE works correctly when the view's
 -- columns are named and ordered differently than the underlying table's.
 create table uv_iocu_tab (a text unique, b float);
 insert into uv_iocu_tab values ('xyxyxy', 0);
@@ -1847,6 +1869,8 @@ select * from uv_iocu_tab;
 insert into uv_iocu_view (a, b) values ('xyxyxy', 1)
    on conflict (a) do update set b = excluded.b;
 select * from uv_iocu_tab;
+insert into uv_iocu_view (a, b) values ('xyxyxy', 1)
+   on conflict (a) do select where uv_iocu_view.c = 2 and excluded.c = 2 returning *;
 
 -- OK to access view columns that are not present in underlying base
 -- relation in the ON CONFLICT portion of the query
@@ -1883,6 +1907,11 @@ insert into uv_iocu_view (aa,bb) values (1,'y')
    and excluded.bb != ''
    and excluded.cc is not null;
 select * from uv_iocu_view;
+explain (costs off)
+insert into uv_iocu_view (aa,bb) values (1,'Rejected: (y,1,"(1,y)")')
+   on conflict (aa) do select where uv_iocu_view.* = excluded.* returning *;
+insert into uv_iocu_view (aa,bb) values (1,'Rejected: (y,1,"(1,y)")')
+   on conflict (aa) do select where uv_iocu_view.* = excluded.* returning *;
 
 -- Test omitting a column of the base relation
 delete from uv_iocu_view;
@@ -1895,11 +1924,15 @@ alter table uv_iocu_tab alter column b set default 'table default';
 insert into uv_iocu_view (aa) values (1)
    on conflict (aa) do update set bb = 'Rejected: '||excluded.*;
 select * from uv_iocu_view;
+insert into uv_iocu_view (aa) values (1)
+   on conflict (aa) do select returning *;
 
 alter view uv_iocu_view alter column bb set default 'view default';
 insert into uv_iocu_view (aa) values (1)
    on conflict (aa) do update set bb = 'Rejected: '||excluded.*;
 select * from uv_iocu_view;
+insert into uv_iocu_view (aa) values (1)
+   on conflict (aa) do select returning *;
 
 -- Should fail to update non-updatable columns
 insert into uv_iocu_view (aa) values (1)
@@ -1908,7 +1941,7 @@ insert into uv_iocu_view (aa) values (1)
 drop view uv_iocu_view;
 drop table uv_iocu_tab;
 
--- ON CONFLICT DO UPDATE permissions checks
+-- ON CONFLICT DO SELECT/UPDATE permissions checks
 create user regress_view_user1;
 create user regress_view_user2;
 
@@ -1932,6 +1965,10 @@ insert into rw_view1 values ('zzz',2.0,1)
   on conflict (aa) do update set bb = rw_view1.bb||'xxx'; -- OK
 insert into rw_view1 values ('zzz',2.0,1)
   on conflict (aa) do update set cc = 3.0; -- Not allowed
+insert into rw_view1 values ('yyy',2.0,1)
+  on conflict (aa) do select for update returning cc; -- Not allowed
+insert into rw_view1 values ('yyy',2.0,1)
+  on conflict (aa) do select for update returning aa, bb;
 reset session authorization;
 select * from base_tbl;
 
@@ -1944,9 +1981,13 @@ set session authorization regress_view_user2;
 create view rw_view2 as select b as bb, c as cc, a as aa from base_tbl;
 insert into rw_view2 (aa,bb) values (1,'xxx')
   on conflict (aa) do update set bb = excluded.bb; -- Not allowed
+insert into rw_view2 (aa,bb) values (1,'xxx')
+  on conflict (aa) do select returning 1;          -- Not allowed
 create view rw_view3 as select b as bb, a as aa from base_tbl;
 insert into rw_view3 (aa,bb) values (1,'xxx')
   on conflict (aa) do update set bb = excluded.bb; -- OK
+insert into rw_view3 (aa,bb) values (1,'xxx')
+  on conflict (aa) do select returning aa, bb;     -- OK
 reset session authorization;
 select * from base_tbl;
 
@@ -1954,6 +1995,8 @@ set session authorization regress_view_user2;
 create view rw_view4 as select aa, bb, cc FROM rw_view1;
 insert into rw_view4 (aa,bb) values (1,'yyy')
   on conflict (aa) do update set bb = excluded.bb; -- Not allowed
+insert into rw_view4 (aa,bb) values (1,'yyy')
+  on conflict (aa) do select returning 1; -- Not allowed
 create view rw_view5 as select aa, bb FROM rw_view1;
 insert into rw_view5 (aa,bb) values (1,'yyy')
   on conflict (aa) do update set bb = excluded.bb; -- OK

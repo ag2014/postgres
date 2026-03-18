@@ -11,7 +11,7 @@
 #ifndef HBA_H
 #define HBA_H
 
-#include "libpq/pqcomm.h"	/* pgrminclude ignore */	/* needed for NetBSD */
+#include "libpq/pqcomm.h"		/* needed for NetBSD */
 #include "nodes/pg_list.h"
 #include "regex/regex.h"
 
@@ -39,7 +39,8 @@ typedef enum UserAuth
 	uaCert,
 	uaRADIUS,
 	uaPeer,
-#define USER_AUTH_LAST uaPeer	/* Must be last value of this enum */
+	uaOAuth,
+#define USER_AUTH_LAST uaOAuth	/* Must be last value of this enum */
 } UserAuth;
 
 /*
@@ -135,6 +136,10 @@ typedef struct HbaLine
 	char	   *radiusidentifiers_s;
 	List	   *radiusports;
 	char	   *radiusports_s;
+	char	   *oauth_issuer;
+	char	   *oauth_scope;
+	char	   *oauth_validator;
+	bool		oauth_skip_usermap;
 } HbaLine;
 
 typedef struct IdentLine
@@ -164,19 +169,18 @@ typedef struct TokenizedAuthLine
 	char	   *err_msg;		/* Error message if any */
 } TokenizedAuthLine;
 
-/* kluge to avoid including libpq/libpq-be.h here */
-typedef struct Port hbaPort;
+/* avoid including libpq/libpq-be.h here */
+typedef struct Port Port;
 
 extern bool load_hba(void);
 extern bool load_ident(void);
 extern const char *hba_authname(UserAuth auth_method);
-extern void hba_getauthmethod(hbaPort *port);
+extern void hba_getauthmethod(Port *port);
 extern int	check_usermap(const char *usermap_name,
 						  const char *pg_user, const char *system_user,
 						  bool case_insensitive);
 extern HbaLine *parse_hba_line(TokenizedAuthLine *tok_line, int elevel);
 extern IdentLine *parse_ident_line(TokenizedAuthLine *tok_line, int elevel);
-extern bool pg_isblank(const char c);
 extern FILE *open_auth_file(const char *filename, int elevel, int depth,
 							char **err_msg);
 extern void free_auth_file(FILE *file, int depth);

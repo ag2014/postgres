@@ -2,15 +2,22 @@
  * conflict.h
  *	   Exports for conflicts logging.
  *
- * Copyright (c) 2024, PostgreSQL Global Development Group
+ * Copyright (c) 2024-2026, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
 #ifndef CONFLICT_H
 #define CONFLICT_H
 
-#include "nodes/execnodes.h"
-#include "utils/timestamp.h"
+#include "access/xlogdefs.h"
+#include "datatype/timestamp.h"
+#include "nodes/pg_list.h"
+
+/* Avoid including execnodes.h here */
+typedef struct EState EState;
+typedef struct ResultRelInfo ResultRelInfo;
+typedef struct TupleTableSlot TupleTableSlot;
+
 
 /*
  * Conflict types that could occur while applying remote changes.
@@ -32,6 +39,9 @@ typedef enum
 	/* The updated row value violates unique constraint */
 	CT_UPDATE_EXISTS,
 
+	/* The row to be updated was concurrently deleted by a different origin */
+	CT_UPDATE_DELETED,
+
 	/* The row to be updated is missing */
 	CT_UPDATE_MISSING,
 
@@ -41,6 +51,9 @@ typedef enum
 	/* The row to be deleted is missing */
 	CT_DELETE_MISSING,
 
+	/* The row to be inserted/updated violates multiple unique constraint */
+	CT_MULTIPLE_UNIQUE_CONFLICTS,
+
 	/*
 	 * Other conflicts, such as exclusion constraint violations, involve more
 	 * complex rules than simple equality checks. These conflicts are left for
@@ -48,19 +61,32 @@ typedef enum
 	 */
 } ConflictType;
 
-#define CONFLICT_NUM_TYPES (CT_DELETE_MISSING + 1)
+#define CONFLICT_NUM_TYPES (CT_MULTIPLE_UNIQUE_CONFLICTS + 1)
+
+/*
+ * Information for the local row that caused the conflict.
+ */
+typedef struct ConflictTupleInfo
+{
+	TupleTableSlot *slot;		/* tuple slot holding the conflicting local
+								 * tuple */
+	Oid			indexoid;		/* OID of the index where the conflict
+								 * occurred */
+	TransactionId xmin;			/* transaction ID of the modification causing
+								 * the conflict */
+	ReplOriginId origin;		/* origin identifier of the modification */
+	TimestampTz ts;				/* timestamp of when the modification on the
+								 * conflicting local row occurred */
+} ConflictTupleInfo;
 
 extern bool GetTupleTransactionInfo(TupleTableSlot *localslot,
 									TransactionId *xmin,
-									RepOriginId *localorigin,
+									ReplOriginId *localorigin,
 									TimestampTz *localts);
 extern void ReportApplyConflict(EState *estate, ResultRelInfo *relinfo,
 								int elevel, ConflictType type,
 								TupleTableSlot *searchslot,
-								TupleTableSlot *localslot,
 								TupleTableSlot *remoteslot,
-								Oid indexoid, TransactionId localxmin,
-								RepOriginId localorigin, TimestampTz localts);
+								List *conflicttuples);
 extern void InitConflictIndexes(ResultRelInfo *relInfo);
-
 #endif

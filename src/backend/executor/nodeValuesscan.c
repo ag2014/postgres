@@ -4,7 +4,7 @@
  *	  Support routines for scanning Values lists
  *	  ("VALUES (...), (...), ..." in rangetable).
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -142,8 +142,8 @@ ValuesNext(ValuesScanState *node)
 		foreach(lc, exprstatelist)
 		{
 			ExprState  *estate = (ExprState *) lfirst(lc);
-			Form_pg_attribute attr = TupleDescAttr(slot->tts_tupleDescriptor,
-												   resind);
+			CompactAttribute *attr = TupleDescCompactAttr(slot->tts_tupleDescriptor,
+														  resind);
 
 			values[resind] = ExecEvalExpr(estate,
 										  econtext,
@@ -247,7 +247,7 @@ ExecInitValuesScan(ValuesScan *node, EState *estate, int eflags)
 	 * Get info about values list, initialize scan slot with it.
 	 */
 	tupdesc = ExecTypeFromExprList((List *) linitial(node->values_lists));
-	ExecInitScanTupleSlot(estate, &scanstate->ss, tupdesc, &TTSOpsVirtual);
+	ExecInitScanTupleSlot(estate, &scanstate->ss, tupdesc, &TTSOpsVirtual, 0);
 
 	/*
 	 * Initialize result type and projection.

@@ -23,7 +23,7 @@
  * Note the size of the null bitmask may not be the same as that of the
  * datum array.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -84,6 +84,7 @@ brtuple_disk_tupdesc(BrinDesc *brdesc)
 
 		MemoryContextSwitchTo(oldcxt);
 
+		TupleDescFinalize(tupdesc);
 		brdesc->bd_disktdesc = tupdesc;
 	}
 
@@ -119,13 +120,12 @@ brin_form_tuple(BrinDesc *brdesc, BlockNumber blkno, BrinMemTuple *tuple,
 
 	Assert(brdesc->bd_totalstored > 0);
 
-	values = (Datum *) palloc(sizeof(Datum) * brdesc->bd_totalstored);
-	nulls = (bool *) palloc0(sizeof(bool) * brdesc->bd_totalstored);
-	phony_nullbitmap = (bits8 *)
-		palloc(sizeof(bits8) * BITMAPLEN(brdesc->bd_totalstored));
+	values = palloc_array(Datum, brdesc->bd_totalstored);
+	nulls = palloc0_array(bool, brdesc->bd_totalstored);
+	phony_nullbitmap = palloc_array(bits8, BITMAPLEN(brdesc->bd_totalstored));
 
 #ifdef TOAST_INDEX_HACK
-	untoasted_values = (Datum *) palloc(sizeof(Datum) * brdesc->bd_totalstored);
+	untoasted_values = palloc_array(Datum, brdesc->bd_totalstored);
 #endif
 
 	/*
@@ -207,7 +207,7 @@ brin_form_tuple(BrinDesc *brdesc, BlockNumber blkno, BrinMemTuple *tuple,
 			 */
 			if (VARATT_IS_EXTERNAL(DatumGetPointer(value)))
 			{
-				value = PointerGetDatum(detoast_external_attr((struct varlena *)
+				value = PointerGetDatum(detoast_external_attr((varlena *)
 															  DatumGetPointer(value)));
 				free_value = true;
 			}
@@ -488,9 +488,9 @@ brin_new_memtuple(BrinDesc *brdesc)
 						sizeof(BrinValues) * brdesc->bd_tupdesc->natts);
 	dtup = palloc0(basesize + sizeof(Datum) * brdesc->bd_totalstored);
 
-	dtup->bt_values = palloc(sizeof(Datum) * brdesc->bd_totalstored);
-	dtup->bt_allnulls = palloc(sizeof(bool) * brdesc->bd_tupdesc->natts);
-	dtup->bt_hasnulls = palloc(sizeof(bool) * brdesc->bd_tupdesc->natts);
+	dtup->bt_values = palloc_array(Datum, brdesc->bd_totalstored);
+	dtup->bt_allnulls = palloc_array(bool, brdesc->bd_tupdesc->natts);
+	dtup->bt_hasnulls = palloc_array(bool, brdesc->bd_tupdesc->natts);
 
 	dtup->bt_empty_range = true;
 
@@ -699,17 +699,19 @@ brin_deconstruct_tuple(BrinDesc *brdesc,
 			 datumno < brdesc->bd_info[attnum]->oi_nstored;
 			 datumno++)
 		{
-			Form_pg_attribute thisatt = TupleDescAttr(diskdsc, stored);
+			CompactAttribute *thisatt = TupleDescCompactAttr(diskdsc, stored);
 
 			if (thisatt->attlen == -1)
 			{
-				off = att_align_pointer(off, thisatt->attalign, -1,
-										tp + off);
+				off = att_pointer_alignby(off,
+										  thisatt->attalignby,
+										  -1,
+										  tp + off);
 			}
 			else
 			{
-				/* not varlena, so safe to use att_align_nominal */
-				off = att_align_nominal(off, thisatt->attalign);
+				/* not varlena, so safe to use att_nominal_alignby */
+				off = att_nominal_alignby(off, thisatt->attalignby);
 			}
 
 			values[stored++] = fetchatt(thisatt, tp + off);

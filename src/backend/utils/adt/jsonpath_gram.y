@@ -6,7 +6,7 @@
  *
  * Transforms tokenized jsonpath into tree of JsonPathParseItem structs.
  *
- * Copyright (c) 2019-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2019-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	src/backend/utils/adt/jsonpath_gram.y
@@ -60,8 +60,10 @@ static bool makeItemLikeRegex(JsonPathParseItem *expr,
 %name-prefix="jsonpath_yy"
 %parse-param {JsonPathParseResult **result}
 %parse-param {struct Node *escontext}
+%parse-param {yyscan_t yyscanner}
 %lex-param {JsonPathParseResult **result}
 %lex-param {struct Node *escontext}
+%lex-param {yyscan_t yyscanner}
 
 %union
 {
@@ -118,7 +120,7 @@ static bool makeItemLikeRegex(JsonPathParseItem *expr,
 
 result:
 	mode expr_or_predicate			{
-										*result = palloc(sizeof(JsonPathParseResult));
+										*result = palloc_object(JsonPathParseResult);
 										(*result)->expr = $2;
 										(*result)->lax = $1;
 										(void) yynerrs;
@@ -382,7 +384,7 @@ method:
 static JsonPathParseItem *
 makeItemType(JsonPathItemType type)
 {
-	JsonPathParseItem *v = palloc(sizeof(*v));
+	JsonPathParseItem *v = palloc_object(JsonPathParseItem);
 
 	CHECK_FOR_INTERRUPTS();
 
@@ -560,7 +562,7 @@ makeAny(int first, int last)
 
 static bool
 makeItemLikeRegex(JsonPathParseItem *expr, JsonPathString *pattern,
-				  JsonPathString *flags, JsonPathParseItem ** result,
+				  JsonPathString *flags, JsonPathParseItem **result,
 				  struct Node *escontext)
 {
 	JsonPathParseItem *v = makeItemType(jpiLikeRegex);
@@ -597,21 +599,22 @@ makeItemLikeRegex(JsonPathParseItem *expr, JsonPathString *pattern,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("invalid input syntax for type %s", "jsonpath"),
 						 errdetail("Unrecognized flag character \"%.*s\" in LIKE_REGEX predicate.",
-								   pg_mblen(flags->val + i), flags->val + i)));
+								   pg_mblen_range(flags->val + i, flags->val + flags->len),
+								   flags->val + i)));
 				break;
 		}
 	}
 
 	/* Convert flags to what pg_regcomp needs */
-	if ( !jspConvertRegexFlags(v->value.like_regex.flags, &cflags, escontext))
-		 return false;
+	if (!jspConvertRegexFlags(v->value.like_regex.flags, &cflags, escontext))
+		return false;
 
 	/* check regex validity */
 	{
-		regex_t     re_tmp;
+		regex_t		re_tmp;
 		pg_wchar   *wpattern;
-		int         wpattern_len;
-		int         re_result;
+		int			wpattern_len;
+		int			re_result;
 
 		wpattern = (pg_wchar *) palloc((pattern->len + 1) * sizeof(pg_wchar));
 		wpattern_len = pg_mb2wchar_with_len(pattern->val,
@@ -621,7 +624,7 @@ makeItemLikeRegex(JsonPathParseItem *expr, JsonPathString *pattern,
 		if ((re_result = pg_regcomp(&re_tmp, wpattern, wpattern_len, cflags,
 									DEFAULT_COLLATION_OID)) != REG_OKAY)
 		{
-			char        errMsg[100];
+			char		errMsg[100];
 
 			pg_regerror(re_result, &re_tmp, errMsg, sizeof(errMsg));
 			ereturn(escontext, false,

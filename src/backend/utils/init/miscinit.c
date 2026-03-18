@@ -3,7 +3,7 @@
  * miscinit.c
  *	  miscellaneous initialization support stuff
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -55,6 +55,7 @@
 #include "utils/pidfile.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
+#include "utils/wait_event.h"
 
 
 #define DIRECTORY_LOCK_FILE		"postmaster.pid"
@@ -106,13 +107,6 @@ InitPostmasterChild(void)
 	pgwin32_signal_initialize();
 #endif
 
-	/*
-	 * Set reference point for stack-depth checking.  This might seem
-	 * redundant in !EXEC_BACKEND builds, but it's better to keep the depth
-	 * logic the same with and without that build option.
-	 */
-	(void) set_stack_base();
-
 	InitProcessGlobals();
 
 	/*
@@ -134,7 +128,7 @@ InitPostmasterChild(void)
 #endif
 
 	/* Initialize process-local latch support */
-	InitializeLatchSupport();
+	InitializeWaitEventSupport();
 	InitProcessLocalLatch();
 	InitializeLatchWaitSet();
 
@@ -195,7 +189,7 @@ InitStandaloneProcess(const char *argv0)
 	InitProcessGlobals();
 
 	/* Initialize process-local latch support */
-	InitializeLatchSupport();
+	InitializeWaitEventSupport();
 	InitProcessLocalLatch();
 	InitializeLatchWaitSet();
 
@@ -273,59 +267,11 @@ GetBackendTypeDesc(BackendType backendType)
 
 	switch (backendType)
 	{
-		case B_INVALID:
-			backendDesc = gettext_noop("not initialized");
-			break;
-		case B_ARCHIVER:
-			backendDesc = gettext_noop("archiver");
-			break;
-		case B_AUTOVAC_LAUNCHER:
-			backendDesc = gettext_noop("autovacuum launcher");
-			break;
-		case B_AUTOVAC_WORKER:
-			backendDesc = gettext_noop("autovacuum worker");
-			break;
-		case B_BACKEND:
-			backendDesc = gettext_noop("client backend");
-			break;
-		case B_DEAD_END_BACKEND:
-			backendDesc = gettext_noop("dead-end client backend");
-			break;
-		case B_BG_WORKER:
-			backendDesc = gettext_noop("background worker");
-			break;
-		case B_BG_WRITER:
-			backendDesc = gettext_noop("background writer");
-			break;
-		case B_CHECKPOINTER:
-			backendDesc = gettext_noop("checkpointer");
-			break;
-		case B_LOGGER:
-			backendDesc = gettext_noop("logger");
-			break;
-		case B_SLOTSYNC_WORKER:
-			backendDesc = gettext_noop("slotsync worker");
-			break;
-		case B_STANDALONE_BACKEND:
-			backendDesc = gettext_noop("standalone backend");
-			break;
-		case B_STARTUP:
-			backendDesc = gettext_noop("startup");
-			break;
-		case B_WAL_RECEIVER:
-			backendDesc = gettext_noop("walreceiver");
-			break;
-		case B_WAL_SENDER:
-			backendDesc = gettext_noop("walsender");
-			break;
-		case B_WAL_SUMMARIZER:
-			backendDesc = gettext_noop("walsummarizer");
-			break;
-		case B_WAL_WRITER:
-			backendDesc = gettext_noop("walwriter");
-			break;
+#define PG_PROCTYPE(bktype, bkcategory, description, main_func, shmem_attach)	\
+		case bktype: backendDesc = description; break;
+#include "postmaster/proctypelist.h"
+#undef PG_PROCTYPE
 	}
-
 	return backendDesc;
 }
 
@@ -762,12 +708,26 @@ has_rolreplication(Oid roleid)
  * Initialize user identity during normal backend startup
  */
 void
-InitializeSessionUserId(const char *rolename, Oid roleid, bool bypass_login_check)
+InitializeSessionUserId(const char *rolename, Oid roleid,
+						bool bypass_login_check)
 {
 	HeapTuple	roleTup;
 	Form_pg_authid rform;
 	char	   *rname;
 	bool		is_superuser;
+
+	/*
+	 * In a parallel worker, we don't have to do anything here.
+	 * ParallelWorkerMain already set our output variables, and we aren't
+	 * going to enforce either rolcanlogin or rolconnlimit.  Furthermore, we
+	 * don't really want to perform a catalog lookup for the role: we don't
+	 * want to fail if it's been dropped.
+	 */
+	if (InitializingParallelWorker)
+	{
+		Assert(bypass_login_check);
+		return;
+	}
 
 	/*
 	 * Don't do scans if we're bootstrapping, none of the system catalogs
@@ -784,34 +744,22 @@ InitializeSessionUserId(const char *rolename, Oid roleid, bool bypass_login_chec
 
 	/*
 	 * Look up the role, either by name if that's given or by OID if not.
-	 * Normally we have to fail if we don't find it, but in parallel workers
-	 * just return without doing anything: all the critical work has been done
-	 * already.  The upshot of that is that if the role has been deleted, we
-	 * will not enforce its rolconnlimit against parallel workers anymore.
 	 */
 	if (rolename != NULL)
 	{
 		roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(rolename));
 		if (!HeapTupleIsValid(roleTup))
-		{
-			if (InitializingParallelWorker)
-				return;
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("role \"%s\" does not exist", rolename)));
-		}
 	}
 	else
 	{
 		roleTup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
 		if (!HeapTupleIsValid(roleTup))
-		{
-			if (InitializingParallelWorker)
-				return;
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("role with OID %u does not exist", roleid)));
-		}
 	}
 
 	rform = (Form_pg_authid) GETSTRUCT(roleTup);
@@ -819,33 +767,29 @@ InitializeSessionUserId(const char *rolename, Oid roleid, bool bypass_login_chec
 	rname = NameStr(rform->rolname);
 	is_superuser = rform->rolsuper;
 
-	/* In a parallel worker, ParallelWorkerMain already set these variables */
-	if (!InitializingParallelWorker)
-	{
-		SetAuthenticatedUserId(roleid);
+	SetAuthenticatedUserId(roleid);
 
-		/*
-		 * Set SessionUserId and related variables, including "role", via the
-		 * GUC mechanisms.
-		 *
-		 * Note: ideally we would use PGC_S_DYNAMIC_DEFAULT here, so that
-		 * session_authorization could subsequently be changed from
-		 * pg_db_role_setting entries.  Instead, session_authorization in
-		 * pg_db_role_setting has no effect.  Changing that would require
-		 * solving two problems:
-		 *
-		 * 1. If pg_db_role_setting has values for both session_authorization
-		 * and role, we could not be sure which order those would be applied
-		 * in, and it would matter.
-		 *
-		 * 2. Sites may have years-old session_authorization entries.  There's
-		 * not been any particular reason to remove them.  Ending the dormancy
-		 * of those entries could seriously change application behavior, so
-		 * only a major release should do that.
-		 */
-		SetConfigOption("session_authorization", rname,
-						PGC_BACKEND, PGC_S_OVERRIDE);
-	}
+	/*
+	 * Set SessionUserId and related variables, including "role", via the GUC
+	 * mechanisms.
+	 *
+	 * Note: ideally we would use PGC_S_DYNAMIC_DEFAULT here, so that
+	 * session_authorization could subsequently be changed from
+	 * pg_db_role_setting entries.  Instead, session_authorization in
+	 * pg_db_role_setting has no effect.  Changing that would require solving
+	 * two problems:
+	 *
+	 * 1. If pg_db_role_setting has values for both session_authorization and
+	 * role, we could not be sure which order those would be applied in, and
+	 * it would matter.
+	 *
+	 * 2. Sites may have years-old session_authorization entries.  There's not
+	 * been any particular reason to remove them.  Ending the dormancy of
+	 * those entries could seriously change application behavior, so only a
+	 * major release should do that.
+	 */
+	SetConfigOption("session_authorization", rname,
+					PGC_BACKEND, PGC_S_OVERRIDE);
 
 	/*
 	 * These next checks are not enforced when in standalone mode, so that
@@ -855,7 +799,8 @@ InitializeSessionUserId(const char *rolename, Oid roleid, bool bypass_login_chec
 	if (IsUnderPostmaster)
 	{
 		/*
-		 * Is role allowed to login at all?
+		 * Is role allowed to login at all?  (But background workers can
+		 * override this by setting bypass_login_check.)
 		 */
 		if (!bypass_login_check && !rform->rolcanlogin)
 			ereport(FATAL,
@@ -864,7 +809,9 @@ InitializeSessionUserId(const char *rolename, Oid roleid, bool bypass_login_chec
 							rname)));
 
 		/*
-		 * Check connection limit for this role.
+		 * Check connection limit for this role.  We enforce the limit only
+		 * for regular backends, since other process types have their own
+		 * PGPROC pools.
 		 *
 		 * There is a race condition here --- we create our PGPROC before
 		 * checking for other PGPROCs.  If two backends did this at about the
@@ -874,6 +821,7 @@ InitializeSessionUserId(const char *rolename, Oid roleid, bool bypass_login_chec
 		 * just document that the connection limit is approximate.
 		 */
 		if (rform->rolconnlimit >= 0 &&
+			AmRegularBackendProcess() &&
 			!is_superuser &&
 			CountUserBackends(roleid) > rform->rolconnlimit)
 			ereport(FATAL,
@@ -1101,7 +1049,8 @@ EstimateClientConnectionInfoSpace(void)
  * Serialize MyClientConnectionInfo for use by parallel workers.
  */
 void
-SerializeClientConnectionInfo(Size maxsize, char *start_address)
+SerializeClientConnectionInfo(Size maxsize PG_USED_FOR_ASSERTS_ONLY,
+							  char *start_address)
 {
 	SerializedClientConnectionInfo serialized = {0};
 
@@ -1185,7 +1134,6 @@ UnlinkLockFiles(int status, Datum arg)
 		/* Should we complain if the unlink fails? */
 	}
 	/* Since we're about to exit, no need to reclaim storage */
-	lock_files = NIL;
 
 	/*
 	 * Lock file removal should always be the last externally visible action

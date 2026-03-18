@@ -3,7 +3,7 @@
  * user.c
  *	  Commands for manipulating roles (formerly called users).
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/commands/user.c
@@ -32,6 +32,7 @@
 #include "commands/user.h"
 #include "libpq/crypt.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -169,6 +170,12 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 	DefElem    *dvalidUntil = NULL;
 	DefElem    *dbypassRLS = NULL;
 	GrantRoleOptions popt;
+
+	/* Report error if name has \n or \r character. */
+	if (strpbrk(stmt->role, "\n\r"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("role name \"%s\" contains a newline or carriage return character", stmt->role)));
 
 	/* The defaults can vary depending on the original statement type */
 	switch (stmt->stmt_type)
@@ -817,12 +824,12 @@ AlterRole(ParseState *pstate, AlterRoleStmt *stmt)
 							   "BYPASSRLS", "BYPASSRLS")));
 	}
 
-	/* To add members to a role, you need ADMIN OPTION. */
+	/* To add or drop members, you need ADMIN OPTION. */
 	if (drolemembers && !is_admin_of_role(currentUserId, roleid))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to alter role"),
-				 errdetail("Only roles with the %s option on role \"%s\" may add members.",
+				 errdetail("Only roles with the %s option on role \"%s\" may add or drop members.",
 						   "ADMIN", rolename)));
 
 	/* Convert validuntil to internal form */
@@ -1346,6 +1353,12 @@ RenameRole(const char *oldname, const char *newname)
 	Oid			roleid;
 	ObjectAddress address;
 	Form_pg_authid authform;
+
+	/* Report error if name has \n or \r character. */
+	if (strpbrk(newname, "\n\r"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("role name \"%s\" contains a newline or carriage return character", newname)));
 
 	rel = table_open(AuthIdRelationId, RowExclusiveLock);
 	dsc = RelationGetDescr(rel);
@@ -1904,7 +1917,7 @@ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
 		else
 		{
 			Oid			objectId;
-			Oid		   *newmembers = palloc(sizeof(Oid));
+			Oid		   *newmembers = palloc_object(Oid);
 
 			/*
 			 * The values for these options can be taken directly from 'popt'.
@@ -1923,7 +1936,7 @@ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
 			 */
 			if ((popt->specified & GRANT_ROLE_SPECIFIED_INHERIT) != 0)
 				new_record[Anum_pg_auth_members_inherit_option - 1] =
-					popt->inherit;
+					BoolGetDatum(popt->inherit);
 			else
 			{
 				HeapTuple	mrtup;
@@ -1934,14 +1947,14 @@ AddRoleMems(Oid currentUserId, const char *rolename, Oid roleid,
 					elog(ERROR, "cache lookup failed for role %u", memberid);
 				mrform = (Form_pg_authid) GETSTRUCT(mrtup);
 				new_record[Anum_pg_auth_members_inherit_option - 1] =
-					mrform->rolinherit;
+					BoolGetDatum(mrform->rolinherit);
 				ReleaseSysCache(mrtup);
 			}
 
 			/* get an OID for the new row and insert it */
 			objectId = GetNewOidWithIndex(pg_authmem_rel, AuthMemOidIndexId,
 										  Anum_pg_auth_members_oid);
-			new_record[Anum_pg_auth_members_oid - 1] = objectId;
+			new_record[Anum_pg_auth_members_oid - 1] = ObjectIdGetDatum(objectId);
 			tuple = heap_form_tuple(pg_authmem_dsc,
 									new_record, new_record_nulls);
 			CatalogTupleInsert(pg_authmem_rel, tuple);
@@ -2295,7 +2308,7 @@ initialize_revoke_actions(CatCList *memlist)
 	if (memlist->n_members == 0)
 		return NULL;
 
-	result = palloc(sizeof(RevokeRoleGrantAction) * memlist->n_members);
+	result = palloc_array(RevokeRoleGrantAction, memlist->n_members);
 	for (i = 0; i < memlist->n_members; i++)
 		result[i] = RRG_NOOP;
 	return result;
@@ -2555,6 +2568,8 @@ check_createrole_self_grant(char **newval, void **extra, GucSource source)
 	list_free(elemlist);
 
 	result = (unsigned *) guc_malloc(LOG, sizeof(unsigned));
+	if (!result)
+		return false;
 	*result = options;
 	*extra = result;
 

@@ -4,7 +4,7 @@
  *	  prototypes for catalog/index.c.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/index.h
@@ -16,6 +16,12 @@
 
 #include "catalog/objectaddress.h"
 #include "nodes/execnodes.h"
+
+
+/*
+ * forward references in this file
+ */
+typedef struct AttrMap AttrMap;
 
 
 #define DEFAULT_INDEX_TYPE	"btree"
@@ -187,7 +193,7 @@ extern void IndexSetParentIndex(Relation partitionIdx, Oid parentOid);
  * As noted in validate_index(), this can be significantly faster.
  */
 static inline int64
-itemptr_encode(ItemPointer itemptr)
+itemptr_encode(const ItemPointerData *itemptr)
 {
 	BlockNumber block = ItemPointerGetBlockNumber(itemptr);
 	OffsetNumber offset = ItemPointerGetOffsetNumber(itemptr);

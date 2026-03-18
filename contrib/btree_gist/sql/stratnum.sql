@@ -1,3 +1,3 @@
--- test stratnum support func
-SELECT gist_stratnum_btree(3::smallint);
-SELECT gist_stratnum_btree(18::smallint);
+-- test stratnum translation support func
+SELECT gist_translate_cmptype_btree(7);
+SELECT gist_translate_cmptype_btree(3);

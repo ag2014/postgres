@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 common_sources = files(
   'archive.c',
@@ -184,6 +184,7 @@ foreach name, opts : pgcommon_variants
 
   lib = static_library('libpgcommon@0@'.format(name),
       link_with: cflag_libs,
+      link_whole: cflag_libs,
       c_pch: pch_c_h,
       kwargs: opts + {
         'include_directories': [
@@ -191,6 +192,7 @@ foreach name, opts : pgcommon_variants
           opts.get('include_directories', []),
         ],
         'dependencies': opts['dependencies'] + [ssl],
+        'install': install_internal_static_lib and name != '_srv',
       }
     )
   pgcommon += {name: lib}

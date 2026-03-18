@@ -3,7 +3,7 @@
  * relcache.c
  *	  POSTGRES relation descriptor cache code
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -75,6 +75,7 @@
 #include "pgstat.h"
 #include "rewrite/rewriteDefine.h"
 #include "rewrite/rowsecurity.h"
+#include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/array.h"
@@ -307,7 +308,7 @@ static TupleDesc GetPgClassDescriptor(void);
 static TupleDesc GetPgIndexDescriptor(void);
 static void AttrDefaultFetch(Relation relation, int ndef);
 static int	AttrDefaultCmp(const void *a, const void *b);
-static void CheckConstraintFetch(Relation relation);
+static void CheckNNConstraintFetch(Relation relation);
 static int	CheckConstraintCmp(const void *a, const void *b);
 static void InitIndexAmRoutine(Relation relation);
 static void IndexSupportInitialize(oidvector *indclass,
@@ -371,14 +372,13 @@ ScanPgRelation(Oid targetRelId, bool indexOK, bool force_non_historic)
 	pg_class_desc = table_open(RelationRelationId, AccessShareLock);
 
 	/*
-	 * The caller might need a tuple that's newer than the one the historic
-	 * snapshot; currently the only case requiring to do so is looking up the
-	 * relfilenumber of non mapped system relations during decoding. That
-	 * snapshot can't change in the midst of a relcache build, so there's no
-	 * need to register the snapshot.
+	 * The caller might need a tuple that's newer than what's visible to the
+	 * historic snapshot; currently the only case requiring to do so is
+	 * looking up the relfilenumber of non mapped system relations during
+	 * decoding.
 	 */
 	if (force_non_historic)
-		snapshot = GetNonHistoricCatalogSnapshot(RelationRelationId);
+		snapshot = RegisterSnapshot(GetNonHistoricCatalogSnapshot(RelationRelationId));
 
 	pg_class_scan = systable_beginscan(pg_class_desc, ClassOidIndexId,
 									   indexOK && criticalRelcachesBuilt,
@@ -395,6 +395,10 @@ ScanPgRelation(Oid targetRelId, bool indexOK, bool force_non_historic)
 
 	/* all done */
 	systable_endscan(pg_class_scan);
+
+	if (snapshot)
+		UnregisterSnapshot(snapshot);
+
 	table_close(pg_class_desc, AccessShareLock);
 
 	return pg_class_tuple;
@@ -419,7 +423,7 @@ AllocateRelationDesc(Form_pg_class relp)
 	/*
 	 * allocate and zero space for new relation descriptor
 	 */
-	relation = (Relation) palloc0(sizeof(RelationData));
+	relation = palloc0_object(RelationData);
 
 	/* make sure relation is marked as having no open file yet */
 	relation->rd_smgr = NULL;
@@ -585,11 +589,15 @@ RelationBuildTupleDesc(Relation relation)
 			   attp,
 			   ATTRIBUTE_FIXED_PART_SIZE);
 
+		populate_compact_attribute(relation->rd_att, attnum - 1);
+
 		/* Update constraint/default info */
 		if (attp->attnotnull)
 			constr->has_not_null = true;
 		if (attp->attgenerated == ATTRIBUTE_GENERATED_STORED)
 			constr->has_generated_stored = true;
+		if (attp->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+			constr->has_generated_virtual = true;
 		if (attp->atthasdef)
 			ndef++;
 
@@ -660,36 +668,17 @@ RelationBuildTupleDesc(Relation relation)
 			 need, RelationGetRelid(relation));
 
 	/*
-	 * The attcacheoff values we read from pg_attribute should all be -1
-	 * ("unknown").  Verify this if assert checking is on.  They will be
-	 * computed when and if needed during tuple access.
-	 */
-#ifdef USE_ASSERT_CHECKING
-	{
-		int			i;
-
-		for (i = 0; i < RelationGetNumberOfAttributes(relation); i++)
-			Assert(TupleDescAttr(relation->rd_att, i)->attcacheoff == -1);
-	}
-#endif
-
-	/*
-	 * However, we can easily set the attcacheoff value for the first
-	 * attribute: it must be zero.  This eliminates the need for special cases
-	 * for attnum=1 that used to exist in fastgetattr() and index_getattr().
-	 */
-	if (RelationGetNumberOfAttributes(relation) > 0)
-		TupleDescAttr(relation->rd_att, 0)->attcacheoff = 0;
-
-	/*
 	 * Set up constraint/default info
 	 */
 	if (constr->has_not_null ||
 		constr->has_generated_stored ||
+		constr->has_generated_virtual ||
 		ndef > 0 ||
 		attrmiss ||
 		relation->rd_rel->relchecks > 0)
 	{
+		bool		is_catalog = IsCatalogRelation(relation);
+
 		relation->rd_att->constr = constr;
 
 		if (ndef > 0)			/* DEFAULTs */
@@ -699,9 +688,33 @@ RelationBuildTupleDesc(Relation relation)
 
 		constr->missing = attrmiss;
 
-		if (relation->rd_rel->relchecks > 0)	/* CHECKs */
-			CheckConstraintFetch(relation);
-		else
+		/* CHECK and NOT NULLs */
+		if (relation->rd_rel->relchecks > 0 ||
+			(!is_catalog && constr->has_not_null))
+			CheckNNConstraintFetch(relation);
+
+		/*
+		 * Any not-null constraint that wasn't marked invalid by
+		 * CheckNNConstraintFetch must necessarily be valid; make it so in the
+		 * CompactAttribute array.
+		 */
+		if (!is_catalog)
+		{
+			for (int i = 0; i < relation->rd_rel->relnatts; i++)
+			{
+				CompactAttribute *attr;
+
+				attr = TupleDescCompactAttr(relation->rd_att, i);
+
+				if (attr->attnullability == ATTNULLABLE_UNKNOWN)
+					attr->attnullability = ATTNULLABLE_VALID;
+				else
+					Assert(attr->attnullability == ATTNULLABLE_INVALID ||
+						   attr->attnullability == ATTNULLABLE_UNRESTRICTED);
+			}
+		}
+
+		if (relation->rd_rel->relchecks == 0)
 			constr->num_check = 0;
 	}
 	else
@@ -709,6 +722,8 @@ RelationBuildTupleDesc(Relation relation)
 		pfree(constr);
 		relation->rd_att->constr = NULL;
 	}
+
+	TupleDescFinalize(relation->rd_att);
 }
 
 /*
@@ -1400,22 +1415,17 @@ RelationInitPhysicalAddr(Relation relation)
 static void
 InitIndexAmRoutine(Relation relation)
 {
-	IndexAmRoutine *cached,
-			   *tmp;
+	MemoryContext oldctx;
 
 	/*
-	 * Call the amhandler in current, short-lived memory context, just in case
-	 * it leaks anything (it probably won't, but let's be paranoid).
+	 * We formerly specified that the amhandler should return a palloc'd
+	 * struct.  That's now deprecated in favor of returning a pointer to a
+	 * static struct, but to avoid completely breaking old external AMs, run
+	 * the amhandler in the relation's rd_indexcxt.
 	 */
-	tmp = GetIndexAmRoutine(relation->rd_amhandler);
-
-	/* OK, now transfer the data into relation's rd_indexcxt. */
-	cached = (IndexAmRoutine *) MemoryContextAlloc(relation->rd_indexcxt,
-												   sizeof(IndexAmRoutine));
-	memcpy(cached, tmp, sizeof(IndexAmRoutine));
-	relation->rd_indam = cached;
-
-	pfree(tmp);
+	oldctx = MemoryContextSwitchTo(relation->rd_indexcxt);
+	relation->rd_indam = GetIndexAmRoutine(relation->rd_amhandler);
+	MemoryContextSwitchTo(oldctx);
 }
 
 /*
@@ -1882,7 +1892,7 @@ formrdesc(const char *relationName, Oid relationReltype,
 	/*
 	 * allocate new relation desc, clear all fields of reldesc
 	 */
-	relation = (Relation) palloc0(sizeof(RelationData));
+	relation = palloc0_object(RelationData);
 
 	/* make sure relation is marked as having no open file yet */
 	relation->rd_smgr = NULL;
@@ -1937,6 +1947,7 @@ formrdesc(const char *relationName, Oid relationReltype,
 	relation->rd_rel->relpages = 0;
 	relation->rd_rel->reltuples = -1;
 	relation->rd_rel->relallvisible = 0;
+	relation->rd_rel->relallfrozen = 0;
 	relation->rd_rel->relkind = RELKIND_RELATION;
 	relation->rd_rel->relnatts = (int16) natts;
 
@@ -1963,17 +1974,16 @@ formrdesc(const char *relationName, Oid relationReltype,
 			   &attrs[i],
 			   ATTRIBUTE_FIXED_PART_SIZE);
 		has_not_null |= attrs[i].attnotnull;
-		/* make sure attcacheoff is valid */
-		TupleDescAttr(relation->rd_att, i)->attcacheoff = -1;
+
+		populate_compact_attribute(relation->rd_att, i);
 	}
 
-	/* initialize first attribute's attcacheoff, cf RelationBuildTupleDesc */
-	TupleDescAttr(relation->rd_att, 0)->attcacheoff = 0;
+	TupleDescFinalize(relation->rd_att);
 
 	/* mark not-null status */
 	if (has_not_null)
 	{
-		TupleConstr *constr = (TupleConstr *) palloc0(sizeof(TupleConstr));
+		TupleConstr *constr = palloc0_object(TupleConstr);
 
 		constr->has_not_null = true;
 		relation->rd_att->constr = constr;
@@ -2035,6 +2045,23 @@ formrdesc(const char *relationName, Oid relationReltype,
 	relation->rd_isvalid = true;
 }
 
+#ifdef USE_ASSERT_CHECKING
+/*
+ *		AssertCouldGetRelation
+ *
+ *		Check safety of calling RelationIdGetRelation().
+ *
+ *		In code that reads catalogs in the event of a cache miss, call this
+ *		before checking the cache.
+ */
+void
+AssertCouldGetRelation(void)
+{
+	Assert(IsTransactionState());
+	AssertBufferLocksPermitCatalogRead();
+}
+#endif
+
 
 /* ----------------------------------------------------------------
  *				 Relation Descriptor Lookup Interface
@@ -2062,8 +2089,7 @@ RelationIdGetRelation(Oid relationId)
 {
 	Relation	rd;
 
-	/* Make sure we're in an xact, even if this ends up being a cache hit */
-	Assert(IsTransactionState());
+	AssertCouldGetRelation();
 
 	/*
 	 * first try to find reldesc in the cache
@@ -2352,8 +2378,7 @@ RelationReloadNailed(Relation relation)
 	Assert(relation->rd_isnailed);
 	/* nailed indexes are handled by RelationReloadIndexInfo() */
 	Assert(relation->rd_rel->relkind == RELKIND_RELATION);
-	/* can only reread catalog contents in a transaction */
-	Assert(IsTransactionState());
+	AssertCouldGetRelation();
 
 	/*
 	 * Redo RelationInitPhysicalAddr in case it is a mapped relation whose
@@ -2549,8 +2574,7 @@ static void
 RelationRebuildRelation(Relation relation)
 {
 	Assert(!RelationHasReferenceCountZero(relation));
-	/* rebuilding requires access to the catalogs */
-	Assert(IsTransactionState());
+	AssertCouldGetRelation();
 	/* there is no reason to ever rebuild a dropped relation */
 	Assert(relation->rd_droppedSubid == InvalidSubTransactionId);
 
@@ -2861,7 +2885,7 @@ RelationForgetRelation(Oid rid)
 
 	RelationIdCacheLookup(rid, relation);
 
-	if (!PointerIsValid(relation))
+	if (!relation)
 		return;					/* not in cache, nothing to do */
 
 	if (!RelationHasReferenceCountZero(relation))
@@ -2906,7 +2930,7 @@ RelationCacheInvalidateEntry(Oid relationId)
 
 	RelationIdCacheLookup(relationId, relation);
 
-	if (PointerIsValid(relation))
+	if (relation)
 	{
 		relcacheInvalsReceived++;
 		RelationFlushRelation(relation);
@@ -3149,7 +3173,7 @@ AssertPendingSyncs_RelationCache(void)
 		if ((LockTagType) locallock->tag.lock.locktag_type !=
 			LOCKTAG_RELATION)
 			continue;
-		relid = ObjectIdGetDatum(locallock->tag.lock.locktag_field2);
+		relid = locallock->tag.lock.locktag_field2;
 		r = RelationIdGetRelation(relid);
 		if (!RelationIsValid(r))
 			continue;
@@ -3544,7 +3568,7 @@ RelationBuildLocalRelation(const char *relname,
 	/*
 	 * allocate a new relation descriptor and fill in basic state fields.
 	 */
-	rel = (Relation) palloc0(sizeof(RelationData));
+	rel = palloc0_object(RelationData);
 
 	/* make sure relation is marked as having no open file yet */
 	rel->rd_smgr = NULL;
@@ -3579,11 +3603,20 @@ RelationBuildLocalRelation(const char *relname,
 		datt->attgenerated = satt->attgenerated;
 		datt->attnotnull = satt->attnotnull;
 		has_not_null |= satt->attnotnull;
+		populate_compact_attribute(rel->rd_att, i);
+
+		if (satt->attnotnull)
+		{
+			CompactAttribute *scatt = TupleDescCompactAttr(tupDesc, i);
+			CompactAttribute *dcatt = TupleDescCompactAttr(rel->rd_att, i);
+
+			dcatt->attnullability = scatt->attnullability;
+		}
 	}
 
 	if (has_not_null)
 	{
-		TupleConstr *constr = (TupleConstr *) palloc0(sizeof(TupleConstr));
+		TupleConstr *constr = palloc0_object(TupleConstr);
 
 		constr->has_not_null = true;
 		rel->rd_att->constr = constr;
@@ -3648,6 +3681,8 @@ RelationBuildLocalRelation(const char *relname,
 
 	for (i = 0; i < natts; i++)
 		TupleDescAttr(rel->rd_att, i)->attrelid = relid;
+
+	TupleDescFinalize(rel->rd_att);
 
 	rel->rd_rel->reltablespace = reltablespace;
 
@@ -3893,6 +3928,7 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 			classform->relpages = 0;	/* it's empty until further notice */
 			classform->reltuples = -1;
 			classform->relallvisible = 0;
+			classform->relallfrozen = 0;
 		}
 		classform->relfrozenxid = freezeXid;
 		classform->relminmxid = minmulti;
@@ -4397,12 +4433,11 @@ BuildHardcodedDescriptor(int natts, const FormData_pg_attribute *attrs)
 	for (i = 0; i < natts; i++)
 	{
 		memcpy(TupleDescAttr(result, i), &attrs[i], ATTRIBUTE_FIXED_PART_SIZE);
-		/* make sure attcacheoff is valid */
-		TupleDescAttr(result, i)->attcacheoff = -1;
+
+		populate_compact_attribute(result, i);
 	}
 
-	/* initialize first attribute's attcacheoff, cf RelationBuildTupleDesc */
-	TupleDescAttr(result, 0)->attcacheoff = 0;
+	TupleDescFinalize(result);
 
 	/* Note: we don't bother to set up a TupleConstr entry */
 
@@ -4536,13 +4571,14 @@ AttrDefaultCmp(const void *a, const void *b)
 }
 
 /*
- * Load any check constraints for the relation.
+ * Load any check constraints for the relation, and update not-null validity
+ * of invalid constraints.
  *
  * As with defaults, if we don't find the expected number of them, just warn
  * here.  The executor should throw an error if an INSERT/UPDATE is attempted.
  */
 static void
-CheckConstraintFetch(Relation relation)
+CheckNNConstraintFetch(Relation relation)
 {
 	ConstrCheck *check;
 	int			ncheck = relation->rd_rel->relchecks;
@@ -4552,10 +4588,13 @@ CheckConstraintFetch(Relation relation)
 	HeapTuple	htup;
 	int			found = 0;
 
-	/* Allocate array with room for as many entries as expected */
-	check = (ConstrCheck *)
-		MemoryContextAllocZero(CacheMemoryContext,
-							   ncheck * sizeof(ConstrCheck));
+	/* Allocate array with room for as many entries as expected, if needed */
+	if (ncheck > 0)
+		check = (ConstrCheck *)
+			MemoryContextAllocZero(CacheMemoryContext,
+								   ncheck * sizeof(ConstrCheck));
+	else
+		check = NULL;
 
 	/* Search pg_constraint for relevant entries */
 	ScanKeyInit(&skey[0],
@@ -4573,7 +4612,31 @@ CheckConstraintFetch(Relation relation)
 		Datum		val;
 		bool		isnull;
 
-		/* We want check constraints only */
+		/*
+		 * If this is a not-null constraint, then only look at it if it's
+		 * invalid, and if so, mark the TupleDesc entry as known invalid.
+		 * Otherwise move on.  We'll mark any remaining columns that are still
+		 * in UNKNOWN state as known valid later.  This allows us not to have
+		 * to extract the attnum from this constraint tuple in the vast
+		 * majority of cases.
+		 */
+		if (conform->contype == CONSTRAINT_NOTNULL)
+		{
+			if (!conform->convalidated)
+			{
+				AttrNumber	attnum;
+
+				attnum = extractNotNullColumn(htup);
+				Assert(relation->rd_att->compact_attrs[attnum - 1].attnullability ==
+					   ATTNULLABLE_UNKNOWN);
+				relation->rd_att->compact_attrs[attnum - 1].attnullability =
+					ATTNULLABLE_INVALID;
+			}
+
+			continue;
+		}
+
+		/* For what follows, consider check constraints only */
 		if (conform->contype != CONSTRAINT_CHECK)
 			continue;
 
@@ -4584,11 +4647,6 @@ CheckConstraintFetch(Relation relation)
 				 RelationGetRelationName(relation));
 			break;
 		}
-
-		check[found].ccvalid = conform->convalidated;
-		check[found].ccnoinherit = conform->connoinherit;
-		check[found].ccname = MemoryContextStrdup(CacheMemoryContext,
-												  NameStr(conform->conname));
 
 		/* Grab and test conbin is actually set */
 		val = fastgetattr(htup,
@@ -4602,7 +4660,13 @@ CheckConstraintFetch(Relation relation)
 			/* detoast and convert to cstring in caller's context */
 			char	   *s = TextDatumGetCString(val);
 
+			check[found].ccenforced = conform->conenforced;
+			check[found].ccvalid = conform->convalidated;
+			check[found].ccnoinherit = conform->connoinherit;
+			check[found].ccname = MemoryContextStrdup(CacheMemoryContext,
+													  NameStr(conform->conname));
 			check[found].ccbin = MemoryContextStrdup(CacheMemoryContext, s);
+
 			pfree(s);
 			found++;
 		}
@@ -4668,11 +4732,6 @@ RelationGetFKeyList(Relation relation)
 	if (relation->rd_fkeyvalid)
 		return relation->rd_fkeylist;
 
-	/* Fast path: non-partitioned tables without triggers can't have FKs */
-	if (!relation->rd_rel->relhastriggers &&
-		relation->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
-		return NIL;
-
 	/*
 	 * We build the list we intend to return (in the caller's context) while
 	 * doing the scan.  After successfully completing the scan, we copy that
@@ -4704,6 +4763,7 @@ RelationGetFKeyList(Relation relation)
 		info->conoid = constraint->oid;
 		info->conrelid = constraint->conrelid;
 		info->confrelid = constraint->confrelid;
+		info->conenforced = constraint->conenforced;
 
 		DeconstructFkConstraintRow(htup, &info->nkeys,
 								   info->conkey,
@@ -5573,7 +5633,7 @@ RelationGetIdentityKeyBitmap(Relation relation)
  * This should be called only for an index that is known to have an associated
  * exclusion constraint or primary key/unique constraint using WITHOUT
  * OVERLAPS.
-
+ *
  * It returns arrays (palloc'd in caller's context) of the exclusion operator
  * OIDs, their underlying functions' OIDs, and their strategy numbers in the
  * index's opclasses.  We cache all this information since it requires a fair
@@ -5600,9 +5660,9 @@ RelationGetExclusionInfo(Relation indexRelation,
 	indnkeyatts = IndexRelationGetNumberOfKeyAttributes(indexRelation);
 
 	/* Allocate result space in caller context */
-	*operators = ops = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
-	*procs = funcs = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
-	*strategies = strats = (uint16 *) palloc(sizeof(uint16) * indnkeyatts);
+	*operators = ops = palloc_array(Oid, indnkeyatts);
+	*procs = funcs = palloc_array(Oid, indnkeyatts);
+	*strategies = strats = palloc_array(uint16, indnkeyatts);
 
 	/* Quick exit if we have the data cached already */
 	if (indexRelation->rd_exclstrats != NULL)
@@ -5693,9 +5753,9 @@ RelationGetExclusionInfo(Relation indexRelation,
 
 	/* Save a copy of the results in the relcache entry. */
 	oldcxt = MemoryContextSwitchTo(indexRelation->rd_indexcxt);
-	indexRelation->rd_exclops = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
-	indexRelation->rd_exclprocs = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
-	indexRelation->rd_exclstrats = (uint16 *) palloc(sizeof(uint16) * indnkeyatts);
+	indexRelation->rd_exclops = palloc_array(Oid, indnkeyatts);
+	indexRelation->rd_exclprocs = palloc_array(Oid, indnkeyatts);
+	indexRelation->rd_exclstrats = palloc_array(uint16, indnkeyatts);
 	memcpy(indexRelation->rd_exclops, ops, sizeof(Oid) * indnkeyatts);
 	memcpy(indexRelation->rd_exclprocs, funcs, sizeof(Oid) * indnkeyatts);
 	memcpy(indexRelation->rd_exclstrats, strats, sizeof(uint16) * indnkeyatts);
@@ -5723,7 +5783,9 @@ RelationGetExclusionInfo(Relation indexRelation,
 void
 RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 {
-	List	   *puboids;
+	List	   *puboids = NIL;
+	List	   *exceptpuboids = NIL;
+	List	   *alltablespuboids;
 	ListCell   *lc;
 	MemoryContext oldcxt;
 	Oid			schemaid;
@@ -5761,28 +5823,49 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 	pubdesc->gencols_valid_for_delete = true;
 
 	/* Fetch the publication membership info. */
-	puboids = GetRelationPublications(relid);
+	puboids = GetRelationIncludedPublications(relid);
 	schemaid = RelationGetNamespace(relation);
 	puboids = list_concat_unique_oid(puboids, GetSchemaPublications(schemaid));
 
 	if (relation->rd_rel->relispartition)
 	{
+		Oid			last_ancestor_relid;
+
 		/* Add publications that the ancestors are in too. */
 		ancestors = get_partition_ancestors(relid);
+		last_ancestor_relid = llast_oid(ancestors);
 
 		foreach(lc, ancestors)
 		{
 			Oid			ancestor = lfirst_oid(lc);
 
 			puboids = list_concat_unique_oid(puboids,
-											 GetRelationPublications(ancestor));
+											 GetRelationIncludedPublications(ancestor));
 			schemaid = get_rel_namespace(ancestor);
 			puboids = list_concat_unique_oid(puboids,
 											 GetSchemaPublications(schemaid));
 		}
-	}
-	puboids = list_concat_unique_oid(puboids, GetAllTablesPublications());
 
+		/*
+		 * Only the top-most ancestor can appear in the EXCEPT clause.
+		 * Therefore, for a partition, exclusion must be evaluated at the
+		 * top-most ancestor.
+		 */
+		exceptpuboids = GetRelationExcludedPublications(last_ancestor_relid);
+	}
+	else
+	{
+		/*
+		 * For a regular table or a root partitioned table, check exclusion on
+		 * table itself.
+		 */
+		exceptpuboids = GetRelationExcludedPublications(relid);
+	}
+
+	alltablespuboids = GetAllTablesPublications();
+	puboids = list_concat_unique_oid(puboids,
+									 list_difference_oid(alltablespuboids,
+														 exceptpuboids));
 	foreach(lc, puboids)
 	{
 		Oid			pubid = lfirst_oid(lc);
@@ -5889,7 +5972,7 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 
 	/* Now save copy of the descriptor in the relcache entry. */
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
-	relation->rd_pubdesc = palloc(sizeof(PublicationDesc));
+	relation->rd_pubdesc = palloc_object(PublicationDesc);
 	memcpy(relation->rd_pubdesc, pubdesc, sizeof(PublicationDesc));
 	MemoryContextSwitchTo(oldcxt);
 }
@@ -5897,7 +5980,7 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 static bytea **
 CopyIndexAttOptions(bytea **srcopts, int natts)
 {
-	bytea	  **opts = palloc(sizeof(*opts) * natts);
+	bytea	  **opts = palloc_array(bytea *, natts);
 
 	for (int i = 0; i < natts; i++)
 	{
@@ -5929,7 +6012,7 @@ RelationGetIndexAttOptions(Relation relation, bool copy)
 		return copy ? CopyIndexAttOptions(opts, natts) : opts;
 
 	/* Get and parse opclass options. */
-	opts = palloc0(sizeof(*opts) * natts);
+	opts = palloc0_array(bytea *, natts);
 
 	for (i = 0; i < natts; i++)
 	{
@@ -6199,7 +6282,11 @@ load_relcache_init_file(bool shared)
 				goto read_failed;
 
 			has_not_null |= attr->attnotnull;
+
+			populate_compact_attribute(rel->rd_att, i);
 		}
+
+		TupleDescFinalize(rel->rd_att);
 
 		/* next read the access method specific field */
 		if (fread(&len, 1, sizeof(len), fp) != sizeof(len))
@@ -6220,7 +6307,7 @@ load_relcache_init_file(bool shared)
 		/* mark not-null status */
 		if (has_not_null)
 		{
-			TupleConstr *constr = (TupleConstr *) palloc0(sizeof(TupleConstr));
+			TupleConstr *constr = palloc0_object(TupleConstr);
 
 			constr->has_not_null = true;
 			rel->rd_att->constr = constr;
@@ -6919,5 +7006,5 @@ ResOwnerReleaseRelation(Datum res)
 	Assert(rel->rd_refcnt > 0);
 	rel->rd_refcnt -= 1;
 
-	RelationCloseCleanup((Relation) res);
+	RelationCloseCleanup((Relation) DatumGetPointer(res));
 }

@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -213,7 +213,7 @@ my $nthreads = 2;
 
 {
 	my ($stderr);
-	run_log([ 'pgbench', '-j', '2', '--bad-option' ], '2>', \$stderr);
+	run_log([ 'pgbench', '--jobs' => '2', '--bad-option' ], '2>' => \$stderr);
 	$nthreads = 1 if $stderr =~ m/threads are not supported on this platform/;
 }
 
@@ -668,6 +668,56 @@ SELECT :v0, :v1, :v2, :v3;
 }
 	});
 
+# test nested \if constructs
+$node->pgbench(
+	'--no-vacuum --client=1 --exit-on-abort --transactions=1',
+	0,
+	[qr{actually processed}],
+	[qr{^$}],
+	'nested ifs',
+	{
+		'pgbench_nested_if' => q(
+			\if false
+				SELECT 1 / 0;
+				\if true
+					SELECT 1 / 0;
+				\elif true
+					SELECT 1 / 0;
+				\else
+					SELECT 1 / 0;
+				\endif
+				SELECT 1 / 0;
+			\elif false
+				\if true
+					SELECT 1 / 0;
+				\elif true
+					SELECT 1 / 0;
+				\else
+					SELECT 1 / 0;
+				\endif
+			\else
+				\if false
+					SELECT 1 / 0;
+				\elif false
+					SELECT 1 / 0;
+				\else
+					SELECT 'correct';
+				\endif
+			\endif
+			\if true
+				SELECT 'correct';
+			\else
+				\if true
+					SELECT 1 / 0;
+				\elif true
+					SELECT 1 / 0;
+				\else
+					SELECT 1 / 0;
+				\endif
+			\endif
+		)
+	});
+
 # random determinism when seeded
 $node->safe_psql('postgres',
 	'CREATE UNLOGGED TABLE seeded_random(seed INT8 NOT NULL, rand TEXT NOT NULL, val INTEGER NOT NULL);'
@@ -703,15 +753,23 @@ my ($ret, $out, $err) = $node->psql('postgres',
 	'SELECT seed, rand, val, COUNT(*) FROM seeded_random GROUP BY seed, rand, val'
 );
 
-ok($ret == 0, "psql seeded_random count ok");
-ok($err eq '', "psql seeded_random count stderr is empty");
-ok($out =~ /\b$seed\|uniform\|1\d\d\d\|2/,
+is($ret, 0, "psql seeded_random count ok");
+is($err, '', "psql seeded_random count stderr is empty");
+like(
+	$out,
+	qr/\b$seed\|uniform\|1\d\d\d\|2/,
 	"psql seeded_random count uniform");
-ok( $out =~ /\b$seed\|exponential\|2\d\d\d\|2/,
+like(
+	$out,
+	qr/\b$seed\|exponential\|2\d\d\d\|2/,
 	"psql seeded_random count exponential");
-ok( $out =~ /\b$seed\|gaussian\|3\d\d\d\|2/,
+like(
+	$out,
+	qr/\b$seed\|gaussian\|3\d\d\d\|2/,
 	"psql seeded_random count gaussian");
-ok($out =~ /\b$seed\|zipfian\|4\d\d\d\|2/,
+like(
+	$out,
+	qr/\b$seed\|zipfian\|4\d\d\d\|2/,
 	"psql seeded_random count zipfian");
 
 $node->safe_psql('postgres', 'DROP TABLE seeded_random;');
@@ -1471,8 +1529,9 @@ sub check_pgbench_logs
 
 	# $prefix is simple enough, thus does not need escaping
 	my @logs = list_files($dir, qr{^$prefix\..*$});
-	ok(@logs == $nb, "number of log files");
-	ok(grep(/\/$prefix\.\d+(\.\d+)?$/, @logs) == $nb, "file name format");
+	is(scalar(@logs), $nb, "number of log files");
+	is(scalar(grep(/\/$prefix\.\d+(\.\d+)?$/, @logs)),
+		$nb, "file name format");
 
 	my $log_number = 0;
 	for my $log (sort @logs)
@@ -1482,10 +1541,12 @@ sub check_pgbench_logs
 
 		my @contents = split(/\n/, $contents_raw);
 		my $clen = @contents;
-		ok( $min <= $clen && $clen <= $max,
-			"transaction count for $log ($clen)");
+		cmp_ok($clen, '>=', $min,
+			"transaction count for $log ($clen) is above min");
+		cmp_ok($clen, '<=', $max,
+			"transaction count for $log ($clen) is below max");
 		my $clen_match = grep(/$re/, @contents);
-		ok($clen_match == $clen, "transaction format for $prefix");
+		is($clen_match, $clen, "transaction format for $prefix");
 
 		# Show more information if some logs don't match
 		# to help with debugging.
@@ -1760,8 +1821,41 @@ update counter set i = i+1 returning i \gset
 }
 	});
 
+# Test copy in pgbench
+$node->pgbench(
+	'-t 10',
+	2,
+	[],
+	[ qr{COPY is not supported in pgbench, aborting} ],
+	'Test copy in script',
+	{
+		'001_copy' => q{ COPY pgbench_accounts FROM stdin }
+	});
+
 # Clean up
 $node->safe_psql('postgres', 'DROP TABLE counter;');
+
+# Test --continue-on-error
+$node->safe_psql('postgres',
+	'CREATE TABLE unique_table(i int unique);');
+
+$node->pgbench(
+	'-n -t 10 --continue-on-error --failures-detailed',
+	0,
+	[
+		qr{processed: 1/10\b},
+		qr{other failures: 9\b}
+	],
+	[],
+	'test --continue-on-error',
+	{
+		'001_continue_on_error' => q{
+		INSERT INTO unique_table VALUES(0);
+		}
+	});
+
+# Clean up
+$node->safe_psql('postgres', 'DROP TABLE unique_table;');
 
 # done
 $node->safe_psql('postgres', 'DROP TABLESPACE regress_pgbench_tap_1_ts');

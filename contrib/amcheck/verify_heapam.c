@@ -3,7 +3,7 @@
  * verify_heapam.c
  *	  Functions to check postgresql heap relations for corruption
  *
- * Copyright (c) 2016-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  *	  contrib/amcheck/verify_heapam.c
  *-------------------------------------------------------------------------
@@ -25,9 +25,11 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
+#include "storage/read_stream.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
+#include "utils/tuplestore.h"
 
 PG_FUNCTION_INFO_V1(verify_heapam);
 
@@ -72,7 +74,7 @@ typedef enum SkipPages
  */
 typedef struct ToastedAttribute
 {
-	struct varatt_external toast_pointer;
+	varatt_external toast_pointer;
 	BlockNumber blkno;			/* block in main table */
 	OffsetNumber offnum;		/* offset in main table */
 	AttrNumber	attnum;			/* attribute in main table */
@@ -118,7 +120,10 @@ typedef struct HeapCheckContext
 	Relation	valid_toast_index;
 	int			num_toast_indexes;
 
-	/* Values for iterating over pages in the relation */
+	/*
+	 * Values for iterating over pages in the relation. `blkno` is the most
+	 * recent block in the buffer yielded by the read stream API.
+	 */
 	BlockNumber blkno;
 	BufferAccessStrategy bstrategy;
 	Buffer		buffer;
@@ -153,7 +158,32 @@ typedef struct HeapCheckContext
 	Tuplestorestate *tupstore;
 } HeapCheckContext;
 
+/*
+ * The per-relation data provided to the read stream API for heap amcheck to
+ * use in its callback for the SKIP_PAGES_ALL_FROZEN and
+ * SKIP_PAGES_ALL_VISIBLE options.
+ */
+typedef struct HeapCheckReadStreamData
+{
+	/*
+	 * `range` is used by all SkipPages options. SKIP_PAGES_NONE uses the
+	 * default read stream callback, block_range_read_stream_cb(), which takes
+	 * a BlockRangeReadStreamPrivate as its callback_private_data. `range`
+	 * keeps track of the current block number across
+	 * read_stream_next_buffer() invocations.
+	 */
+	BlockRangeReadStreamPrivate range;
+	SkipPages	skip_option;
+	Relation	rel;
+	Buffer	   *vmbuffer;
+} HeapCheckReadStreamData;
+
+
 /* Internal implementation */
+static BlockNumber heapcheck_read_stream_next_unskippable(ReadStream *stream,
+														  void *callback_private_data,
+														  void *per_buffer_data);
+
 static void check_tuple(HeapCheckContext *ctx,
 						bool *xmin_commit_status_ok,
 						XidCommitStatus *xmin_commit_status);
@@ -231,6 +261,11 @@ verify_heapam(PG_FUNCTION_ARGS)
 	BlockNumber last_block;
 	BlockNumber nblocks;
 	const char *skip;
+	ReadStream *stream;
+	int			stream_flags;
+	ReadStreamBlockNumberCB stream_cb;
+	void	   *stream_data;
+	HeapCheckReadStreamData stream_skip_data;
 
 	/* Check supplied arguments */
 	if (PG_ARGISNULL(0))
@@ -404,7 +439,46 @@ verify_heapam(PG_FUNCTION_ARGS)
 	if (TransactionIdIsNormal(ctx.relfrozenxid))
 		ctx.oldest_xid = ctx.relfrozenxid;
 
-	for (ctx.blkno = first_block; ctx.blkno <= last_block; ctx.blkno++)
+	/* Now that `ctx` is set up, set up the read stream */
+	stream_skip_data.range.current_blocknum = first_block;
+	stream_skip_data.range.last_exclusive = last_block + 1;
+	stream_skip_data.skip_option = skip_option;
+	stream_skip_data.rel = ctx.rel;
+	stream_skip_data.vmbuffer = &vmbuffer;
+
+	if (skip_option == SKIP_PAGES_NONE)
+	{
+		/*
+		 * It is safe to use batchmode as block_range_read_stream_cb takes no
+		 * locks.
+		 */
+		stream_cb = block_range_read_stream_cb;
+		stream_flags = READ_STREAM_SEQUENTIAL |
+			READ_STREAM_FULL |
+			READ_STREAM_USE_BATCHING;
+		stream_data = &stream_skip_data.range;
+	}
+	else
+	{
+		/*
+		 * It would not be safe to naively use batchmode, as
+		 * heapcheck_read_stream_next_unskippable takes locks. It shouldn't be
+		 * too hard to convert though.
+		 */
+		stream_cb = heapcheck_read_stream_next_unskippable;
+		stream_flags = READ_STREAM_DEFAULT;
+		stream_data = &stream_skip_data;
+	}
+
+	stream = read_stream_begin_relation(stream_flags,
+										ctx.bstrategy,
+										ctx.rel,
+										MAIN_FORKNUM,
+										stream_cb,
+										stream_data,
+										0);
+
+	while ((ctx.buffer = read_stream_next_buffer(stream, NULL)) != InvalidBuffer)
 	{
 		OffsetNumber maxoff;
 		OffsetNumber predecessor[MaxOffsetNumber];
@@ -417,30 +491,11 @@ verify_heapam(PG_FUNCTION_ARGS)
 
 		memset(predecessor, 0, sizeof(OffsetNumber) * MaxOffsetNumber);
 
-		/* Optionally skip over all-frozen or all-visible blocks */
-		if (skip_option != SKIP_PAGES_NONE)
-		{
-			int32		mapbits;
-
-			mapbits = (int32) visibilitymap_get_status(ctx.rel, ctx.blkno,
-													   &vmbuffer);
-			if (skip_option == SKIP_PAGES_ALL_FROZEN)
-			{
-				if ((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0)
-					continue;
-			}
-
-			if (skip_option == SKIP_PAGES_ALL_VISIBLE)
-			{
-				if ((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0)
-					continue;
-			}
-		}
-
-		/* Read and lock the next page. */
-		ctx.buffer = ReadBufferExtended(ctx.rel, MAIN_FORKNUM, ctx.blkno,
-										RBM_NORMAL, ctx.bstrategy);
+		/* Lock the next page. */
+		Assert(BufferIsValid(ctx.buffer));
 		LockBuffer(ctx.buffer, BUFFER_LOCK_SHARE);
+
+		ctx.blkno = BufferGetBlockNumber(ctx.buffer);
 		ctx.page = BufferGetPage(ctx.buffer);
 
 		/* Perform tuple checks */
@@ -472,17 +527,17 @@ verify_heapam(PG_FUNCTION_ARGS)
 				if (rdoffnum < FirstOffsetNumber)
 				{
 					report_corruption(&ctx,
-									  psprintf("line pointer redirection to item at offset %u precedes minimum offset %u",
-											   (unsigned) rdoffnum,
-											   (unsigned) FirstOffsetNumber));
+									  psprintf("line pointer redirection to item at offset %d precedes minimum offset %d",
+											   rdoffnum,
+											   FirstOffsetNumber));
 					continue;
 				}
 				if (rdoffnum > maxoff)
 				{
 					report_corruption(&ctx,
-									  psprintf("line pointer redirection to item at offset %u exceeds maximum offset %u",
-											   (unsigned) rdoffnum,
-											   (unsigned) maxoff));
+									  psprintf("line pointer redirection to item at offset %d exceeds maximum offset %d",
+											   rdoffnum,
+											   maxoff));
 					continue;
 				}
 
@@ -496,22 +551,22 @@ verify_heapam(PG_FUNCTION_ARGS)
 				if (!ItemIdIsUsed(rditem))
 				{
 					report_corruption(&ctx,
-									  psprintf("redirected line pointer points to an unused item at offset %u",
-											   (unsigned) rdoffnum));
+									  psprintf("redirected line pointer points to an unused item at offset %d",
+											   rdoffnum));
 					continue;
 				}
 				else if (ItemIdIsDead(rditem))
 				{
 					report_corruption(&ctx,
-									  psprintf("redirected line pointer points to a dead item at offset %u",
-											   (unsigned) rdoffnum));
+									  psprintf("redirected line pointer points to a dead item at offset %d",
+											   rdoffnum));
 					continue;
 				}
 				else if (ItemIdIsRedirected(rditem))
 				{
 					report_corruption(&ctx,
-									  psprintf("redirected line pointer points to another redirected line pointer at offset %u",
-											   (unsigned) rdoffnum));
+									  psprintf("redirected line pointer points to another redirected line pointer at offset %d",
+											   rdoffnum));
 					continue;
 				}
 
@@ -547,10 +602,10 @@ verify_heapam(PG_FUNCTION_ARGS)
 			if (ctx.lp_off + ctx.lp_len > BLCKSZ)
 			{
 				report_corruption(&ctx,
-								  psprintf("line pointer to page offset %u with length %u ends beyond maximum page offset %u",
+								  psprintf("line pointer to page offset %u with length %u ends beyond maximum page offset %d",
 										   ctx.lp_off,
 										   ctx.lp_len,
-										   (unsigned) BLCKSZ));
+										   BLCKSZ));
 				continue;
 			}
 
@@ -624,16 +679,16 @@ verify_heapam(PG_FUNCTION_ARGS)
 				if (!HeapTupleHeaderIsHeapOnly(next_htup))
 				{
 					report_corruption(&ctx,
-									  psprintf("redirected line pointer points to a non-heap-only tuple at offset %u",
-											   (unsigned) nextoffnum));
+									  psprintf("redirected line pointer points to a non-heap-only tuple at offset %d",
+											   nextoffnum));
 				}
 
 				/* HOT chains should not intersect. */
 				if (predecessor[nextoffnum] != InvalidOffsetNumber)
 				{
 					report_corruption(&ctx,
-									  psprintf("redirect line pointer points to offset %u, but offset %u also points there",
-											   (unsigned) nextoffnum, (unsigned) predecessor[nextoffnum]));
+									  psprintf("redirect line pointer points to offset %d, but offset %d also points there",
+											   nextoffnum, predecessor[nextoffnum]));
 					continue;
 				}
 
@@ -665,8 +720,8 @@ verify_heapam(PG_FUNCTION_ARGS)
 			if (predecessor[nextoffnum] != InvalidOffsetNumber)
 			{
 				report_corruption(&ctx,
-								  psprintf("tuple points to new version at offset %u, but offset %u also points there",
-										   (unsigned) nextoffnum, (unsigned) predecessor[nextoffnum]));
+								  psprintf("tuple points to new version at offset %d, but offset %d also points there",
+										   nextoffnum, predecessor[nextoffnum]));
 				continue;
 			}
 
@@ -689,15 +744,15 @@ verify_heapam(PG_FUNCTION_ARGS)
 				HeapTupleHeaderIsHeapOnly(next_htup))
 			{
 				report_corruption(&ctx,
-								  psprintf("non-heap-only update produced a heap-only tuple at offset %u",
-										   (unsigned) nextoffnum));
+								  psprintf("non-heap-only update produced a heap-only tuple at offset %d",
+										   nextoffnum));
 			}
 			if ((curr_htup->t_infomask2 & HEAP_HOT_UPDATED) &&
 				!HeapTupleHeaderIsHeapOnly(next_htup))
 			{
 				report_corruption(&ctx,
-								  psprintf("heap-only update produced a non-heap only tuple at offset %u",
-										   (unsigned) nextoffnum));
+								  psprintf("heap-only update produced a non-heap only tuple at offset %d",
+										   nextoffnum));
 			}
 
 			/*
@@ -718,10 +773,10 @@ verify_heapam(PG_FUNCTION_ARGS)
 				TransactionIdIsInProgress(curr_xmin))
 			{
 				report_corruption(&ctx,
-								  psprintf("tuple with in-progress xmin %u was updated to produce a tuple at offset %u with committed xmin %u",
-										   (unsigned) curr_xmin,
-										   (unsigned) ctx.offnum,
-										   (unsigned) next_xmin));
+								  psprintf("tuple with in-progress xmin %u was updated to produce a tuple at offset %d with committed xmin %u",
+										   curr_xmin,
+										   ctx.offnum,
+										   next_xmin));
 			}
 
 			/*
@@ -734,16 +789,16 @@ verify_heapam(PG_FUNCTION_ARGS)
 			{
 				if (xmin_commit_status[nextoffnum] == XID_IN_PROGRESS)
 					report_corruption(&ctx,
-									  psprintf("tuple with aborted xmin %u was updated to produce a tuple at offset %u with in-progress xmin %u",
-											   (unsigned) curr_xmin,
-											   (unsigned) ctx.offnum,
-											   (unsigned) next_xmin));
+									  psprintf("tuple with aborted xmin %u was updated to produce a tuple at offset %d with in-progress xmin %u",
+											   curr_xmin,
+											   ctx.offnum,
+											   next_xmin));
 				else if (xmin_commit_status[nextoffnum] == XID_COMMITTED)
 					report_corruption(&ctx,
-									  psprintf("tuple with aborted xmin %u was updated to produce a tuple at offset %u with committed xmin %u",
-											   (unsigned) curr_xmin,
-											   (unsigned) ctx.offnum,
-											   (unsigned) next_xmin));
+									  psprintf("tuple with aborted xmin %u was updated to produce a tuple at offset %d with committed xmin %u",
+											   curr_xmin,
+											   ctx.offnum,
+											   next_xmin));
 			}
 		}
 
@@ -799,6 +854,8 @@ verify_heapam(PG_FUNCTION_ARGS)
 			break;
 	}
 
+	read_stream_end(stream);
+
 	if (vmbuffer != InvalidBuffer)
 		ReleaseBuffer(vmbuffer);
 
@@ -813,6 +870,42 @@ verify_heapam(PG_FUNCTION_ARGS)
 	relation_close(ctx.rel, AccessShareLock);
 
 	PG_RETURN_NULL();
+}
+
+/*
+ * Heap amcheck's read stream callback for getting the next unskippable block.
+ * This callback is only used when 'all-visible' or 'all-frozen' is provided
+ * as the skip option to verify_heapam(). With the default 'none',
+ * block_range_read_stream_cb() is used instead.
+ */
+static BlockNumber
+heapcheck_read_stream_next_unskippable(ReadStream *stream,
+									   void *callback_private_data,
+									   void *per_buffer_data)
+{
+	HeapCheckReadStreamData *p = callback_private_data;
+
+	/* Loops over [current_blocknum, last_exclusive) blocks */
+	for (BlockNumber i; (i = p->range.current_blocknum++) < p->range.last_exclusive;)
+	{
+		uint8		mapbits = visibilitymap_get_status(p->rel, i, p->vmbuffer);
+
+		if (p->skip_option == SKIP_PAGES_ALL_FROZEN)
+		{
+			if ((mapbits & VISIBILITYMAP_ALL_FROZEN) != 0)
+				continue;
+		}
+
+		if (p->skip_option == SKIP_PAGES_ALL_VISIBLE)
+		{
+			if ((mapbits & VISIBILITYMAP_ALL_VISIBLE) != 0)
+				continue;
+		}
+
+		return i;
+	}
+
+	return InvalidBlockNumber;
 }
 
 /*
@@ -1568,14 +1661,14 @@ static bool
 check_tuple_attribute(HeapCheckContext *ctx)
 {
 	Datum		attdatum;
-	struct varlena *attr;
+	varlena    *attr;
 	char	   *tp;				/* pointer to the tuple data */
 	uint16		infomask;
-	Form_pg_attribute thisatt;
-	struct varatt_external toast_pointer;
+	CompactAttribute *thisatt;
+	varatt_external toast_pointer;
 
 	infomask = ctx->tuphdr->t_infomask;
-	thisatt = TupleDescAttr(RelationGetDescr(ctx->rel), ctx->attnum);
+	thisatt = TupleDescCompactAttr(RelationGetDescr(ctx->rel), ctx->attnum);
 
 	tp = (char *) ctx->tuphdr + ctx->tuphdr->t_hoff;
 
@@ -1596,7 +1689,7 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	/* Skip non-varlena values, but update offset first */
 	if (thisatt->attlen != -1)
 	{
-		ctx->offset = att_align_nominal(ctx->offset, thisatt->attalign);
+		ctx->offset = att_nominal_alignby(ctx->offset, thisatt->attalignby);
 		ctx->offset = att_addlength_pointer(ctx->offset, thisatt->attlen,
 											tp + ctx->offset);
 		if (ctx->tuphdr->t_hoff + ctx->offset > ctx->lp_len)
@@ -1612,8 +1705,8 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	}
 
 	/* Ok, we're looking at a varlena attribute. */
-	ctx->offset = att_align_pointer(ctx->offset, thisatt->attalign, -1,
-									tp + ctx->offset);
+	ctx->offset = att_pointer_alignby(ctx->offset, thisatt->attalignby, -1,
+									  tp + ctx->offset);
 
 	/* Get the (possibly corrupt) varlena datum */
 	attdatum = fetchatt(thisatt, tp + ctx->offset);
@@ -1662,7 +1755,7 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	 * We go further, because we need to check if the toast datum is corrupt.
 	 */
 
-	attr = (struct varlena *) DatumGetPointer(attdatum);
+	attr = (varlena *) DatumGetPointer(attdatum);
 
 	/*
 	 * Now we follow the logic of detoast_external_attr(), with the same
@@ -1746,7 +1839,7 @@ check_tuple_attribute(HeapCheckContext *ctx)
 	{
 		ToastedAttribute *ta;
 
-		ta = (ToastedAttribute *) palloc0(sizeof(ToastedAttribute));
+		ta = palloc0_object(ToastedAttribute);
 
 		VARATT_EXTERNAL_GET_POINTER(ta->toast_pointer, attr);
 		ta->blkno = ctx->blkno;
@@ -1850,7 +1943,7 @@ check_tuple(HeapCheckContext *ctx, bool *xmin_commit_status_ok,
 	if (RelationGetDescr(ctx->rel)->natts < ctx->natts)
 	{
 		report_corruption(ctx,
-						  psprintf("number of attributes %u exceeds maximum expected for table %u",
+						  psprintf("number of attributes %u exceeds maximum %u expected for table",
 								   ctx->natts,
 								   RelationGetDescr(ctx->rel)->natts));
 		return;
@@ -1877,7 +1970,9 @@ check_tuple(HeapCheckContext *ctx, bool *xmin_commit_status_ok,
 /*
  * Convert a TransactionId into a FullTransactionId using our cached values of
  * the valid transaction ID range.  It is the caller's responsibility to have
- * already updated the cached values, if necessary.
+ * already updated the cached values, if necessary.  This is akin to
+ * FullTransactionIdFromAllowableAt(), but it tolerates corruption in the form
+ * of an xid before epoch 0.
  */
 static FullTransactionId
 FullTransactionIdFromXidAndCtx(TransactionId xid, const HeapCheckContext *ctx)

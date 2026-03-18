@@ -3,7 +3,7 @@
  * pg_crc32c_armv8.c
  *	  Compute CRC-32C checksum using ARMv8 CRC Extension instructions
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,7 +14,11 @@
  */
 #include "c.h"
 
+#ifdef _MSC_VER
+#include <intrin.h>
+#else
 #include <arm_acle.h>
+#endif
 
 #include "port/pg_crc32c.h"
 
@@ -38,32 +42,32 @@ pg_comp_crc32c_armv8(pg_crc32c crc, const void *data, size_t len)
 	if (!PointerIsAligned(p, uint32) &&
 		p + 2 <= pend)
 	{
-		crc = __crc32ch(crc, *(uint16 *) p);
+		crc = __crc32ch(crc, *(const uint16 *) p);
 		p += 2;
 	}
 	if (!PointerIsAligned(p, uint64) &&
 		p + 4 <= pend)
 	{
-		crc = __crc32cw(crc, *(uint32 *) p);
+		crc = __crc32cw(crc, *(const uint32 *) p);
 		p += 4;
 	}
 
 	/* Process eight bytes at a time, as far as we can. */
 	while (p + 8 <= pend)
 	{
-		crc = __crc32cd(crc, *(uint64 *) p);
+		crc = __crc32cd(crc, *(const uint64 *) p);
 		p += 8;
 	}
 
 	/* Process remaining 0-7 bytes. */
 	if (p + 4 <= pend)
 	{
-		crc = __crc32cw(crc, *(uint32 *) p);
+		crc = __crc32cw(crc, *(const uint32 *) p);
 		p += 4;
 	}
 	if (p + 2 <= pend)
 	{
-		crc = __crc32ch(crc, *(uint16 *) p);
+		crc = __crc32ch(crc, *(const uint16 *) p);
 		p += 2;
 	}
 	if (p < pend)

@@ -6,10 +6,10 @@
  * the whole archive to a single file, and astreamer_extractor writes
  * each archive member to a separate file in a given directory.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
- *		  src/bin/pg_basebackup/astreamer_file.c
+ *		  src/fe_utils/astreamer_file.c
  *-------------------------------------------------------------------------
  */
 
@@ -82,7 +82,7 @@ astreamer_plain_writer_new(char *pathname, FILE *file)
 {
 	astreamer_plain_writer *streamer;
 
-	streamer = palloc0(sizeof(astreamer_plain_writer));
+	streamer = palloc0_object(astreamer_plain_writer);
 	*((const astreamer_ops **) &streamer->base.bbs_ops) =
 		&astreamer_plain_writer_ops;
 
@@ -189,7 +189,7 @@ astreamer_extractor_new(const char *basepath,
 {
 	astreamer_extractor *streamer;
 
-	streamer = palloc0(sizeof(astreamer_extractor));
+	streamer = palloc0_object(astreamer_extractor);
 	*((const astreamer_ops **) &streamer->base.bbs_ops) =
 		&astreamer_extractor_ops;
 	streamer->basepath = pstrdup(basepath);

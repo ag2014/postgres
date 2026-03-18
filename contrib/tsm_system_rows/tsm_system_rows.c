@@ -17,7 +17,7 @@
  * won't visit blocks added after the first scan, but that is fine since
  * such blocks shouldn't contain any visible tuples anyway.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -34,7 +34,10 @@
 #include "optimizer/optimizer.h"
 #include "utils/sampling.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "tsm_system_rows",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(tsm_system_rows_handler);
 
@@ -160,7 +163,7 @@ system_rows_samplescangetsamplesize(PlannerInfo *root,
 static void
 system_rows_initsamplescan(SampleScanState *node, int eflags)
 {
-	node->tsm_state = palloc0(sizeof(SystemRowsSamplerData));
+	node->tsm_state = palloc0_object(SystemRowsSamplerData);
 	/* Note the above leaves tsm_state->step equal to zero */
 }
 

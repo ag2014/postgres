@@ -3,7 +3,7 @@
  * jsonapi.c
  *		JSON parser and lexer interfaces
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -1297,7 +1297,10 @@ parse_scalar(JsonLexContext *lex, const JsonSemAction *sem)
 		return result;
 	}
 
-	/* invoke the callback, which may take ownership of val */
+	/*
+	 * invoke the callback, which may take ownership of val. For string
+	 * values, val is NULL if need_escapes is false.
+	 */
 	result = (*sfunc) (sem->semstate, val, tok);
 
 	if (lex->flags & JSONLEX_CTX_OWNS_TOKENS)
@@ -1326,6 +1329,7 @@ parse_object_field(JsonLexContext *lex, const JsonSemAction *sem)
 		return report_parse_error(JSON_PARSE_STRING, lex);
 	if ((ostart != NULL || oend != NULL) && lex->need_escapes)
 	{
+		/* fname is NULL if need_escapes is false */
 		fname = STRDUP(lex->strval->data);
 		if (fname == NULL)
 			return JSON_OUT_OF_MEMORY;
@@ -1978,8 +1982,11 @@ json_lex_string(JsonLexContext *lex)
 	} while (0)
 #define FAIL_AT_CHAR_END(code) \
 	do { \
-		const char	   *term = s + pg_encoding_mblen(lex->input_encoding, s); \
-		lex->token_terminator = (term <= end) ? term : end; \
+		ptrdiff_t	remaining = end - s; \
+		int			charlen; \
+		charlen = pg_encoding_mblen_or_incomplete(lex->input_encoding, \
+												  s, remaining); \
+		lex->token_terminator = (charlen <= remaining) ? s + charlen : end; \
 		return code; \
 	} while (0)
 
@@ -2160,9 +2167,9 @@ json_lex_string(JsonLexContext *lex)
 			 * can batch calls to jsonapi_appendBinaryStringInfo.
 			 */
 			while (p < end - sizeof(Vector8) &&
-				   !pg_lfind8('\\', (uint8 *) p, sizeof(Vector8)) &&
-				   !pg_lfind8('"', (uint8 *) p, sizeof(Vector8)) &&
-				   !pg_lfind8_le(31, (uint8 *) p, sizeof(Vector8)))
+				   !pg_lfind8('\\', (const uint8 *) p, sizeof(Vector8)) &&
+				   !pg_lfind8('"', (const uint8 *) p, sizeof(Vector8)) &&
+				   !pg_lfind8_le(31, (const uint8 *) p, sizeof(Vector8)))
 				p += sizeof(Vector8);
 
 			for (; p < end; p++)

@@ -3,7 +3,7 @@
  * pg_proc.c
  *	  routines to support manipulation of the pg_proc relation
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,13 +20,13 @@
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_type.h"
-#include "commands/defrem.h"
 #include "executor/functions.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
@@ -61,6 +61,35 @@ static bool match_prosrc_to_literal(const char *prosrc, const char *literal,
 /* ----------------------------------------------------------------
  *		ProcedureCreate
  *
+ *	procedureName: string name of routine (proname)
+ *	procNamespace: OID of namespace (pronamespace)
+ *	replace: true to allow replacement of an existing pg_proc entry
+ *	returnsSet: returns set? (proretset)
+ *	returnType: OID of result type (prorettype)
+ *	proowner: OID of owner role (proowner)
+ *	languageObjectId: OID of function language (prolang)
+ *	languageValidator: OID of validator function to apply, if any
+ *	prosrc: string form of function definition (prosrc)
+ *	probin: string form of binary reference, or NULL (probin)
+ *	prosqlbody: Node tree of pre-parsed SQL body, or NULL (prosqlbody)
+ *	prokind: function/aggregate/procedure/etc code (prokind)
+ *	security_definer: security definer? (prosecdef)
+ *	isLeakProof: leak proof? (proleakproof)
+ *	isStrict: strict? (proisstrict)
+ *	volatility: volatility code (provolatile)
+ *	parallel: parallel safety code (proparallel)
+ *	parameterTypes: input parameter types, as an oidvector (proargtypes)
+ *	allParameterTypes: all parameter types, as an OID array (proallargtypes)
+ *	parameterModes: parameter modes, as a "char" array (proargmodes)
+ *	parameterNames: parameter names, as a text array (proargnames)
+ *	parameterDefaults: defaults, as a List of Node trees (proargdefaults)
+ *	trftypes: transformable type OIDs, as an OID array (protrftypes)
+ *	trfoids: List of transform OIDs that routine should depend on
+ *	proconfig: GUC set clauses, as a text array (proconfig)
+ *	prosupport: OID of support function, if any (prosupport)
+ *	procost: cost factor (procost)
+ *	prorows: estimated output rows for a SRF (prorows)
+ *
  * Note: allParameterTypes, parameterModes, parameterNames, trftypes, and proconfig
  * are either arrays of the proper types or NULL.  We declare them Datum,
  * not "ArrayType *", to avoid importing array.h into pg_proc.h.
@@ -90,6 +119,7 @@ ProcedureCreate(const char *procedureName,
 				Datum parameterNames,
 				List *parameterDefaults,
 				Datum trftypes,
+				List *trfoids,
 				Datum proconfig,
 				Oid prosupport,
 				float4 procost,
@@ -112,16 +142,16 @@ ProcedureCreate(const char *procedureName,
 	TupleDesc	tupDesc;
 	bool		is_update;
 	ObjectAddress myself,
-				referenced;
+				referenced,
+				temp_object;
 	char	   *detailmsg;
 	int			i;
-	Oid			trfid;
 	ObjectAddresses *addrs;
 
 	/*
 	 * sanity checks
 	 */
-	Assert(PointerIsValid(prosrc));
+	Assert(prosrc);
 
 	parameterCount = parameterTypes->dim1;
 	if (parameterCount < 0 || parameterCount > FUNC_MAX_ARGS)
@@ -609,25 +639,18 @@ ProcedureCreate(const char *procedureName,
 	ObjectAddressSet(referenced, TypeRelationId, returnType);
 	add_exact_object_address(&referenced, addrs);
 
-	/* dependency on transform used by return type, if any */
-	if ((trfid = get_transform_oid(returnType, languageObjectId, true)))
-	{
-		ObjectAddressSet(referenced, TransformRelationId, trfid);
-		add_exact_object_address(&referenced, addrs);
-	}
-
 	/* dependency on parameter types */
 	for (i = 0; i < allParamCount; i++)
 	{
 		ObjectAddressSet(referenced, TypeRelationId, allParams[i]);
 		add_exact_object_address(&referenced, addrs);
+	}
 
-		/* dependency on transform used by parameter type, if any */
-		if ((trfid = get_transform_oid(allParams[i], languageObjectId, true)))
-		{
-			ObjectAddressSet(referenced, TransformRelationId, trfid);
-			add_exact_object_address(&referenced, addrs);
-		}
+	/* dependency on transforms, if any */
+	foreach_oid(transformid, trfoids)
+	{
+		ObjectAddressSet(referenced, TransformRelationId, transformid);
+		add_exact_object_address(&referenced, addrs);
 	}
 
 	/* dependency on support function, if any */
@@ -637,17 +660,40 @@ ProcedureCreate(const char *procedureName,
 		add_exact_object_address(&referenced, addrs);
 	}
 
-	record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
-	free_object_addresses(addrs);
-
-	/* dependency on SQL routine body */
+	/* dependencies appearing in new-style SQL routine body */
 	if (languageObjectId == SQLlanguageId && prosqlbody)
-		recordDependencyOnExpr(&myself, prosqlbody, NIL, DEPENDENCY_NORMAL);
+		collectDependenciesOfExpr(addrs, prosqlbody, NIL);
 
 	/* dependency on parameter default expressions */
 	if (parameterDefaults)
-		recordDependencyOnExpr(&myself, (Node *) parameterDefaults,
-							   NIL, DEPENDENCY_NORMAL);
+		collectDependenciesOfExpr(addrs, (Node *) parameterDefaults, NIL);
+
+	/*
+	 * Now that we have all the normal dependencies, thumb through them and
+	 * warn if any are to temporary objects.  This informs the user if their
+	 * supposedly non-temp function will silently go away at session exit, due
+	 * to a dependency on a temp object.  However, do not complain when a
+	 * function created in our own pg_temp namespace refers to other objects
+	 * in that namespace, since then they'll have similar lifespans anyway.
+	 */
+	if (find_temp_object(addrs, isTempNamespace(procNamespace), &temp_object))
+		ereport(NOTICE,
+				(errmsg("function \"%s\" will be effectively temporary",
+						procedureName),
+				 errdetail("It depends on temporary %s.",
+						   getObjectDescription(&temp_object, false))));
+
+	/*
+	 * Now record all normal dependencies at once.  This will also remove any
+	 * duplicates in the list.  (Role and extension dependencies are handled
+	 * separately below.  Role dependencies would have to be separate anyway
+	 * since they are shared dependencies.  An extension dependency could be
+	 * folded into the addrs list, but pg_depend.c doesn't make that easy, and
+	 * it won't duplicate anything we've collected so far anyway.)
+	 */
+	record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
+
+	free_object_addresses(addrs);
 
 	/* dependency on owner */
 	if (!is_update)
@@ -960,7 +1006,7 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 			(void) check_sql_fn_retval(querytree_list,
 									   rettype, rettupdesc,
 									   proc->prokind,
-									   false, NULL);
+									   false);
 		}
 
 		error_context_stack = sqlerrcontext.previous;
@@ -1160,7 +1206,7 @@ match_prosrc_to_literal(const char *prosrc, const char *literal,
 			if (cursorpos > 0)
 				newcp++;
 		}
-		chlen = pg_mblen(prosrc);
+		chlen = pg_mblen_cstr(prosrc);
 		if (strncmp(prosrc, literal, chlen) != 0)
 			goto fail;
 		prosrc += chlen;
@@ -1191,6 +1237,6 @@ oid_array_to_list(Datum datum)
 
 	deconstruct_array_builtin(array, OIDOID, &values, NULL, &nelems);
 	for (i = 0; i < nelems; i++)
-		result = lappend_oid(result, values[i]);
+		result = lappend_oid(result, DatumGetObjectId(values[i]));
 	return result;
 }

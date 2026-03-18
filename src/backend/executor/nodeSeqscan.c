@@ -3,7 +3,7 @@
  * nodeSeqscan.c
  *	  Support routines for sequential scans of relations.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -29,6 +29,7 @@
 
 #include "access/relscan.h"
 #include "access/tableam.h"
+#include "executor/execScan.h"
 #include "executor/executor.h"
 #include "executor/nodeSeqscan.h"
 #include "utils/rel.h"
@@ -46,7 +47,7 @@ static TupleTableSlot *SeqNext(SeqScanState *node);
  *		This is a workhorse for ExecSeqScan
  * ----------------------------------------------------------------
  */
-static TupleTableSlot *
+static pg_attribute_always_inline TupleTableSlot *
 SeqNext(SeqScanState *node)
 {
 	TableScanDesc scandesc;
@@ -85,7 +86,7 @@ SeqNext(SeqScanState *node)
 /*
  * SeqRecheck -- access method routine to recheck a tuple in EvalPlanQual
  */
-static bool
+static pg_attribute_always_inline bool
 SeqRecheck(SeqScanState *node, TupleTableSlot *slot)
 {
 	/*
@@ -99,9 +100,10 @@ SeqRecheck(SeqScanState *node, TupleTableSlot *slot)
  *		ExecSeqScan(node)
  *
  *		Scans the relation sequentially and returns the next qualifying
- *		tuple.
- *		We call the ExecScan() routine and pass it the appropriate
- *		access method functions.
+ *		tuple. This variant is used when there is no es_epq_active, no qual
+ *		and no projection.  Passing const-NULLs for these to ExecScanExtended
+ *		allows the compiler to eliminate the additional code that would
+ *		ordinarily be required for the evaluation of these.
  * ----------------------------------------------------------------
  */
 static TupleTableSlot *
@@ -109,11 +111,97 @@ ExecSeqScan(PlanState *pstate)
 {
 	SeqScanState *node = castNode(SeqScanState, pstate);
 
+	Assert(pstate->state->es_epq_active == NULL);
+	Assert(pstate->qual == NULL);
+	Assert(pstate->ps_ProjInfo == NULL);
+
+	return ExecScanExtended(&node->ss,
+							(ExecScanAccessMtd) SeqNext,
+							(ExecScanRecheckMtd) SeqRecheck,
+							NULL,
+							NULL,
+							NULL);
+}
+
+/*
+ * Variant of ExecSeqScan() but when qual evaluation is required.
+ */
+static TupleTableSlot *
+ExecSeqScanWithQual(PlanState *pstate)
+{
+	SeqScanState *node = castNode(SeqScanState, pstate);
+
+	/*
+	 * Use pg_assume() for != NULL tests to make the compiler realize no
+	 * runtime check for the field is needed in ExecScanExtended().
+	 */
+	Assert(pstate->state->es_epq_active == NULL);
+	pg_assume(pstate->qual != NULL);
+	Assert(pstate->ps_ProjInfo == NULL);
+
+	return ExecScanExtended(&node->ss,
+							(ExecScanAccessMtd) SeqNext,
+							(ExecScanRecheckMtd) SeqRecheck,
+							NULL,
+							pstate->qual,
+							NULL);
+}
+
+/*
+ * Variant of ExecSeqScan() but when projection is required.
+ */
+static TupleTableSlot *
+ExecSeqScanWithProject(PlanState *pstate)
+{
+	SeqScanState *node = castNode(SeqScanState, pstate);
+
+	Assert(pstate->state->es_epq_active == NULL);
+	Assert(pstate->qual == NULL);
+	pg_assume(pstate->ps_ProjInfo != NULL);
+
+	return ExecScanExtended(&node->ss,
+							(ExecScanAccessMtd) SeqNext,
+							(ExecScanRecheckMtd) SeqRecheck,
+							NULL,
+							NULL,
+							pstate->ps_ProjInfo);
+}
+
+/*
+ * Variant of ExecSeqScan() but when qual evaluation and projection are
+ * required.
+ */
+static TupleTableSlot *
+ExecSeqScanWithQualProject(PlanState *pstate)
+{
+	SeqScanState *node = castNode(SeqScanState, pstate);
+
+	Assert(pstate->state->es_epq_active == NULL);
+	pg_assume(pstate->qual != NULL);
+	pg_assume(pstate->ps_ProjInfo != NULL);
+
+	return ExecScanExtended(&node->ss,
+							(ExecScanAccessMtd) SeqNext,
+							(ExecScanRecheckMtd) SeqRecheck,
+							NULL,
+							pstate->qual,
+							pstate->ps_ProjInfo);
+}
+
+/*
+ * Variant of ExecSeqScan for when EPQ evaluation is required.  We don't
+ * bother adding variants of this for with/without qual and projection as
+ * EPQ doesn't seem as exciting a case to optimize for.
+ */
+static TupleTableSlot *
+ExecSeqScanEPQ(PlanState *pstate)
+{
+	SeqScanState *node = castNode(SeqScanState, pstate);
+
 	return ExecScan(&node->ss,
 					(ExecScanAccessMtd) SeqNext,
 					(ExecScanRecheckMtd) SeqRecheck);
 }
-
 
 /* ----------------------------------------------------------------
  *		ExecInitSeqScan
@@ -137,7 +225,6 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	scanstate = makeNode(SeqScanState);
 	scanstate->ss.ps.plan = (Plan *) node;
 	scanstate->ss.ps.state = estate;
-	scanstate->ss.ps.ExecProcNode = ExecSeqScan;
 
 	/*
 	 * Miscellaneous initialization
@@ -157,7 +244,8 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	/* and create slot with the appropriate rowtype */
 	ExecInitScanTupleSlot(estate, &scanstate->ss,
 						  RelationGetDescr(scanstate->ss.ss_currentRelation),
-						  table_slot_callbacks(scanstate->ss.ss_currentRelation));
+						  table_slot_callbacks(scanstate->ss.ss_currentRelation),
+						  TTS_FLAG_OBEYS_NOT_NULL_CONSTRAINTS);
 
 	/*
 	 * Initialize result type and projection.
@@ -170,6 +258,28 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 	 */
 	scanstate->ss.ps.qual =
 		ExecInitQual(node->scan.plan.qual, (PlanState *) scanstate);
+
+	/*
+	 * When EvalPlanQual() is not in use, assign ExecProcNode for this node
+	 * based on the presence of qual and projection. Each ExecSeqScan*()
+	 * variant is optimized for the specific combination of these conditions.
+	 */
+	if (scanstate->ss.ps.state->es_epq_active != NULL)
+		scanstate->ss.ps.ExecProcNode = ExecSeqScanEPQ;
+	else if (scanstate->ss.ps.qual == NULL)
+	{
+		if (scanstate->ss.ps.ps_ProjInfo == NULL)
+			scanstate->ss.ps.ExecProcNode = ExecSeqScan;
+		else
+			scanstate->ss.ps.ExecProcNode = ExecSeqScanWithProject;
+	}
+	else
+	{
+		if (scanstate->ss.ps.ps_ProjInfo == NULL)
+			scanstate->ss.ps.ExecProcNode = ExecSeqScanWithQual;
+		else
+			scanstate->ss.ps.ExecProcNode = ExecSeqScanWithQualProject;
+	}
 
 	return scanstate;
 }

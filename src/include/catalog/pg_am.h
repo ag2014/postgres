@@ -4,7 +4,7 @@
  *	  definition of the "access method" system catalog (pg_am)
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_am.h
@@ -19,13 +19,15 @@
 #define PG_AM_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_am_d.h"
+#include "catalog/pg_am_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_am definition.  cpp turns this into
  *		typedef struct FormData_pg_am
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_am,2601,AccessMethodRelationId)
 {
 	Oid			oid;			/* oid */
@@ -39,6 +41,8 @@ CATALOG(pg_am,2601,AccessMethodRelationId)
 	/* see AMTYPE_xxx constants below */
 	char		amtype;
 } FormData_pg_am;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_am corresponds to a pointer to a tuple with

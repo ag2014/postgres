@@ -3,7 +3,7 @@
  * blinsert.c
  *		Bloom index build and insert functions.
  *
- * Copyright (c) 2016-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2016-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/bloom/blinsert.c
@@ -22,7 +22,10 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "bloom",
+					.version = PG_VERSION
+);
 
 /*
  * State of bloom index build.  We accumulate one page data here before
@@ -148,7 +151,7 @@ blbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	MemoryContextDelete(buildstate.tmpCtx);
 
-	result = (IndexBuildResult *) palloc(sizeof(IndexBuildResult));
+	result = palloc_object(IndexBuildResult);
 	result->heap_tuples = reltuples;
 	result->index_tuples = buildstate.indtuples;
 

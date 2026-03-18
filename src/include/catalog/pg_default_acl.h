@@ -5,7 +5,7 @@
  *	  (pg_default_acl)
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_default_acl.h
@@ -20,13 +20,15 @@
 #define PG_DEFAULT_ACL_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_default_acl_d.h"
+#include "catalog/pg_default_acl_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_default_acl definition.  cpp turns this into
  *		typedef struct FormData_pg_default_acl
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_default_acl,826,DefaultAclRelationId)
 {
 	Oid			oid;			/* oid */
@@ -41,6 +43,8 @@ CATALOG(pg_default_acl,826,DefaultAclRelationId)
 													 * CREATE time */
 #endif
 } FormData_pg_default_acl;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_default_acl corresponds to a pointer to a tuple with
@@ -68,6 +72,7 @@ MAKE_SYSCACHE(DEFACLROLENSPOBJ, pg_default_acl_role_nsp_obj_index, 8);
 #define DEFACLOBJ_FUNCTION		'f' /* function */
 #define DEFACLOBJ_TYPE			'T' /* type */
 #define DEFACLOBJ_NAMESPACE		'n' /* namespace */
+#define DEFACLOBJ_LARGEOBJECT	'L' /* large object */
 
 #endif							/* EXPOSE_TO_CLIENT_CODE */
 

@@ -3,7 +3,7 @@
  * index.c
  *	  code to create and destroy POSTGRES index relations
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,6 +24,7 @@
 #include <unistd.h>
 
 #include "access/amapi.h"
+#include "access/attmap.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/relscan.h"
@@ -63,6 +64,7 @@
 #include "optimizer/optimizer.h"
 #include "parser/parser.h"
 #include "pgstat.h"
+#include "postmaster/autovacuum.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -288,7 +290,7 @@ ConstructTupleDescriptor(Relation heapRelation,
 	int			numkeyatts = indexInfo->ii_NumIndexKeyAttrs;
 	ListCell   *colnames_item = list_head(indexColNames);
 	ListCell   *indexpr_item = list_head(indexInfo->ii_Expressions);
-	IndexAmRoutine *amroutine;
+	const IndexAmRoutine *amroutine;
 	TupleDesc	heapTupDesc;
 	TupleDesc	indexTupDesc;
 	int			natts;			/* #atts in heap rel --- for error checks */
@@ -320,7 +322,6 @@ ConstructTupleDescriptor(Relation heapRelation,
 
 		MemSet(to, 0, ATTRIBUTE_FIXED_PART_SIZE);
 		to->attnum = i + 1;
-		to->attcacheoff = -1;
 		to->attislocal = true;
 		to->attcollation = (i < numkeyatts) ? collationIds[i] : InvalidOid;
 
@@ -477,9 +478,11 @@ ConstructTupleDescriptor(Relation heapRelation,
 
 			ReleaseSysCache(tuple);
 		}
+
+		populate_compact_attribute(indexTupDesc, i);
 	}
 
-	pfree(amroutine);
+	TupleDescFinalize(indexTupDesc);
 
 	return indexTupDesc;
 }
@@ -798,11 +801,11 @@ index_create(Relation heapRelation,
 				 errmsg("user-defined indexes on system catalog tables are not supported")));
 
 	/*
-	 * Btree text_pattern_ops uses text_eq as the equality operator, which is
-	 * fine as long as the collation is deterministic; text_eq then reduces to
+	 * Btree text_pattern_ops uses texteq as the equality operator, which is
+	 * fine as long as the collation is deterministic; texteq then reduces to
 	 * bitwise equality and so it is semantically compatible with the other
 	 * operators and functions in that opclass.  But with a nondeterministic
-	 * collation, text_eq could yield results that are incompatible with the
+	 * collation, texteq could yield results that are incompatible with the
 	 * actual behavior of the index (which is determined by the opclass's
 	 * comparison function).  We prevent such problems by refusing creation of
 	 * an index with that opclass and a nondeterministic collation.
@@ -812,7 +815,7 @@ index_create(Relation heapRelation,
 	 * opclasses as incompatible with nondeterminism; but for now, this small
 	 * hack suffices.
 	 *
-	 * Another solution is to use a special operator, not text_eq, as the
+	 * Another solution is to use a special operator, not texteq, as the
 	 * equality opclass member; but that is undesirable because it would
 	 * prevent index usage in many queries that work fine today.
 	 */
@@ -1412,7 +1415,7 @@ index_concurrently_create_copy(Relation heapRelation, Oid oldIndexId,
 	}
 
 	/* Extract opclass options for each attribute */
-	opclassOptions = palloc0(sizeof(Datum) * newInfo->ii_NumIndexAttrs);
+	opclassOptions = palloc0_array(Datum, newInfo->ii_NumIndexAttrs);
 	for (int i = 0; i < newInfo->ii_NumIndexAttrs; i++)
 		opclassOptions[i] = get_attoptions(oldIndexId, i + 1);
 
@@ -1957,6 +1960,7 @@ index_constraint_create(Relation heapRelation,
 								   constraintType,
 								   deferrable,
 								   initdeferred,
+								   true,	/* Is Enforced */
 								   true,
 								   parentConstraintId,
 								   RelationGetRelid(heapRelation),
@@ -2675,12 +2679,9 @@ BuildSpeculativeIndexInfo(Relation index, IndexInfo *ii)
 	 */
 	Assert(ii->ii_Unique);
 
-	if (index->rd_rel->relam != BTREE_AM_OID)
-		elog(ERROR, "unexpected non-btree speculative unique index");
-
-	ii->ii_UniqueOps = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
-	ii->ii_UniqueProcs = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
-	ii->ii_UniqueStrats = (uint16 *) palloc(sizeof(uint16) * indnkeyatts);
+	ii->ii_UniqueOps = palloc_array(Oid, indnkeyatts);
+	ii->ii_UniqueProcs = palloc_array(Oid, indnkeyatts);
+	ii->ii_UniqueStrats = palloc_array(uint16, indnkeyatts);
 
 	/*
 	 * We have to look up the operator's strategy number.  This provides a
@@ -2689,7 +2690,11 @@ BuildSpeculativeIndexInfo(Relation index, IndexInfo *ii)
 	/* We need the func OIDs and strategy numbers too */
 	for (i = 0; i < indnkeyatts; i++)
 	{
-		ii->ii_UniqueStrats[i] = BTEqualStrategyNumber;
+		ii->ii_UniqueStrats[i] =
+			IndexAmTranslateCompareType(COMPARE_EQ,
+										index->rd_rel->relam,
+										index->rd_opfamily[i],
+										false);
 		ii->ii_UniqueOps[i] =
 			get_opfamily_member(index->rd_opfamily[i],
 								index->rd_opcintype[i],
@@ -2790,8 +2795,8 @@ FormIndexDatum(IndexInfo *indexInfo,
  * hasindex: set relhasindex to this value
  * reltuples: if >= 0, set reltuples to this value; else no change
  *
- * If reltuples >= 0, relpages and relallvisible are also updated (using
- * RelationGetNumberOfBlocks() and visibilitymap_count()).
+ * If reltuples >= 0, relpages, relallvisible, and relallfrozen are also
+ * updated (using RelationGetNumberOfBlocks() and visibilitymap_count()).
  *
  * NOTE: an important side-effect of this operation is that an SI invalidation
  * message is sent out to all backends --- including me --- causing relcache
@@ -2809,6 +2814,7 @@ index_update_stats(Relation rel,
 	bool		update_stats;
 	BlockNumber relpages = 0;	/* keep compiler quiet */
 	BlockNumber relallvisible = 0;
+	BlockNumber relallfrozen = 0;
 	Oid			relid = RelationGetRelid(rel);
 	Relation	pg_class;
 	ScanKeyData key[1];
@@ -2837,6 +2843,27 @@ index_update_stats(Relation rel,
 	update_stats = reltuples >= 0 && !IsBinaryUpgrade;
 
 	/*
+	 * If autovacuum is off, user may not be expecting table relstats to
+	 * change.  This can be important when restoring a dump that includes
+	 * statistics, as the table statistics may be restored before the index is
+	 * created, and we want to preserve the restored table statistics.
+	 */
+	if (rel->rd_rel->relkind == RELKIND_RELATION ||
+		rel->rd_rel->relkind == RELKIND_TOASTVALUE ||
+		rel->rd_rel->relkind == RELKIND_MATVIEW)
+	{
+		if (AutoVacuumingActive())
+		{
+			StdRdOptions *options = (StdRdOptions *) rel->rd_options;
+
+			if (options != NULL && !options->autovacuum.enabled)
+				update_stats = false;
+		}
+		else
+			update_stats = false;
+	}
+
+	/*
 	 * Finish I/O and visibility map buffer locks before
 	 * systable_inplace_update_begin() locks the pg_class buffer.  The rd_rel
 	 * we modify may differ from rel->rd_rel due to e.g. commit of concurrent
@@ -2848,7 +2875,7 @@ index_update_stats(Relation rel,
 		relpages = RelationGetNumberOfBlocks(rel);
 
 		if (rel->rd_rel->relkind != RELKIND_INDEX)
-			visibilitymap_count(rel, &relallvisible, NULL);
+			visibilitymap_count(rel, &relallvisible, &relallfrozen);
 	}
 
 	/*
@@ -2921,6 +2948,11 @@ index_update_stats(Relation rel,
 			rd_rel->relallvisible = (int32) relallvisible;
 			dirty = true;
 		}
+		if (rd_rel->relallfrozen != (int32) relallfrozen)
+		{
+			rd_rel->relallfrozen = (int32) relallfrozen;
+			dirty = true;
+		}
 	}
 
 	/*
@@ -2983,13 +3015,13 @@ index_build(Relation heapRelation,
 	 * sanity checks
 	 */
 	Assert(RelationIsValid(indexRelation));
-	Assert(PointerIsValid(indexRelation->rd_indam));
-	Assert(PointerIsValid(indexRelation->rd_indam->ambuild));
-	Assert(PointerIsValid(indexRelation->rd_indam->ambuildempty));
+	Assert(indexRelation->rd_indam);
+	Assert(indexRelation->rd_indam->ambuild);
+	Assert(indexRelation->rd_indam->ambuildempty);
 
 	/*
 	 * Determine worker process details for parallel CREATE INDEX.  Currently,
-	 * only btree has support for parallel builds.
+	 * only btree, GIN, and BRIN have support for parallel builds.
 	 *
 	 * Note that planner considers parallel safety for us.
 	 */
@@ -3046,7 +3078,7 @@ index_build(Relation heapRelation,
 	 */
 	stats = indexRelation->rd_indam->ambuild(heapRelation, indexRelation,
 											 indexInfo);
-	Assert(PointerIsValid(stats));
+	Assert(stats);
 
 	/*
 	 * If this is an unlogged index, we may need to write out an init fork for
@@ -4048,7 +4080,7 @@ reindex_relation(const ReindexStmt *stmt, Oid relid, int flags,
 		Assert(!ReindexIsProcessingIndex(indexOid));
 
 		/* Set index rebuild count */
-		pgstat_progress_update_param(PROGRESS_CLUSTER_INDEX_REBUILD_COUNT,
+		pgstat_progress_update_param(PROGRESS_REPACK_INDEX_REBUILD_COUNT,
 									 i);
 		i++;
 	}

@@ -8,7 +8,7 @@
  * declarations should be put here.  However, we do include some stuff
  * that is meant to prevent conflicts between our code and Perl.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1995, Regents of the University of California
  *
  * src/pl/plperl/plperl_system.h
@@ -82,8 +82,8 @@
  * can compile against MULTIPLICITY Perl builds without including XSUB.h.
  */
 #define PERL_NO_GET_CONTEXT
-#include "EXTERN.h"
-#include "perl.h"
+#include <EXTERN.h>
+#include <perl.h>
 
 /*
  * We want to include XSUB.h only within .xs files, because on some platforms
@@ -103,6 +103,7 @@
 #undef fstat
 #undef kill
 #undef listen
+#undef lseek
 #undef lstat
 #undef mkdir
 #undef open
@@ -116,7 +117,7 @@
 #undef unlink
 #endif
 
-#include "XSUB.h"
+#include <XSUB.h>
 #endif
 
 /* put back our *printf macros ... this must match src/include/port.h */

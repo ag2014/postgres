@@ -3,7 +3,7 @@
  * pg_aggregate.c
  *	  routines to support manipulation of the pg_aggregate relation
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -637,6 +637,7 @@ AggregateCreate(const char *aggName,
 							 parameterNames,	/* parameterNames */
 							 parameterDefaults, /* parameterDefaults */
 							 PointerGetDatum(NULL), /* trftypes */
+							 NIL,	/* trfoids */
 							 PointerGetDatum(NULL), /* proconfig */
 							 InvalidOid,	/* no prosupport */
 							 1, /* procost */
@@ -653,7 +654,7 @@ AggregateCreate(const char *aggName,
 	for (i = 0; i < Natts_pg_aggregate; i++)
 	{
 		nulls[i] = false;
-		values[i] = (Datum) NULL;
+		values[i] = (Datum) 0;
 		replaces[i] = true;
 	}
 	values[Anum_pg_aggregate_aggfnoid - 1] = ObjectIdGetDatum(procOid);
@@ -835,6 +836,7 @@ lookup_agg_function(List *fnName,
 	Oid			vatype;
 	Oid		   *true_oid_array;
 	FuncDetailCode fdresult;
+	int			fgc_flags;
 	AclResult	aclresult;
 	int			i;
 
@@ -847,6 +849,7 @@ lookup_agg_function(List *fnName,
 	 */
 	fdresult = func_get_detail(fnName, NIL, NIL,
 							   nargs, input_types, false, false, false,
+							   &fgc_flags,
 							   &fnOid, rettype, &retset,
 							   &nvargs, &vatype,
 							   &true_oid_array, NULL);

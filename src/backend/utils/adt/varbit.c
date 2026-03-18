@@ -20,7 +20,7 @@
  *
  * Code originally contributed by Adriaan Joubert.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -232,7 +232,7 @@ bit_in(PG_FUNCTION_ARGS)
 				ereturn(escontext, (Datum) 0,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("\"%.*s\" is not a valid binary digit",
-								pg_mblen(sp), sp)));
+								pg_mblen_cstr(sp), sp)));
 
 			x >>= 1;
 			if (x == 0)
@@ -257,7 +257,7 @@ bit_in(PG_FUNCTION_ARGS)
 				ereturn(escontext, (Datum) 0,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("\"%.*s\" is not a valid hexadecimal digit",
-								pg_mblen(sp), sp)));
+								pg_mblen_cstr(sp), sp)));
 
 			if (bc)
 			{
@@ -361,7 +361,7 @@ bit_recv(PG_FUNCTION_ARGS)
 	SET_VARSIZE(result, len);
 	VARBITLEN(result) = bitlen;
 
-	pq_copymsgbytes(buf, (char *) VARBITS(result), VARBITBYTES(result));
+	pq_copymsgbytes(buf, VARBITS(result), VARBITBYTES(result));
 
 	/* Make sure last byte is correctly zero-padded */
 	VARBIT_PAD(result);
@@ -533,7 +533,7 @@ varbit_in(PG_FUNCTION_ARGS)
 				ereturn(escontext, (Datum) 0,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("\"%.*s\" is not a valid binary digit",
-								pg_mblen(sp), sp)));
+								pg_mblen_cstr(sp), sp)));
 
 			x >>= 1;
 			if (x == 0)
@@ -558,7 +558,7 @@ varbit_in(PG_FUNCTION_ARGS)
 				ereturn(escontext, (Datum) 0,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 						 errmsg("\"%.*s\" is not a valid hexadecimal digit",
-								pg_mblen(sp), sp)));
+								pg_mblen_cstr(sp), sp)));
 
 			if (bc)
 			{
@@ -666,7 +666,7 @@ varbit_recv(PG_FUNCTION_ARGS)
 	SET_VARSIZE(result, len);
 	VARBITLEN(result) = bitlen;
 
-	pq_copymsgbytes(buf, (char *) VARBITS(result), VARBITBYTES(result));
+	pq_copymsgbytes(buf, VARBITS(result), VARBITBYTES(result));
 
 	/* Make sure last byte is correctly zero-padded */
 	VARBIT_PAD(result);

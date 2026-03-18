@@ -7,11 +7,11 @@ GETTEXT_TRIGGERS = $(BACKEND_COMMON_GETTEXT_TRIGGERS) \
                    GUC_check_errhint \
                    write_stderr \
                    yyerror \
-                   jsonpath_yyerror:3 \
+                   jsonpath_yyerror:4 \
                    parser_yyerror \
-                   replication_yyerror \
+                   replication_yyerror:3 \
                    scanner_yyerror \
-                   syncrep_yyerror \
+                   syncrep_yyerror:4 \
                    report_invalid_record:2 \
                    ereport_startup_progress \
                    json_token_error:2 \
@@ -28,7 +28,7 @@ GETTEXT_FLAGS    = $(BACKEND_COMMON_GETTEXT_FLAGS) \
                    error_cb:2:c-format
 
 gettext-files: generated-parser-sources generated-headers
-	find $(srcdir) $(srcdir)/../common $(srcdir)/../port -name '*.c' -print | LC_ALL=C sort >$@
+	find $(srcdir) $(srcdir)/../common $(srcdir)/../port $(srcdir)/../include/ \( -name '*.c' -o -name "proctypelist.h" \) -print | LC_ALL=C sort >$@
 
 my-clean:
 	rm -f gettext-files

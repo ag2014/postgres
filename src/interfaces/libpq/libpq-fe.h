@@ -4,7 +4,7 @@
  *	  This file contains definitions for structures and
  *	  externs for functions used by frontend postgres applications.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/libpq-fe.h
@@ -20,6 +20,7 @@ extern "C"
 {
 #endif
 
+#include <stdint.h>
 #include <stdio.h>
 
 /*
@@ -59,6 +60,14 @@ extern "C"
 /* Features added in PostgreSQL v18: */
 /* Indicates presence of PQfullProtocolVersion */
 #define LIBPQ_HAS_FULL_PROTOCOL_VERSION 1
+/* Indicates presence of the PQAUTHDATA_PROMPT_OAUTH_DEVICE authdata hook */
+#define LIBPQ_HAS_PROMPT_OAUTH_DEVICE 1
+
+/* Features added in PostgreSQL v19: */
+/* Indicates presence of PQgetThreadLock */
+#define LIBPQ_HAS_GET_THREAD_LOCK 1
+/* Indicates presence of the PQAUTHDATA_OAUTH_BEARER_TOKEN_V2 authdata hook */
+#define LIBPQ_HAS_OAUTH_BEARER_TOKEN_V2 1
 
 /*
  * Option flags for PQcopyResult
@@ -103,6 +112,8 @@ typedef enum
 	CONNECTION_CHECK_STANDBY,	/* Checking if server is in standby mode. */
 	CONNECTION_ALLOCATED,		/* Waiting for connection attempt to be
 								 * started.  */
+	CONNECTION_AUTHENTICATING,	/* Authentication is in progress with some
+								 * external system. */
 } ConnStatusType;
 
 typedef enum
@@ -184,6 +195,15 @@ typedef enum
 	PQ_PIPELINE_ABORTED
 } PGpipelineStatus;
 
+typedef enum
+{
+	PQAUTHDATA_PROMPT_OAUTH_DEVICE, /* user must visit a device-authorization
+									 * URL */
+	PQAUTHDATA_OAUTH_BEARER_TOKEN,	/* server requests an OAuth Bearer token
+									 * (v2 is preferred; see below) */
+	PQAUTHDATA_OAUTH_BEARER_TOKEN_V2,	/* newest API for OAuth Bearer tokens */
+} PGauthData;
+
 /* PGconn encapsulates a connection to the backend.
  * The contents of this struct are not supposed to be known to applications.
  */
@@ -223,7 +243,7 @@ typedef struct pgNotify
 } PGnotify;
 
 /* pg_usec_time_t is like time_t, but with microsecond resolution */
-typedef pg_int64 pg_usec_time_t;
+typedef int64_t pg_usec_time_t;
 
 /* Function types for notice-handling callbacks */
 typedef void (*PQnoticeReceiver) (void *arg, const PGresult *res);
@@ -450,12 +470,14 @@ extern PQnoticeProcessor PQsetNoticeProcessor(PGconn *conn,
  *	   Used to set callback that prevents concurrent access to
  *	   non-thread safe functions that libpq needs.
  *	   The default implementation uses a libpq internal mutex.
- *	   Only required for multithreaded apps that use kerberos
- *	   both within their app and for postgresql connections.
+ *	   Only required for multithreaded apps that use Kerberos or
+ *	   older (non-threadsafe) versions of Curl both within their
+ *	   app and for postgresql connections.
  */
 typedef void (*pgthreadlock_t) (int acquire);
 
 extern pgthreadlock_t PQregisterThreadLock(pgthreadlock_t newhandler);
+extern pgthreadlock_t PQgetThreadLock(void);
 
 /* === in fe-trace.c === */
 extern void PQtrace(PGconn *conn, FILE *debug_port);
@@ -679,13 +701,13 @@ extern int	lo_close(PGconn *conn, int fd);
 extern int	lo_read(PGconn *conn, int fd, char *buf, size_t len);
 extern int	lo_write(PGconn *conn, int fd, const char *buf, size_t len);
 extern int	lo_lseek(PGconn *conn, int fd, int offset, int whence);
-extern pg_int64 lo_lseek64(PGconn *conn, int fd, pg_int64 offset, int whence);
+extern int64_t lo_lseek64(PGconn *conn, int fd, int64_t offset, int whence);
 extern Oid	lo_creat(PGconn *conn, int mode);
 extern Oid	lo_create(PGconn *conn, Oid lobjId);
 extern int	lo_tell(PGconn *conn, int fd);
-extern pg_int64 lo_tell64(PGconn *conn, int fd);
+extern int64_t lo_tell64(PGconn *conn, int fd);
 extern int	lo_truncate(PGconn *conn, int fd, size_t len);
-extern int	lo_truncate64(PGconn *conn, int fd, pg_int64 len);
+extern int	lo_truncate64(PGconn *conn, int fd, int64_t len);
 extern int	lo_unlink(PGconn *conn, Oid lobjId);
 extern Oid	lo_import(PGconn *conn, const char *filename);
 extern Oid	lo_import_with_oid(PGconn *conn, const char *filename, Oid lobjId);
@@ -717,9 +739,115 @@ extern int	PQenv2encoding(void);
 
 /* === in fe-auth.c === */
 
+/* Authdata for PQAUTHDATA_PROMPT_OAUTH_DEVICE */
+typedef struct _PGpromptOAuthDevice
+{
+	const char *verification_uri;	/* verification URI to visit */
+	const char *user_code;		/* user code to enter */
+	const char *verification_uri_complete;	/* optional combination of URI and
+											 * code, or NULL */
+	int			expires_in;		/* seconds until user code expires */
+} PGpromptOAuthDevice;
+
+/*
+ * For PGoauthBearerRequest.async(). This macro just allows clients to avoid
+ * depending on libpq-int.h or Winsock for the "socket" type; it's undefined
+ * immediately below.
+ */
+#ifdef _WIN32
+#define PQ_SOCKTYPE uintptr_t	/* avoids depending on winsock2.h for SOCKET */
+#else
+#define PQ_SOCKTYPE int
+#endif
+
+/* Authdata for PQAUTHDATA_OAUTH_BEARER_TOKEN */
+typedef struct PGoauthBearerRequest
+{
+	/* Hook inputs (constant across all calls) */
+	const char *openid_configuration;	/* OIDC discovery URI */
+	const char *scope;			/* required scope(s), or NULL */
+
+	/* Hook outputs */
+
+	/*---------
+	 * Callback implementing a custom asynchronous OAuth flow.
+	 *
+	 * The callback may return
+	 * - PGRES_POLLING_READING/WRITING, to indicate that a socket descriptor
+	 *   has been stored in *altsock and libpq should wait until it is
+	 *   readable or writable before calling back;
+	 * - PGRES_POLLING_OK, to indicate that the flow is complete and
+	 *   request->token has been set; or
+	 * - PGRES_POLLING_FAILED, to indicate that token retrieval has failed.
+	 *
+	 * This callback is optional. If the token can be obtained without
+	 * blocking during the original call to the PQAUTHDATA_OAUTH_BEARER_TOKEN
+	 * hook, it may be returned directly, but one of request->async or
+	 * request->token must be set by the hook.
+	 *
+	 * The (PQ_SOCKTYPE *) in the signature is a placeholder for the platform's
+	 * native socket type: (SOCKET *) on Windows, and (int *) everywhere else.
+	 */
+	PostgresPollingStatusType (*async) (PGconn *conn,
+										struct PGoauthBearerRequest *request,
+										PQ_SOCKTYPE * altsock);
+
+	/*
+	 * Callback to clean up custom allocations. A hook implementation may use
+	 * this to free request->token and any resources in request->user. V2
+	 * implementations should additionally free request->error, if set.
+	 *
+	 * This is technically optional, but highly recommended, because there is
+	 * no other indication as to when it is safe to free the token.
+	 */
+	void		(*cleanup) (PGconn *conn, struct PGoauthBearerRequest *request);
+
+	/*
+	 * The hook should set this to the Bearer token contents for the
+	 * connection, once the flow is completed.  The token contents must remain
+	 * available to libpq until the hook's cleanup callback is called.
+	 */
+	char	   *token;
+
+	/*
+	 * Hook-defined data. libpq will not modify this pointer across calls to
+	 * the async callback, so it can be used to keep track of
+	 * application-specific state. Resources allocated here should be freed by
+	 * the cleanup callback.
+	 */
+	void	   *user;
+} PGoauthBearerRequest;
+
+#undef PQ_SOCKTYPE
+
+/* Authdata for PQAUTHDATA_OAUTH_BEARER_TOKEN_V2 */
+typedef struct
+{
+	PGoauthBearerRequest v1;	/* see the PGoauthBearerRequest struct, above */
+
+	/* Hook inputs (constant across all calls) */
+	const char *issuer;			/* the issuer identifier (RFC 9207) in use, as
+								 * derived from the connection's oauth_issuer */
+
+	/* Hook outputs */
+
+	/*
+	 * Hook-defined error message which will be included in the connection's
+	 * PQerrorMessage() output when the flow fails. libpq does not take
+	 * ownership of this pointer; any allocations should be freed during the
+	 * cleanup callback.
+	 */
+	const char *error;
+} PGoauthBearerRequestV2;
+
 extern char *PQencryptPassword(const char *passwd, const char *user);
 extern char *PQencryptPasswordConn(PGconn *conn, const char *passwd, const char *user, const char *algorithm);
 extern PGresult *PQchangePassword(PGconn *conn, const char *user, const char *passwd);
+
+typedef int (*PQauthDataHook_type) (PGauthData type, PGconn *conn, void *data);
+extern void PQsetAuthDataHook(PQauthDataHook_type hook);
+extern PQauthDataHook_type PQgetAuthDataHook(void);
+extern int	PQdefaultAuthDataHook(PGauthData type, PGconn *conn, void *data);
 
 /* === in encnames.c === */
 

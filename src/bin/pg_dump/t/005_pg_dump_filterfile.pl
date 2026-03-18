@@ -1,5 +1,5 @@
 
-# Copyright (c) 2023-2024, PostgreSQL Global Development Group
+# Copyright (c) 2023-2026, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -90,17 +90,22 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"filter file without patterns");
 
 my $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE TABLE public\.table_one/m, "table one dumped");
-ok($dump =~ qr/^CREATE TABLE public\.table_two/m, "table two dumped");
-ok($dump =~ qr/^CREATE TABLE public\.table_three/m, "table three dumped");
-ok($dump =~ qr/^CREATE TABLE public\.table_three_one/m,
+like($dump, qr/^CREATE TABLE public\.table_one/m, "table one dumped");
+like($dump, qr/^CREATE TABLE public\.table_two/m, "table two dumped");
+like($dump, qr/^CREATE TABLE public\.table_three/m, "table three dumped");
+like(
+	$dump,
+	qr/^CREATE TABLE public\.table_three_one/m,
 	"table three one dumped");
 
 # Test various combinations of whitespace, comments and correct filters
@@ -117,21 +122,31 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"dump tables with filter patterns as well as comments and whitespace");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE TABLE public\.table_one/m, "dumped table one");
-ok($dump =~ qr/^CREATE TABLE public\.table_two/m, "dumped table two");
-ok($dump !~ qr/^CREATE TABLE public\.table_three/m, "table three not dumped");
-ok($dump !~ qr/^CREATE TABLE public\.table_three_one/m,
+like($dump, qr/^CREATE TABLE public\.table_one/m, "dumped table one");
+like($dump, qr/^CREATE TABLE public\.table_two/m, "dumped table two");
+unlike(
+	$dump,
+	qr/^CREATE TABLE public\.table_three/m,
+	"table three not dumped");
+unlike(
+	$dump,
+	qr/^CREATE TABLE public\.table_three_one/m,
 	"table three_one not dumped");
-ok( $dump !~ qr/^COPY public\.table_one/m,
+unlike(
+	$dump,
+	qr/^COPY public\.table_one/m,
 	"content of table one is not included");
-ok($dump =~ qr/^COPY public\.table_two/m, "content of table two is included");
+like($dump, qr/^COPY public\.table_two/m, "content of table two is included");
 
 # Test dumping tables specified by qualified names
 open $inputfile, '>', "$tempdir/inputfile.txt"
@@ -143,16 +158,19 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"filter file without patterns");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE TABLE public\.table_one/m, "dumped table one");
-ok($dump =~ qr/^CREATE TABLE public\.table_two/m, "dumped table two");
-ok($dump =~ qr/^CREATE TABLE public\.table_three/m, "dumped table three");
+like($dump, qr/^CREATE TABLE public\.table_one/m, "dumped table one");
+like($dump, qr/^CREATE TABLE public\.table_two/m, "dumped table two");
+like($dump, qr/^CREATE TABLE public\.table_three/m, "dumped table three");
 
 # Test dumping all tables except one
 open $inputfile, '>', "$tempdir/inputfile.txt"
@@ -162,17 +180,22 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"dump tables with exclusion of a single table");
 
 $dump = slurp_file($plainfile);
 
-ok($dump !~ qr/^CREATE TABLE public\.table_one/m, "table one not dumped");
-ok($dump =~ qr/^CREATE TABLE public\.table_two/m, "dumped table two");
-ok($dump =~ qr/^CREATE TABLE public\.table_three/m, "dumped table three");
-ok($dump =~ qr/^CREATE TABLE public\.table_three_one/m,
+unlike($dump, qr/^CREATE TABLE public\.table_one/m, "table one not dumped");
+like($dump, qr/^CREATE TABLE public\.table_two/m, "dumped table two");
+like($dump, qr/^CREATE TABLE public\.table_three/m, "dumped table three");
+like(
+	$dump,
+	qr/^CREATE TABLE public\.table_three_one/m,
 	"dumped table three_one");
 
 # Test dumping tables with a wildcard pattern
@@ -183,17 +206,22 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"dump tables with wildcard in pattern");
 
 $dump = slurp_file($plainfile);
 
-ok($dump !~ qr/^CREATE TABLE public\.table_one/m, "table one not dumped");
-ok($dump !~ qr/^CREATE TABLE public\.table_two/m, "table two not dumped");
-ok($dump =~ qr/^CREATE TABLE public\.table_three/m, "dumped table three");
-ok($dump =~ qr/^CREATE TABLE public\.table_three_one/m,
+unlike($dump, qr/^CREATE TABLE public\.table_one/m, "table one not dumped");
+unlike($dump, qr/^CREATE TABLE public\.table_two/m, "table two not dumped");
+like($dump, qr/^CREATE TABLE public\.table_three/m, "dumped table three");
+like(
+	$dump,
+	qr/^CREATE TABLE public\.table_three_one/m,
 	"dumped table three_one");
 
 # Test dumping table with multiline quoted tablename
@@ -205,14 +233,19 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"dump tables with multiline names requiring quoting");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE TABLE public.\"strange aaa/m,
+like(
+	$dump,
+	qr/^CREATE TABLE public.\"strange aaa/m,
 	"dump table with new line in name");
 
 # Test excluding multiline quoted tablename from dump
@@ -223,14 +256,19 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"dump tables with filter");
 
 $dump = slurp_file($plainfile);
 
-ok($dump !~ qr/^CREATE TABLE public.\"strange aaa/m,
+unlike(
+	$dump,
+	qr/^CREATE TABLE public.\"strange aaa/m,
 	"dump table with new line in name");
 
 # Test excluding an entire schema
@@ -241,14 +279,17 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"exclude the public schema");
 
 $dump = slurp_file($plainfile);
 
-ok($dump !~ qr/^CREATE TABLE/m, "no table dumped");
+unlike($dump, qr/^CREATE TABLE/m, "no table dumped");
 
 # Test including and excluding an entire schema by multiple filterfiles
 open $inputfile, '>', "$tempdir/inputfile.txt"
@@ -263,15 +304,18 @@ close $alt_inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt",
-		"--filter=$tempdir/inputfile2.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'--filter' => "$tempdir/inputfile2.txt",
+		'postgres'
 	],
 	"exclude the public schema with multiple filters");
 
 $dump = slurp_file($plainfile);
 
-ok($dump !~ qr/^CREATE TABLE/m, "no table dumped");
+unlike($dump, qr/^CREATE TABLE/m, "no table dumped");
 
 # Test dumping a table with a single leading newline on a row
 open $inputfile, '>', "$tempdir/inputfile.txt"
@@ -284,14 +328,19 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"dump tables with filter");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE TABLE public.\"\nt\nt\n\" \($/ms,
+like(
+	$dump,
+	qr/^CREATE TABLE public.\"\nt\nt\n\" \($/ms,
 	"dump table with multiline strange name");
 
 open $inputfile, '>', "$tempdir/inputfile.txt"
@@ -301,14 +350,19 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"dump tables with filter");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE TABLE public.\"\nt\nt\n\" \($/ms,
+like(
+	$dump,
+	qr/^CREATE TABLE public.\"\nt\nt\n\" \($/ms,
 	"dump table with multiline strange name");
 
 #########################################
@@ -321,8 +375,11 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	qr/pg_dump: error: no matching foreign servers were found for pattern/,
 	"dump nonexisting foreign server");
@@ -334,14 +391,17 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"dump foreign_data with filter");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE SERVER dummyserver/m, "dump foreign server");
+like($dump, qr/^CREATE SERVER dummyserver/m, "dump foreign server");
 
 open $inputfile, '>', "$tempdir/inputfile.txt"
   or die "unable to open filterfile for writing";
@@ -350,8 +410,11 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	qr/exclude filter for "foreign data" is not allowed/,
 	"erroneously exclude foreign server");
@@ -367,25 +430,37 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	qr/invalid filter command/,
 	"invalid syntax: incorrect filter command");
 
-# Test invalid object type
+# Test invalid object type.
+#
+# This test also verifies that keywords are correctly recognized as strings of
+# non-whitespace characters. If the parser incorrectly treats non-whitespace
+# delimiters (like hyphens) as keyword boundaries, "table-data" might be
+# misread as the valid object type "table". To catch such issues,
+# "table-data" is used here as an intentionally invalid object type.
 open $inputfile, '>', "$tempdir/inputfile.txt"
   or die "unable to open filterfile for writing";
-print $inputfile "include xxx";
+print $inputfile "exclude table-data one";
 close $inputfile;
 
 command_fails_like(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
-	qr/unsupported filter object type: "xxx"/,
-	"invalid syntax: invalid object type specified, should be table, schema, foreign_data or data"
+	qr/unsupported filter object type: "table-data"/,
+	"invalid syntax: invalid object type specified"
 );
 
 # Test missing object identifier pattern
@@ -396,8 +471,11 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	qr/missing object name/,
 	"invalid syntax: missing object identifier pattern");
@@ -410,8 +488,11 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	qr/no matching tables were found/,
 	"invalid syntax: extra content after object identifier pattern");
@@ -427,15 +508,17 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt",
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
 		'--strict-names', 'postgres'
 	],
 	"strict names with matching pattern");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE TABLE public\.table_one/m, "no table dumped");
+like($dump, qr/^CREATE TABLE public\.table_one/m, "no table dumped");
 
 # Now append a pattern to the filter file which doesn't resolve
 open $inputfile, '>>', "$tempdir/inputfile.txt"
@@ -445,8 +528,10 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt",
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
 		'--strict-names', 'postgres'
 	],
 	qr/no matching tables were found/,
@@ -464,26 +549,30 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dumpall', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt"
+		'pg_dumpall',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt"
 	],
 	"dump tables with exclusion of a database");
 
 $dump = slurp_file($plainfile);
 
-ok($dump !~ qr/^\\connect postgres/m, "database postgres is not dumped");
-ok($dump =~ qr/^\\connect template1/m, "database template1 is dumped");
+unlike($dump, qr/^\\connect postgres/m, "database postgres is not dumped");
+like($dump, qr/^\\connect template1/m, "database template1 is dumped");
 
-# Make sure this option dont break the existing limitation of using
+# Make sure this option doesn't break the existing limitation of using
 # --globals-only with exclusions
 command_fails_like(
 	[
-		'pg_dumpall', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt",
+		'pg_dumpall',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
 		'--globals-only'
 	],
-	qr/\Qpg_dumpall: error: option --exclude-database cannot be used together with -g\/--globals-only\E/,
-	'pg_dumpall: option --exclude-database cannot be used together with -g/--globals-only'
+	qr/\Qpg_dumpall: error: options --exclude-database and -g\/--globals-only cannot be used together\E/,
+	'pg_dumpall: options --exclude-database and -g/--globals-only cannot be used together'
 );
 
 # Test invalid filter command
@@ -494,8 +583,10 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_dumpall', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt"
+		'pg_dumpall',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt"
 	],
 	qr/invalid filter command/,
 	"invalid syntax: incorrect filter command");
@@ -508,8 +599,10 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_dumpall', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt"
+		'pg_dumpall',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt"
 	],
 	qr/unsupported filter object type: "xxx"/,
 	"invalid syntax: exclusion of non-existing object type");
@@ -521,8 +614,10 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_dumpall', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt"
+		'pg_dumpall',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt"
 	],
 	qr/pg_dumpall: error: invalid format in filter/,
 	"invalid syntax: exclusion of unsupported object type");
@@ -532,8 +627,11 @@ command_fails_like(
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', "$tempdir/filter_test.dump",
-		"-Fc", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => "$tempdir/filter_test.dump",
+		'--format' => 'custom',
+		'postgres'
 	],
 	"dump all tables");
 
@@ -544,16 +642,21 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_restore', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt",
-		"-Fc", "$tempdir/filter_test.dump"
+		'pg_restore',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'--format' => 'custom',
+		"$tempdir/filter_test.dump"
 	],
 	"restore tables with filter");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE TABLE public\.table_two/m, "wanted table restored");
-ok($dump !~ qr/^CREATE TABLE public\.table_one/m,
+like($dump, qr/^CREATE TABLE public\.table_two/m, "wanted table restored");
+unlike(
+	$dump,
+	qr/^CREATE TABLE public\.table_one/m,
 	"unwanted table is not restored");
 
 open $inputfile, '>', "$tempdir/inputfile.txt"
@@ -563,8 +666,10 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_restore', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt"
+		'pg_restore',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt"
 	],
 	qr/include filter for "table data" is not allowed/,
 	"invalid syntax: inclusion of unallowed object");
@@ -576,8 +681,10 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_restore', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt"
+		'pg_restore',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt"
 	],
 	qr/include filter for "extension" is not allowed/,
 	"invalid syntax: inclusion of unallowed object");
@@ -589,8 +696,10 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_restore', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt"
+		'pg_restore',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt"
 	],
 	qr/exclude filter for "extension" is not allowed/,
 	"invalid syntax: exclusion of unallowed object");
@@ -602,8 +711,10 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_restore', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt"
+		'pg_restore',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt"
 	],
 	qr/exclude filter for "table data" is not allowed/,
 	"invalid syntax: exclusion of unallowed object");
@@ -613,8 +724,11 @@ command_fails_like(
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', "$tempdir/filter_test.dump",
-		"-Fc", 'sourcedb'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => "$tempdir/filter_test.dump",
+		'--format' => 'custom',
+		'sourcedb'
 	],
 	"dump all objects from sourcedb");
 
@@ -625,16 +739,21 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_restore', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt",
-		"-Fc", "$tempdir/filter_test.dump"
+		'pg_restore',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'--format' => 'custom',
+		"$tempdir/filter_test.dump"
 	],
 	"restore function with filter");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE FUNCTION public\.foo1/m, "wanted function restored");
-ok( $dump !~ qr/^CREATE TABLE public\.foo2/m,
+like($dump, qr/^CREATE FUNCTION public\.foo1/m, "wanted function restored");
+unlike(
+	$dump,
+	qr/^CREATE TABLE public\.foo2/m,
 	"unwanted function is not restored");
 
 # this should be white space tolerant (against the -P argument)
@@ -646,15 +765,18 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_restore', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt",
-		"-Fc", "$tempdir/filter_test.dump"
+		'pg_restore',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'--format' => 'custom',
+		"$tempdir/filter_test.dump"
 	],
 	"restore function with filter");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE FUNCTION public\.foo3/m, "wanted function restored");
+like($dump, qr/^CREATE FUNCTION public\.foo3/m, "wanted function restored");
 
 open $inputfile, '>', "$tempdir/inputfile.txt"
   or die "unable to open filterfile for writing";
@@ -667,18 +789,21 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_restore', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt",
-		"-Fc", "$tempdir/filter_test.dump"
+		'pg_restore',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'--format' => 'custom',
+		"$tempdir/filter_test.dump"
 	],
 	"restore function with filter");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE INDEX t1_idx1/m, "wanted index restored");
-ok($dump !~ qr/^CREATE INDEX t2_idx2/m, "unwanted index are not restored");
-ok($dump =~ qr/^CREATE TRIGGER trg1/m, "wanted trigger restored");
-ok($dump !~ qr/^CREATE TRIGGER trg2/m, "unwanted trigger is not restored");
+like($dump, qr/^CREATE INDEX t1_idx1/m, "wanted index restored");
+unlike($dump, qr/^CREATE INDEX t2_idx2/m, "unwanted index are not restored");
+like($dump, qr/^CREATE TRIGGER trg1/m, "wanted trigger restored");
+unlike($dump, qr/^CREATE TRIGGER trg2/m, "unwanted trigger is not restored");
 
 open $inputfile, '>', "$tempdir/inputfile.txt"
   or die "unable to open filterfile for writing";
@@ -687,18 +812,23 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_restore', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt",
-		"-Fc", "$tempdir/filter_test.dump"
+		'pg_restore',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'--format' => 'custom',
+		"$tempdir/filter_test.dump"
 	],
 	"restore function with filter");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE TABLE s1\.t1/m, "wanted table from schema restored");
-ok( $dump =~ qr/^CREATE SEQUENCE s1\.s1/m,
+like($dump, qr/^CREATE TABLE s1\.t1/m, "wanted table from schema restored");
+like(
+	$dump,
+	qr/^CREATE SEQUENCE s1\.s1/m,
 	"wanted sequence from schema restored");
-ok($dump !~ qr/^CREATE TABLE s2\t2/m, "unwanted table is not restored");
+unlike($dump, qr/^CREATE TABLE s2\t2/m, "unwanted table is not restored");
 
 open $inputfile, '>', "$tempdir/inputfile.txt"
   or die "unable to open filterfile for writing";
@@ -707,20 +837,27 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_restore', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt",
-		"-Fc", "$tempdir/filter_test.dump"
+		'pg_restore',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'--format' => 'custom',
+		"$tempdir/filter_test.dump"
 	],
 	"restore function with filter");
 
 $dump = slurp_file($plainfile);
 
-ok($dump !~ qr/^CREATE TABLE s1\.t1/m,
+unlike(
+	$dump,
+	qr/^CREATE TABLE s1\.t1/m,
 	"unwanted table from schema is not restored");
-ok($dump !~ qr/^CREATE SEQUENCE s1\.s1/m,
+unlike(
+	$dump,
+	qr/^CREATE SEQUENCE s1\.s1/m,
 	"unwanted sequence from schema is not restored");
-ok($dump =~ qr/^CREATE TABLE s2\.t2/m, "wanted table restored");
-ok($dump =~ qr/^CREATE TABLE public\.t1/m, "wanted table restored");
+like($dump, qr/^CREATE TABLE s2\.t2/m, "wanted table restored");
+like($dump, qr/^CREATE TABLE public\.t1/m, "wanted table restored");
 
 #########################################
 # test of supported syntax
@@ -733,14 +870,17 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"filter file without patterns");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE TABLE public\.bootab/m, "dumped children table");
+like($dump, qr/^CREATE TABLE public\.bootab/m, "dumped children table");
 
 open $inputfile, '>', "$tempdir/inputfile.txt"
   or die "unable to open filterfile for writing";
@@ -750,14 +890,19 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"filter file without patterns");
 
 $dump = slurp_file($plainfile);
 
-ok($dump !~ qr/^CREATE TABLE public\.bootab/m,
+unlike(
+	$dump,
+	qr/^CREATE TABLE public\.bootab/m,
 	"exclude dumped children table");
 
 open $inputfile, '>', "$tempdir/inputfile.txt"
@@ -768,15 +913,18 @@ close $inputfile;
 
 command_ok(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	"filter file without patterns");
 
 $dump = slurp_file($plainfile);
 
-ok($dump =~ qr/^CREATE TABLE public\.bootab/m, "dumped children table");
-ok($dump !~ qr/^COPY public\.bootab/m, "exclude dumped children table");
+like($dump, qr/^CREATE TABLE public\.bootab/m, "dumped children table");
+unlike($dump, qr/^COPY public\.bootab/m, "exclude dumped children table");
 
 #########################################
 # Test extension
@@ -788,8 +936,11 @@ close $inputfile;
 
 command_fails_like(
 	[
-		'pg_dump', '-p', $port, '-f', $plainfile,
-		"--filter=$tempdir/inputfile.txt", 'postgres'
+		'pg_dump',
+		'--port' => $port,
+		'--file' => $plainfile,
+		'--filter' => "$tempdir/inputfile.txt",
+		'postgres'
 	],
 	qr/pg_dump: error: no matching extensions were found/,
 	"dump nonexisting extension");

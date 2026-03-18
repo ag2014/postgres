@@ -3,7 +3,7 @@
  * pg_iovec.h
  *	  Header for vectored I/O functions, to use in place of <sys/uio.h>.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/port/pg_iovec.h
@@ -16,13 +16,10 @@
 #ifndef WIN32
 
 #include <limits.h>
-#include <sys/uio.h>
+#include <sys/uio.h>			/* IWYU pragma: export */
 #include <unistd.h>
 
 #else
-
-/* POSIX requires at least 16 as a maximum iovcnt. */
-#define IOV_MAX 16
 
 /* Define our own POSIX-compatible iovec struct. */
 struct iovec
@@ -33,15 +30,28 @@ struct iovec
 
 #endif
 
-/* Define a reasonable maximum that is safe to use on the stack. */
-#define PG_IOV_MAX Min(IOV_MAX, 32)
+/*
+ * If <limits.h> didn't define IOV_MAX, define our own.  X/Open requires at
+ * least 16.  (GNU Hurd apparently feel that they're not bound by X/Open,
+ * because they don't define this symbol at all.)
+ */
+#ifndef IOV_MAX
+#define IOV_MAX 16
+#endif
+
+/*
+ * Define a reasonable maximum that is safe to use on the stack in arrays of
+ * struct iovec and other small types.  The operating system could limit us to
+ * a number as low as 16, but most systems have 1024.
+ */
+#define PG_IOV_MAX Min(IOV_MAX, 128)
 
 /*
  * Like preadv(), but with a prefix to remind us of a side-effect: on Windows
  * this changes the current file position.
  */
 static inline ssize_t
-pg_preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+pg_preadv(int fd, const struct iovec *iov, int iovcnt, pgoff_t offset)
 {
 #if HAVE_DECL_PREADV
 	/*
@@ -80,7 +90,7 @@ pg_preadv(int fd, const struct iovec *iov, int iovcnt, off_t offset)
  * this changes the current file position.
  */
 static inline ssize_t
-pg_pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset)
+pg_pwritev(int fd, const struct iovec *iov, int iovcnt, pgoff_t offset)
 {
 #if HAVE_DECL_PWRITEV
 	/*

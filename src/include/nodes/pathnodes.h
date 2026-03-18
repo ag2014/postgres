@@ -6,7 +6,7 @@
  * We don't support copying RelOptInfo, IndexOptInfo, or Path nodes.
  * There are some subsidiary structs that are useful to copy, though.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/pathnodes.h
@@ -22,6 +22,79 @@
 #include "nodes/parsenodes.h"
 #include "storage/block.h"
 
+/*
+ * Path generation strategies.
+ *
+ * These constants are used to specify the set of strategies that the planner
+ * should use, either for the query as a whole or for a specific baserel or
+ * joinrel. The various planner-related enable_* GUCs are used to set the
+ * PlannerGlobal's default_pgs_mask, and that in turn is used to set each
+ * RelOptInfo's pgs_mask. In both cases, extensions can use hooks to modify the
+ * default value.  Not every strategy listed here has a corresponding enable_*
+ * GUC; those that don't are always allowed unless disabled by an extension.
+ * Not all strategies are relevant for every RelOptInfo; e.g. PGS_SEQSCAN
+ * doesn't affect joinrels one way or the other.
+ *
+ * In most cases, disabling a path generation strategy merely means that any
+ * paths generated using that strategy are marked as disabled, but in some
+ * cases, path generation is skipped altogether. The latter strategy is only
+ * permissible when it can't result in planner failure -- for instance, we
+ * couldn't do this for sequential scans on a plain rel, because there might
+ * not be any other possible path. Nevertheless, the behaviors in each
+ * individual case are to some extent the result of historical accident,
+ * chosen to match the preexisting behaviors of the enable_* GUCs.
+ *
+ * In a few cases, we have more than one bit for the same strategy, controlling
+ * different aspects of the planner behavior. When PGS_CONSIDER_INDEXONLY is
+ * unset, we don't even consider index-only scans, and any such scans that
+ * would have been generated become index scans instead. On the other hand,
+ * unsetting PGS_INDEXSCAN or PGS_INDEXONLYSCAN causes generated paths of the
+ * corresponding types to be marked as disabled. Similarly, unsetting
+ * PGS_CONSIDER_PARTITIONWISE prevents any sort of thinking about partitionwise
+ * joins for the current rel, which incidentally will preclude higher-level
+ * joinrels from building partitionwise paths using paths taken from the
+ * current rel's children. On the other hand, unsetting PGS_APPEND or
+ * PGS_MERGE_APPEND will only arrange to disable paths of the corresponding
+ * types if they are generated at the level of the current rel.
+ *
+ * Finally, unsetting PGS_CONSIDER_NONPARTIAL disables all non-partial paths
+ * except those that use Gather or Gather Merge. In most other cases, a
+ * plugin can nudge the planner toward a particular strategy by disabling
+ * all of the others, but that doesn't work here: unsetting PGS_SEQSCAN,
+ * for instance, would disable both partial and non-partial sequential scans.
+ */
+#define PGS_SEQSCAN					0x00000001
+#define PGS_INDEXSCAN				0x00000002
+#define PGS_INDEXONLYSCAN			0x00000004
+#define PGS_BITMAPSCAN				0x00000008
+#define PGS_TIDSCAN					0x00000010
+#define PGS_FOREIGNJOIN				0x00000020
+#define PGS_MERGEJOIN_PLAIN			0x00000040
+#define PGS_MERGEJOIN_MATERIALIZE	0x00000080
+#define PGS_NESTLOOP_PLAIN			0x00000100
+#define PGS_NESTLOOP_MATERIALIZE	0x00000200
+#define PGS_NESTLOOP_MEMOIZE		0x00000400
+#define PGS_HASHJOIN				0x00000800
+#define PGS_APPEND					0x00001000
+#define PGS_MERGE_APPEND			0x00002000
+#define PGS_GATHER					0x00004000
+#define PGS_GATHER_MERGE			0x00008000
+#define PGS_CONSIDER_INDEXONLY		0x00010000
+#define PGS_CONSIDER_PARTITIONWISE	0x00020000
+#define PGS_CONSIDER_NONPARTIAL		0x00040000
+
+/*
+ * Convenience macros for useful combination of the bits defined above.
+ */
+#define PGS_SCAN_ANY		\
+	(PGS_SEQSCAN | PGS_INDEXSCAN | PGS_INDEXONLYSCAN | PGS_BITMAPSCAN | \
+	 PGS_TIDSCAN)
+#define PGS_MERGEJOIN_ANY	\
+	(PGS_MERGEJOIN_PLAIN | PGS_MERGEJOIN_MATERIALIZE)
+#define PGS_NESTLOOP_ANY	\
+	(PGS_NESTLOOP_PLAIN | PGS_NESTLOOP_MATERIALIZE | PGS_NESTLOOP_MEMOIZE)
+#define PGS_JOIN_ANY		\
+	(PGS_FOREIGNJOIN | PGS_MERGEJOIN_ANY | PGS_NESTLOOP_ANY | PGS_HASHJOIN)
 
 /*
  * Relids
@@ -110,14 +183,33 @@ typedef struct PlannerGlobal
 	/* PlannerInfos for SubPlan nodes */
 	List	   *subroots pg_node_attr(read_write_ignore);
 
+	/* names already used for subplans (list of C strings) */
+	List	   *subplanNames pg_node_attr(read_write_ignore);
+
 	/* indices of subplans that require REWIND */
 	Bitmapset  *rewindPlanIDs;
 
 	/* "flat" rangetable for executor */
 	List	   *finalrtable;
 
+	/*
+	 * RT indexes of all relation RTEs in finalrtable (RTE_RELATION and
+	 * RTE_SUBQUERY RTEs of views)
+	 */
+	Bitmapset  *allRelids;
+
+	/*
+	 * RT indexes of all leaf partitions in nodes that support pruning and are
+	 * subject to runtime pruning at plan initialization time ("initial"
+	 * pruning).
+	 */
+	Bitmapset  *prunableRelids;
+
 	/* "flat" list of RTEPermissionInfos */
 	List	   *finalrteperminfos;
+
+	/* list of SubPlanRTInfo nodes */
+	List	   *subrtinfos;
 
 	/* "flat" list of PlanRowMarks */
 	List	   *finalrowmarks;
@@ -128,6 +220,9 @@ typedef struct PlannerGlobal
 	/* "flat" list of AppendRelInfos */
 	List	   *appendRelations;
 
+	/* "flat" list of PartitionPruneInfos */
+	List	   *partPruneInfos;
+
 	/* OIDs of relations the plan depends on */
 	List	   *relationOids;
 
@@ -136,6 +231,9 @@ typedef struct PlannerGlobal
 
 	/* type OIDs for PARAM_EXEC Params */
 	List	   *paramExecTypes;
+
+	/* info about nodes elided from the plan during setrefs processing */
+	List	   *elidedNodes;
 
 	/* highest PlaceHolderVar ID assigned */
 	Index		lastPHId;
@@ -161,8 +259,18 @@ typedef struct PlannerGlobal
 	/* worst PROPARALLEL hazard level */
 	char		maxParallelHazard;
 
+	/* mask of allowed path generation strategies */
+	uint64		default_pgs_mask;
+
 	/* partition descriptors */
 	PartitionDirectory partition_directory pg_node_attr(read_write_ignore);
+
+	/* hash table for NOT NULL attnums of relations */
+	struct HTAB *rel_notnullatts_hash pg_node_attr(read_write_ignore);
+
+	/* extension state */
+	void	  **extension_state pg_node_attr(read_write_ignore);
+	int			extension_state_allocated;
 } PlannerGlobal;
 
 /* macro for fetching the Plan associated with a SubPlan node */
@@ -179,18 +287,17 @@ typedef struct PlannerGlobal
  * original Query.  Note that at present the planner extensively modifies
  * the passed-in Query data structure; someday that should stop.
  *
- * For reasons explained in optimizer/optimizer.h, we define the typedef
- * either here or in that header, whichever is read first.
- *
  * Not all fields are printed.  (In some cases, there is no print support for
  * the field type; in others, doing so would lead to infinite recursion or
  * bloat dump output more than seems useful.)
+ *
+ * NOTE: When adding new entries containing relids and relid bitmapsets,
+ * remember to check that they will be correctly processed by
+ * the remove_self_join_rel function - relid of removing relation will be
+ * correctly replaced with the keeping one.
  *----------
  */
-#ifndef HAVE_PLANNERINFO_TYPEDEF
 typedef struct PlannerInfo PlannerInfo;
-#define HAVE_PLANNERINFO_TYPEDEF 1
-#endif
 
 struct PlannerInfo
 {
@@ -209,6 +316,9 @@ struct PlannerInfo
 
 	/* NULL at outermost Query */
 	PlannerInfo *parent_root pg_node_attr(read_write_ignore);
+
+	/* Subplan name for EXPLAIN and debugging purposes (NULL at top level) */
+	char	   *plan_name;
 
 	/*
 	 * plan_params contains the expressions that this query level needs to
@@ -373,6 +483,15 @@ struct PlannerInfo
 	/* list of PlaceHolderInfos */
 	List	   *placeholder_list;
 
+	/* list of AggClauseInfos */
+	List	   *agg_clause_list;
+
+	/* list of GroupingExprInfos */
+	List	   *group_expr_list;
+
+	/* list of plain Vars contained in targetlist and havingQual */
+	List	   *tlist_vars;
+
 	/* array of PlaceHolderInfos indexed by phid */
 	struct PlaceHolderInfo **placeholder_array pg_node_attr(read_write_ignore, array_size(placeholder_array_size));
 	/* allocated size of array */
@@ -508,6 +627,8 @@ struct PlannerInfo
 	bool		placeholdersFrozen;
 	/* true if planning a recursive WITH item */
 	bool		hasRecursion;
+	/* true if a planner extension may replan this subquery */
+	bool		assumeReplanning;
 
 	/*
 	 * The rangetable index for the RTE_GROUP RTE, or 0 if there is no
@@ -554,11 +675,12 @@ struct PlannerInfo
 	bool	   *isAltSubplan pg_node_attr(read_write_ignore);
 	bool	   *isUsedSubplan pg_node_attr(read_write_ignore);
 
-	/* optional private data for join_search_hook, e.g., GEQO */
-	void	   *join_search_private pg_node_attr(read_write_ignore);
+	/* PartitionPruneInfos added in this query's plan. */
+	List	   *partPruneInfos;
 
-	/* Does this query modify any partition key columns? */
-	bool		partColsUpdated;
+	/* extension state */
+	void	  **extension_state pg_node_attr(read_write_ignore);
+	int			extension_state_allocated;
 };
 
 
@@ -599,7 +721,7 @@ typedef struct PartitionSchemeData
 
 	/* Cached information about partition comparison functions. */
 	struct FmgrInfo *partsupfunc;
-}			PartitionSchemeData;
+} PartitionSchemeData;
 
 typedef struct PartitionSchemeData *PartitionScheme;
 
@@ -676,8 +798,6 @@ typedef struct PartitionSchemeData *PartitionScheme;
  *			(regardless of ordering) among the unparameterized paths;
  *			or if there is no unparameterized path, the path with lowest
  *			total cost among the paths with minimum parameterization
- *		cheapest_unique_path - for caching cheapest path to produce unique
- *			(no duplicates) output from relation; NULL if not yet requested
  *		cheapest_parameterized_paths - best paths for their parameterizations;
  *			always includes cheapest_total_path, even if that's unparameterized
  *		direct_lateral_relids - rels this rel has direct LATERAL references to
@@ -695,6 +815,9 @@ typedef struct PartitionSchemeData *PartitionScheme;
  *				the attribute is needed as part of final targetlist
  *		attr_widths - cache space for per-attribute width estimates;
  *					  zero means not computed yet
+ *		notnullattnums - zero-based set containing attnums of NOT NULL
+ *						 columns (not populated for rels corresponding to
+ *						 non-partitioned inh==true RTEs)
  *		nulling_relids - relids of outer joins that can null this rel
  *		lateral_vars - lateral cross-references of rel, if any (list of
  *					   Vars and PlaceHolderVars)
@@ -734,11 +857,26 @@ typedef struct PartitionSchemeData *PartitionScheme;
  * populate these fields, for base rels; but someday they might be used for
  * join rels too:
  *
- *		unique_for_rels - list of Relid sets, each one being a set of other
+ *		unique_for_rels - list of UniqueRelInfo, each one being a set of other
  *					rels for which this one has been proven unique
  *		non_unique_for_rels - list of Relid sets, each one being a set of
  *					other rels for which we have tried and failed to prove
  *					this one unique
+ *
+ * Three fields are used to cache information about unique-ification of this
+ * relation.  This is used to support semijoins where the relation appears on
+ * the RHS: the relation is first unique-ified, and then a regular join is
+ * performed:
+ *
+ *		unique_rel - the unique-ified version of the relation, containing paths
+ *					that produce unique (no duplicates) output from relation;
+ *					NULL if not yet requested
+ *		unique_pathkeys - pathkeys that represent the ordering requirements for
+ *					the relation's output in sort-based unique-ification
+ *					implementations
+ *		unique_groupclause - a list of SortGroupClause nodes that represent the
+ *					columns to be grouped on in hash-based unique-ification
+ *					implementations
  *
  * The presence of the following fields depends on the restrictions
  * and joins that the relation participates in:
@@ -877,7 +1015,7 @@ typedef struct RelOptInfo
 	Cardinality rows;
 
 	/*
-	 * per-relation planner control flags
+	 * per-relation planner control
 	 */
 	/* keep cheap-startup-cost paths? */
 	bool		consider_startup;
@@ -885,6 +1023,8 @@ typedef struct RelOptInfo
 	bool		consider_param_startup;
 	/* consider parallel paths? */
 	bool		consider_parallel;
+	/* path generation strategy mask */
+	uint64		pgs_mask;
 
 	/*
 	 * default result targetlist for Paths scanning this relation; list of
@@ -900,7 +1040,6 @@ typedef struct RelOptInfo
 	List	   *partial_pathlist;	/* partial Paths */
 	struct Path *cheapest_startup_path;
 	struct Path *cheapest_total_path;
-	struct Path *cheapest_unique_path;
 	List	   *cheapest_parameterized_paths;
 
 	/*
@@ -928,11 +1067,7 @@ typedef struct RelOptInfo
 	Relids	   *attr_needed pg_node_attr(read_write_ignore);
 	/* array indexed [min_attr .. max_attr] */
 	int32	   *attr_widths pg_node_attr(read_write_ignore);
-
-	/*
-	 * Zero-based set containing attnums of NOT NULL columns.  Not populated
-	 * for rels corresponding to non-partitioned inh==true RTEs.
-	 */
+	/* zero-based set containing attnums of NOT NULL columns */
 	Bitmapset  *notnullattnums;
 	/* relids of outer joins that can null this baserel */
 	Relids		nulling_relids;
@@ -973,10 +1108,20 @@ typedef struct RelOptInfo
 	/*
 	 * cache space for remembering if we have proven this relation unique
 	 */
-	/* known unique for these other relid set(s) */
+	/* known unique for these other relid set(s) given in UniqueRelInfo(s) */
 	List	   *unique_for_rels;
 	/* known not unique for these set(s) */
 	List	   *non_unique_for_rels;
+
+	/*
+	 * information about unique-ification of this relation
+	 */
+	/* the unique-ified version of the relation */
+	struct RelOptInfo *unique_rel;
+	/* pathkeys for sort-based unique-ification implementations */
+	List	   *unique_pathkeys;
+	/* SortGroupClause nodes for hash-based unique-ification implementations */
+	List	   *unique_groupclause;
 
 	/*
 	 * used by various scans and joins:
@@ -997,6 +1142,14 @@ typedef struct RelOptInfo
 	 */
 	/* consider partitionwise join paths? (if partitioned rel) */
 	bool		consider_partitionwise_join;
+
+	/*
+	 * used by eager aggregation:
+	 */
+	/* information needed to create grouped paths */
+	struct RelAggInfo *agg_info;
+	/* the partially-aggregated version of the relation */
+	struct RelOptInfo *grouped_rel;
 
 	/*
 	 * inheritance links, if this is an otherrel (otherwise NULL):
@@ -1049,6 +1202,10 @@ typedef struct RelOptInfo
 	List	  **partexprs pg_node_attr(read_write_ignore);
 	/* Nullable partition key expressions */
 	List	  **nullable_partexprs pg_node_attr(read_write_ignore);
+
+	/* extension state */
+	void	  **extension_state pg_node_attr(read_write_ignore);
+	int			extension_state_allocated;
 } RelOptInfo;
 
 /*
@@ -1072,12 +1229,81 @@ typedef struct RelOptInfo
 	 (rel)->part_rels && (rel)->partexprs && (rel)->nullable_partexprs)
 
 /*
+ * Is given relation unique-ified?
+ *
+ * When the nominal jointype is JOIN_INNER, sjinfo->jointype is JOIN_SEMI, and
+ * the given rel is exactly the RHS of the semijoin, it indicates that the rel
+ * has been unique-ified.
+ */
+#define RELATION_WAS_MADE_UNIQUE(rel, sjinfo, nominal_jointype) \
+	((nominal_jointype) == JOIN_INNER && (sjinfo)->jointype == JOIN_SEMI && \
+	 bms_equal((sjinfo)->syn_righthand, (rel)->relids))
+
+/*
+ * Is the given relation a grouped relation?
+ */
+#define IS_GROUPED_REL(rel) \
+	((rel)->agg_info != NULL)
+
+/*
+ * RelAggInfo
+ *		Information needed to create paths for a grouped relation.
+ *
+ * "target" is the default result targetlist for Paths scanning this grouped
+ * relation; list of Vars/Exprs, cost, width.
+ *
+ * "agg_input" is the output tlist for the paths that provide input to the
+ * grouped paths.  One difference from the reltarget of the non-grouped
+ * relation is that agg_input has its sortgrouprefs[] initialized.
+ *
+ * "group_clauses" and "group_exprs" are lists of SortGroupClauses and the
+ * corresponding grouping expressions.
+ *
+ * "apply_agg_at" tracks the set of relids at which partial aggregation is
+ * applied in the paths of this grouped relation.
+ *
+ * "grouped_rows" is the estimated number of result tuples of the grouped
+ * relation.
+ *
+ * "agg_useful" is a flag to indicate whether the grouped paths are considered
+ * useful.  It is set true if the average partial group size is no less than
+ * min_eager_agg_group_size, suggesting a significant row count reduction.
+ */
+typedef struct RelAggInfo
+{
+	pg_node_attr(no_copy_equal, no_read, no_query_jumble)
+
+	NodeTag		type;
+
+	/* the output tlist for the grouped paths */
+	struct PathTarget *target;
+
+	/* the output tlist for the input paths */
+	struct PathTarget *agg_input;
+
+	/* a list of SortGroupClauses */
+	List	   *group_clauses;
+	/* a list of grouping expressions */
+	List	   *group_exprs;
+
+	/* the set of relids partial aggregation is applied at */
+	Relids		apply_agg_at;
+
+	/* estimated number of result tuples */
+	Cardinality grouped_rows;
+
+	/* the grouped paths are considered useful? */
+	bool		agg_useful;
+} RelAggInfo;
+
+/*
  * IndexOptInfo
  *		Per-index information for planning/optimization
  *
- *		indexkeys[], indexcollations[] each have ncolumns entries.
- *		opfamily[], and opcintype[]	each have nkeycolumns entries. They do
- *		not contain any information about included attributes.
+ *		indexkeys[] and canreturn[] each have ncolumns entries.
+ *
+ *		indexcollations[], opfamily[], and opcintype[] each have nkeycolumns
+ *		entries.  These don't contain any information about INCLUDE columns.
  *
  *		sortopfamily[], reverse_sort[], and nulls_first[] have
  *		nkeycolumns entries, if the index is ordered; but if it is unordered,
@@ -1102,15 +1328,10 @@ typedef struct RelOptInfo
  *		(by plancat.c), indrestrictinfo and predOK are set later, in
  *		check_index_predicates().
  */
-#ifndef HAVE_INDEXOPTINFO_TYPEDEF
-typedef struct IndexOptInfo IndexOptInfo;
-#define HAVE_INDEXOPTINFO_TYPEDEF 1
-#endif
 
-struct IndexPath;				/* avoid including pathnodes.h here */
-struct PlannerInfo;				/* avoid including pathnodes.h here */
+struct IndexPath;				/* forward declaration */
 
-struct IndexOptInfo
+typedef struct IndexOptInfo
 {
 	pg_node_attr(no_copy_equal, no_read, no_query_jumble)
 
@@ -1187,8 +1408,12 @@ struct IndexOptInfo
 	bool		predOK;
 	/* true if a unique index */
 	bool		unique;
+	/* true if the index was defined with NULLS NOT DISTINCT */
+	bool		nullsnotdistinct;
 	/* is uniqueness enforced immediately? */
 	bool		immediate;
+	/* true if paths using this index should be marked disabled */
+	bool		disabled;
 	/* true if index doesn't really exist */
 	bool		hypothetical;
 
@@ -1210,7 +1435,7 @@ struct IndexOptInfo
 	/* AM's cost estimator */
 	/* Rather than include amapi.h here, we declare amcostestimate like this */
 	void		(*amcostestimate) (struct PlannerInfo *, struct IndexPath *, double, Cost *, Cost *, Selectivity *, double *, double *) pg_node_attr(read_write_ignore);
-};
+} IndexOptInfo;
 
 /*
  * ForeignKeyOptInfo
@@ -1374,6 +1599,36 @@ typedef struct JoinDomain
  * entry: consider SELECT random() AS a, random() AS b ... ORDER BY b,a.
  * So we record the SortGroupRef of the originating sort clause.
  *
+ * Derived equality clauses are stored in ec_derives_list. For small queries,
+ * this list is scanned directly during lookup. For larger queries -- e.g.,
+ * with many partitions or joins -- a hash table (ec_derives_hash) is built
+ * when the list grows beyond a threshold, for faster lookup. When present,
+ * the hash table contains the same RestrictInfos and is maintained alongside
+ * the list. We retain the list even when the hash is used to simplify
+ * serialization (e.g., in _outEquivalenceClass()) and support
+ * EquivalenceClass merging.
+ *
+ * In contrast, ec_sources holds equality clauses that appear directly in the
+ * query. These are typically few and do not require a hash table for lookup.
+ *
+ * 'ec_members' is a List of all !em_is_child EquivalenceMembers in the class.
+ * EquivalenceMembers for any RELOPT_OTHER_MEMBER_REL and RELOPT_OTHER_JOINREL
+ * relations are stored in the 'ec_childmembers' array in the index
+ * corresponding to the relid, or first component relid in the case of
+ * RELOPT_OTHER_JOINRELs.  'ec_childmembers' is NULL if the class has no child
+ * EquivalenceMembers.
+ *
+ * For code wishing to look at EquivalenceMembers, if only parent-level
+ * members are needed, then a simple foreach loop over ec_members is
+ * sufficient.  When child members are also required, it is best to use the
+ * functionality provided by EquivalenceMemberIterator.  This visits all
+ * parent members and only the relevant child members.  The reason for this
+ * is that large numbers of child EquivalenceMembers can exist in queries to
+ * partitioned tables with many partitions.  The functionality provided by
+ * EquivalenceMemberIterator allows efficient access to EquivalenceMembers
+ * which belong to specific child relids.  See the header comments for
+ * EquivalenceMemberIterator below for further details.
+ *
  * NB: if ec_merged isn't NULL, this class has been merged into another, and
  * should be ignored in favor of using the pointed-to class.
  *
@@ -1391,9 +1646,14 @@ typedef struct EquivalenceClass
 
 	List	   *ec_opfamilies;	/* btree operator family OIDs */
 	Oid			ec_collation;	/* collation, if datatypes are collatable */
+	int			ec_childmembers_size;	/* # elements in ec_childmembers */
 	List	   *ec_members;		/* list of EquivalenceMembers */
+	List	  **ec_childmembers;	/* array of Lists of child members */
 	List	   *ec_sources;		/* list of generating RestrictInfos */
-	List	   *ec_derives;		/* list of derived RestrictInfos */
+	List	   *ec_derives_list;	/* list of derived RestrictInfos */
+	struct derives_hash *ec_derives_hash;	/* optional hash table for fast
+											 * lookup; contains same
+											 * RestrictInfos as list */
 	Relids		ec_relids;		/* all relids appearing in ec_members, except
 								 * for child members (see below) */
 	bool		ec_has_const;	/* any pseudoconstants in ec_members? */
@@ -1422,12 +1682,17 @@ typedef struct EquivalenceClass
  * child when necessary to build a MergeAppend path for the whole appendrel
  * tree.  An em_is_child member has no impact on the properties of the EC as a
  * whole; in particular the EC's ec_relids field does NOT include the child
- * relation.  An em_is_child member should never be marked em_is_const nor
- * cause ec_has_const or ec_has_volatile to be set, either.  Thus, em_is_child
- * members are not really full-fledged members of the EC, but just reflections
- * or doppelgangers of real members.  Most operations on EquivalenceClasses
- * should ignore em_is_child members, and those that don't should test
- * em_relids to make sure they only consider relevant members.
+ * relation.  em_is_child members aren't stored in the ec_members List of the
+ * EC and instead they're stored and indexed by the relids of the child
+ * relation they represent in ec_childmembers.  An em_is_child member
+ * should never be marked em_is_const nor cause ec_has_const or
+ * ec_has_volatile to be set, either.  Thus, em_is_child members are not
+ * really full-fledged members of the EC, but just reflections or
+ * doppelgangers of real members.  Most operations on EquivalenceClasses
+ * should ignore em_is_child members by only inspecting members in the
+ * ec_members list.  Callers that require inspecting child members should do
+ * so using an EquivalenceMemberIterator and should test em_relids to make
+ * sure they only consider relevant members.
  *
  * em_datatype is usually the same as exprType(em_expr), but can be
  * different when dealing with a binary-compatible opfamily; in particular
@@ -1451,6 +1716,67 @@ typedef struct EquivalenceMember
 } EquivalenceMember;
 
 /*
+ * EquivalenceMemberIterator
+ *
+ * EquivalenceMemberIterator allows efficient access to sets of
+ * EquivalenceMembers for callers which require access to child members.
+ * Because partitioning workloads can result in large numbers of child
+ * members, the child members are not stored in the EquivalenceClass's
+ * ec_members List.  Instead, these are stored in the EquivalenceClass's
+ * ec_childmembers array of Lists.  The functionality provided by
+ * EquivalenceMemberIterator aims to provide efficient access to parent
+ * members and child members belonging to specific child relids.
+ *
+ * Currently, there is only one way to initialize and iterate over an
+ * EquivalenceMemberIterator and that is via the setup_eclass_member_iterator
+ * and eclass_member_iterator_next functions.  The iterator object is
+ * generally a local variable which is passed by address to
+ * setup_eclass_member_iterator.  The calling function defines which
+ * EquivalenceClass the iterator should be looking at and which child
+ * relids to also return members for.  child_relids can be passed as NULL, but
+ * the caller may as well just perform a foreach loop over ec_members as only
+ * parent-level members will be returned in that case.
+ *
+ * When calling the next function on an EquivalenceMemberIterator, all
+ * parent-level EquivalenceMembers are returned first, followed by all child
+ * members for the specified 'child_relids' for all child members which were
+ * indexed by any of the specified 'child_relids' in add_child_eq_member().
+ *
+ * Code using the iterator method of finding EquivalenceMembers will generally
+ * always want to ensure the returned member matches their search criteria
+ * rather than relying on the filtering to be done for them as all parent
+ * members are returned and for members belonging to RELOPT_OTHER_JOINREL
+ * rels, the member's em_relids may be a superset of the specified
+ * 'child_relids', which might not be what the caller wants.
+ *
+ * The most common way to use this iterator is as follows:
+ * -----
+ * EquivalenceMemberIterator		it;
+ * EquivalenceMember			   *em;
+ *
+ * setup_eclass_member_iterator(&it, ec, child_relids);
+ * while ((em = eclass_member_iterator_next(&it)) != NULL)
+ * {
+ *		...
+ * }
+ * -----
+ * It is not valid to call eclass_member_iterator_next() after it has returned
+ * NULL for any given EquivalenceMemberIterator.  Individual fields within
+ * the EquivalenceMemberIterator struct must not be accessed by callers.
+ */
+typedef struct
+{
+	EquivalenceClass *ec;		/* The EquivalenceClass to iterate over */
+	int			current_relid;	/* Current relid position within 'relids'. -1
+								 * when still looping over ec_members and -2
+								 * at the end of iteration */
+	Relids		child_relids;	/* Relids of child relations of interest.
+								 * Non-child rels are ignored */
+	ListCell   *current_cell;	/* Next cell to return within current_list */
+	List	   *current_list;	/* Current list of members being returned */
+} EquivalenceMemberIterator;
+
+/*
  * PathKeys
  *
  * The sort ordering of a path is represented by a list of PathKey nodes.
@@ -1463,9 +1789,7 @@ typedef struct EquivalenceMember
  * equivalent and closely-related orderings. (See optimizer/README for more
  * information.)
  *
- * Note: pk_strategy is either BTLessStrategyNumber (for ASC) or
- * BTGreaterStrategyNumber (for DESC).  We assume that all ordering-capable
- * index types will use btree-compatible strategy numbers.
+ * Note: pk_cmptype is either COMPARE_LT (for ASC) or COMPARE_GT (for DESC).
  */
 typedef struct PathKey
 {
@@ -1475,8 +1799,8 @@ typedef struct PathKey
 
 	/* the value that is ordered */
 	EquivalenceClass *pk_eclass pg_node_attr(copy_as_scalar, equal_as_scalar);
-	Oid			pk_opfamily;	/* btree opfamily defining the ordering */
-	int			pk_strategy;	/* sort direction (ASC or DESC) */
+	Oid			pk_opfamily;	/* index opfamily defining the ordering */
+	CompareType pk_cmptype;		/* sort direction (ASC or DESC) */
 	bool		pk_nulls_first; /* do NULLs come before normal values? */
 } PathKey;
 
@@ -1615,8 +1939,8 @@ typedef struct ParamPathInfo
  * and the specified outer rel(s).
  *
  * "rows" is the same as parent->rows in simple paths, but in parameterized
- * paths and UniquePaths it can be less than parent->rows, reflecting the
- * fact that we've filtered by extra join conditions or removed duplicates.
+ * paths it can be less than parent->rows, reflecting the fact that we've
+ * filtered by extra join conditions.
  *
  * "pathkeys" is a List of PathKey nodes (see above), describing the sort
  * ordering of the path's output rows.
@@ -1928,6 +2252,12 @@ typedef struct CustomPath
  * For partial Append, 'subpaths' contains non-partial subpaths followed by
  * partial subpaths.
  *
+ * Whenever accumulate_append_subpath() allows us to consolidate multiple
+ * levels of Append paths down to one, we store the RTI sets for the omitted
+ * paths in child_append_relid_sets. This is not necessary for planning or
+ * execution; we do it for the benefit of code that wants to inspect the
+ * final plan and understand how it came to be.
+ *
  * Note: it is possible for "subpaths" to contain only one, or even no,
  * elements.  These cases are optimized during create_append_plan.
  * In particular, an AppendPath with no subpaths is a "dummy" path that
@@ -1943,6 +2273,7 @@ typedef struct AppendPath
 	/* Index of first partial path in subpaths; list_length(subpaths) if none */
 	int			first_partial_path;
 	Cardinality limit_tuples;	/* hard limit on output tuples, or -1 */
+	List	   *child_append_relid_sets;
 } AppendPath;
 
 #define IS_DUMMY_APPEND(p) \
@@ -1959,12 +2290,15 @@ extern bool is_dummy_rel(RelOptInfo *rel);
 /*
  * MergeAppendPath represents a MergeAppend plan, ie, the merging of sorted
  * results from several member plans to produce similarly-sorted output.
+ *
+ * child_append_relid_sets has the same meaning here as for AppendPath.
  */
 typedef struct MergeAppendPath
 {
 	Path		path;
 	List	   *subpaths;		/* list of component Paths */
 	Cardinality limit_tuples;	/* hard limit on output tuples, or -1 */
+	List	   *child_append_relid_sets;
 } MergeAppendPath;
 
 /*
@@ -2007,39 +2341,13 @@ typedef struct MemoizePath
 								 * complete after caching the first record. */
 	bool		binary_mode;	/* true when cache key should be compared bit
 								 * by bit, false when using hash equality ops */
-	Cardinality calls;			/* expected number of rescans */
 	uint32		est_entries;	/* The maximum number of entries that the
 								 * planner expects will fit in the cache, or 0
 								 * if unknown */
+	Cardinality est_calls;		/* expected number of rescans */
+	Cardinality est_unique_keys;	/* estimated unique keys, for EXPLAIN */
+	double		est_hit_ratio;	/* estimated cache hit ratio, for EXPLAIN */
 } MemoizePath;
-
-/*
- * UniquePath represents elimination of distinct rows from the output of
- * its subpath.
- *
- * This can represent significantly different plans: either hash-based or
- * sort-based implementation, or a no-op if the input path can be proven
- * distinct already.  The decision is sufficiently localized that it's not
- * worth having separate Path node types.  (Note: in the no-op case, we could
- * eliminate the UniquePath node entirely and just return the subpath; but
- * it's convenient to have a UniquePath in the path tree to signal upper-level
- * routines that the input is known distinct.)
- */
-typedef enum UniquePathMethod
-{
-	UNIQUE_PATH_NOOP,			/* input is known unique already */
-	UNIQUE_PATH_HASH,			/* use hashing */
-	UNIQUE_PATH_SORT,			/* use sorting */
-} UniquePathMethod;
-
-typedef struct UniquePath
-{
-	Path		path;
-	Path	   *subpath;
-	UniquePathMethod umethod;
-	List	   *in_operators;	/* equality operators of the IN clause */
-	List	   *uniq_exprs;		/* expressions to be made unique */
-} UniquePath;
 
 /*
  * GatherPath runs several copies of a plan in parallel and collects the
@@ -2126,6 +2434,12 @@ typedef struct NestPath
  * mergejoin.  If it is not NIL then it is a PathKeys list describing
  * the ordering that must be created by an explicit Sort node.
  *
+ * outer_presorted_keys is the number of presorted keys of the outer
+ * path that match outersortkeys.  It is used to determine whether
+ * explicit incremental sort can be applied when outersortkeys is not
+ * NIL.  We do not track the number of presorted keys of the inner
+ * path, as incremental sort currently does not support mark/restore.
+ *
  * skip_mark_restore is true if the executor need not do mark/restore calls.
  * Mark/restore overhead is usually required, but can be skipped if we know
  * that the executor need find only one match per outer tuple, and that the
@@ -2143,6 +2457,8 @@ typedef struct MergePath
 	List	   *path_mergeclauses;	/* join clauses to be used for merge */
 	List	   *outersortkeys;	/* keys for explicit sort, if any */
 	List	   *innersortkeys;	/* keys for explicit sort, if any */
+	int			outer_presorted_keys;	/* number of presorted keys of the
+										 * outer path */
 	bool		skip_mark_restore;	/* can executor skip mark/restore? */
 	bool		materialize_inner;	/* add Materialize to inner? */
 } MergePath;
@@ -2239,17 +2555,17 @@ typedef struct GroupPath
 } GroupPath;
 
 /*
- * UpperUniquePath represents adjacent-duplicate removal (in presorted input)
+ * UniquePath represents adjacent-duplicate removal (in presorted input)
  *
  * The columns to be compared are the first numkeys columns of the path's
  * pathkeys.  The input is presumed already sorted that way.
  */
-typedef struct UpperUniquePath
+typedef struct UniquePath
 {
 	Path		path;
 	Path	   *subpath;		/* path representing input source */
 	int			numkeys;		/* number of pathkey columns to compare */
-} UpperUniquePath;
+} UniquePath;
 
 /*
  * AggPath represents generic computation of aggregate functions
@@ -2340,13 +2656,12 @@ typedef struct WindowAggPath
 typedef struct SetOpPath
 {
 	Path		path;
-	Path	   *subpath;		/* path representing input source */
+	Path	   *leftpath;		/* paths representing input sources */
+	Path	   *rightpath;
 	SetOpCmd	cmd;			/* what to do, see nodes.h */
 	SetOpStrategy strategy;		/* how to do it, see nodes.h */
-	List	   *distinctList;	/* SortGroupClauses identifying target cols */
-	AttrNumber	flagColIdx;		/* where is the flag column, if any */
-	int			firstFlag;		/* flag value for first input relation */
-	Cardinality numGroups;		/* estimated number of groups in input */
+	List	   *groupList;		/* SortGroupClauses identifying target cols */
+	Cardinality numGroups;		/* estimated number of groups in left input */
 } SetOpPath;
 
 /*
@@ -2388,7 +2703,6 @@ typedef struct ModifyTablePath
 	bool		canSetTag;		/* do we set the command tag/es_processed? */
 	Index		nominalRelation;	/* Parent RT index for use of EXPLAIN */
 	Index		rootRelation;	/* Root RT index, if partitioned/inherited */
-	bool		partColsUpdated;	/* some part key in hierarchy updated? */
 	List	   *resultRelations;	/* integer list of RT indexes */
 	List	   *updateColnosLists;	/* per-target-table update_colnos lists */
 	List	   *withCheckOptionLists;	/* per-target-table WCO lists */
@@ -2742,9 +3056,9 @@ typedef struct RestrictInfo
 typedef struct MergeScanSelCache
 {
 	/* Ordering details (cache lookup key) */
-	Oid			opfamily;		/* btree opfamily defining the ordering */
+	Oid			opfamily;		/* index opfamily defining the ordering */
 	Oid			collation;		/* collation for the ordering */
-	int			strategy;		/* sort direction (ASC or DESC) */
+	CompareType cmptype;		/* sort direction (ASC or DESC) */
 	bool		nulls_first;	/* do NULLs come before normal values? */
 	/* Results */
 	Selectivity leftstartsel;	/* first-join fraction for clause left side */
@@ -2891,12 +3205,7 @@ typedef struct PlaceHolderVar
  * We also create transient SpecialJoinInfos for child joins during
  * partitionwise join planning, which are also not present in join_info_list.
  */
-#ifndef HAVE_SPECIALJOININFO_TYPEDEF
-typedef struct SpecialJoinInfo SpecialJoinInfo;
-#define HAVE_SPECIALJOININFO_TYPEDEF 1
-#endif
-
-struct SpecialJoinInfo
+typedef struct SpecialJoinInfo
 {
 	pg_node_attr(no_read, no_query_jumble)
 
@@ -2917,7 +3226,7 @@ struct SpecialJoinInfo
 	bool		semi_can_hash;	/* true if semi_operators are all hash */
 	List	   *semi_operators; /* OIDs of equality join operators */
 	List	   *semi_rhs_exprs; /* righthand-side expressions of these ops */
-};
+} SpecialJoinInfo;
 
 /*
  * Transient outer-join clause info.
@@ -3144,6 +3453,49 @@ typedef struct MinMaxAggInfo
 } MinMaxAggInfo;
 
 /*
+ * For each distinct Aggref node that appears in the targetlist and HAVING
+ * clauses, we store an AggClauseInfo node in the PlannerInfo node's
+ * agg_clause_list.  Each AggClauseInfo records the set of relations referenced
+ * by the aggregate expression.  This information is used to determine how far
+ * the aggregate can be safely pushed down in the join tree.
+ */
+typedef struct AggClauseInfo
+{
+	pg_node_attr(no_read, no_query_jumble)
+
+	NodeTag		type;
+
+	/* the Aggref expr */
+	Aggref	   *aggref;
+
+	/* lowest level we can evaluate this aggregate at */
+	Relids		agg_eval_at;
+} AggClauseInfo;
+
+/*
+ * For each grouping expression that appears in grouping clauses, we store a
+ * GroupingExprInfo node in the PlannerInfo node's group_expr_list.  Each
+ * GroupingExprInfo records the expression being grouped on, its sortgroupref,
+ * and the EquivalenceClass it belongs to.  This information is necessary to
+ * reproduce correct grouping semantics at different levels of the join tree.
+ */
+typedef struct GroupingExprInfo
+{
+	pg_node_attr(no_read, no_query_jumble)
+
+	NodeTag		type;
+
+	/* the represented expression */
+	Expr	   *expr;
+
+	/* the tleSortGroupRef of the corresponding SortGroupClause */
+	Index		sortgroupref;
+
+	/* the equivalence class the expression belongs to */
+	EquivalenceClass *ec pg_node_attr(copy_as_scalar, equal_as_scalar);
+} GroupingExprInfo;
+
+/*
  * At runtime, PARAM_EXEC slots are used to pass values around from one plan
  * node to another.  They can be used to pass values down into subqueries (for
  * outer references in subqueries), or up out of subqueries (for the results
@@ -3234,6 +3586,7 @@ typedef struct SemiAntiJoinFactors
  * sjinfo is extra info about special joins for selectivity estimation
  * semifactors is as shown above (only valid for SEMI/ANTI/inner_unique joins)
  * param_source_rels are OK targets for parameterization of result paths
+ * pgs_mask is a bitmask of PGS_* constants to limit the join strategy
  */
 typedef struct JoinPathExtraData
 {
@@ -3243,6 +3596,7 @@ typedef struct JoinPathExtraData
 	SpecialJoinInfo *sjinfo;
 	SemiAntiJoinFactors semifactors;
 	Relids		param_source_rels;
+	uint64		pgs_mask;
 } JoinPathExtraData;
 
 /*
@@ -3442,5 +3796,36 @@ typedef struct AggTransInfo
 	Datum		initValue pg_node_attr(read_write_ignore);
 	bool		initValueIsNull;
 } AggTransInfo;
+
+/*
+ * UniqueRelInfo caches a fact that a relation is unique when being joined
+ * to other relation(s).
+ */
+typedef struct UniqueRelInfo
+{
+	pg_node_attr(no_copy_equal, no_read, no_query_jumble)
+
+	NodeTag		type;
+
+	/*
+	 * The relation in consideration is unique when being joined with this set
+	 * of other relation(s).
+	 */
+	Relids		outerrelids;
+
+	/*
+	 * The relation in consideration is unique when considering only clauses
+	 * suitable for self-join (passed split_selfjoin_quals()).
+	 */
+	bool		self_join;
+
+	/*
+	 * Additional clauses from a baserestrictinfo list that were used to prove
+	 * the uniqueness.   We cache it for the self-join checking procedure: a
+	 * self-join can be removed if the outer relation contains strictly the
+	 * same set of clauses.
+	 */
+	List	   *extra_clauses;
+} UniqueRelInfo;
 
 #endif							/* PATHNODES_H */

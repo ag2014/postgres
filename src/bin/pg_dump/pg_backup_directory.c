@@ -19,7 +19,7 @@
  *	sync.
  *
  *
- *	Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ *	Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *	Portions Copyright (c) 1994, Regents of the University of California
  *	Portions Copyright (c) 2000, Philip Warner
  *
@@ -41,6 +41,7 @@
 
 #include "common/file_utils.h"
 #include "compress_io.h"
+#include "dumputils.h"
 #include "parallel.h"
 #include "pg_backup_utils.h"
 
@@ -139,7 +140,7 @@ InitArchiveFmt_Directory(ArchiveHandle *AH)
 	AH->WorkerJobDumpPtr = _WorkerJobDumpDirectory;
 
 	/* Set up our private context */
-	ctx = (lclContext *) pg_malloc0(sizeof(lclContext));
+	ctx = pg_malloc0_object(lclContext);
 	AH->formatData = ctx;
 
 	ctx->dataFH = NULL;
@@ -156,41 +157,8 @@ InitArchiveFmt_Directory(ArchiveHandle *AH)
 
 	if (AH->mode == archModeWrite)
 	{
-		struct stat st;
-		bool		is_empty = false;
-
 		/* we accept an empty existing directory */
-		if (stat(ctx->directory, &st) == 0 && S_ISDIR(st.st_mode))
-		{
-			DIR		   *dir = opendir(ctx->directory);
-
-			if (dir)
-			{
-				struct dirent *d;
-
-				is_empty = true;
-				while (errno = 0, (d = readdir(dir)))
-				{
-					if (strcmp(d->d_name, ".") != 0 && strcmp(d->d_name, "..") != 0)
-					{
-						is_empty = false;
-						break;
-					}
-				}
-
-				if (errno)
-					pg_fatal("could not read directory \"%s\": %m",
-							 ctx->directory);
-
-				if (closedir(dir))
-					pg_fatal("could not close directory \"%s\": %m",
-							 ctx->directory);
-			}
-		}
-
-		if (!is_empty && mkdir(ctx->directory, 0700) < 0)
-			pg_fatal("could not create directory \"%s\": %m",
-					 ctx->directory);
+		create_or_open_dir(ctx->directory);
 	}
 	else
 	{							/* Read Mode */
@@ -232,7 +200,7 @@ _ArchiveEntry(ArchiveHandle *AH, TocEntry *te)
 	lclTocEntry *tctx;
 	char		fn[MAXPGPATH];
 
-	tctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
+	tctx = pg_malloc0_object(lclTocEntry);
 	if (strcmp(te->desc, "BLOBS") == 0)
 	{
 		snprintf(fn, MAXPGPATH, "blobs_%d.toc", te->dumpId);
@@ -284,7 +252,7 @@ _ReadExtraToc(ArchiveHandle *AH, TocEntry *te)
 
 	if (tctx == NULL)
 	{
-		tctx = (lclTocEntry *) pg_malloc0(sizeof(lclTocEntry));
+		tctx = pg_malloc0_object(lclTocEntry);
 		te->formatData = tctx;
 	}
 
@@ -348,15 +316,9 @@ _WriteData(ArchiveHandle *AH, const void *data, size_t dLen)
 	lclContext *ctx = (lclContext *) AH->formatData;
 	CompressFileHandle *CFH = ctx->dataFH;
 
-	errno = 0;
-	if (dLen > 0 && !CFH->write_func(data, dLen, CFH))
-	{
-		/* if write didn't set errno, assume problem is no disk space */
-		if (errno == 0)
-			errno = ENOSPC;
-		pg_fatal("could not write to output file: %s",
-				 CFH->get_error_func(CFH));
-	}
+	if (dLen <= 0)
+		return;
+	CFH->write_func(data, dLen, CFH);
 }
 
 /*
@@ -383,7 +345,7 @@ _EndData(ArchiveHandle *AH, TocEntry *te)
 static void
 _PrintFileData(ArchiveHandle *AH, char *filename)
 {
-	size_t		cnt = 0;
+	size_t		cnt;
 	char	   *buf;
 	size_t		buflen;
 	CompressFileHandle *CFH;
@@ -398,7 +360,7 @@ _PrintFileData(ArchiveHandle *AH, char *filename)
 	buflen = DEFAULT_IO_BUFFER_SIZE;
 	buf = pg_malloc(buflen);
 
-	while (CFH->read_func(buf, buflen, &cnt, CFH) && cnt > 0)
+	while ((cnt = CFH->read_func(buf, buflen, CFH)) > 0)
 	{
 		ahwrite(buf, 1, cnt, AH);
 	}
@@ -444,10 +406,15 @@ _LoadLOs(ArchiveHandle *AH, TocEntry *te)
 
 	/*
 	 * Note: before archive v16, there was always only one BLOBS TOC entry,
-	 * now there can be multiple.  We don't need to worry what version we are
-	 * reading though, because tctx->filename should be correct either way.
+	 * now there can be multiple.  Furthermore, although the actual filename
+	 * was always "blobs.toc" before v16, the value of tctx->filename did not
+	 * match that before commit 548e50976 fixed it.  For simplicity we assume
+	 * it must be "blobs.toc" in all archives before v16.
 	 */
-	setFilePath(AH, tocfname, tctx->filename);
+	if (AH->version < K_VERS_1_16)
+		setFilePath(AH, tocfname, "blobs.toc");
+	else
+		setFilePath(AH, tocfname, tctx->filename);
 
 	CFH = ctx->LOsTocFH = InitDiscoverCompressFileHandle(tocfname, PG_BINARY_R);
 
@@ -497,16 +464,7 @@ _WriteByte(ArchiveHandle *AH, const int i)
 	lclContext *ctx = (lclContext *) AH->formatData;
 	CompressFileHandle *CFH = ctx->dataFH;
 
-	errno = 0;
-	if (!CFH->write_func(&c, 1, CFH))
-	{
-		/* if write didn't set errno, assume problem is no disk space */
-		if (errno == 0)
-			errno = ENOSPC;
-		pg_fatal("could not write to output file: %s",
-				 CFH->get_error_func(CFH));
-	}
-
+	CFH->write_func(&c, 1, CFH);
 	return 1;
 }
 
@@ -535,15 +493,7 @@ _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len)
 	lclContext *ctx = (lclContext *) AH->formatData;
 	CompressFileHandle *CFH = ctx->dataFH;
 
-	errno = 0;
-	if (!CFH->write_func(buf, len, CFH))
-	{
-		/* if write didn't set errno, assume problem is no disk space */
-		if (errno == 0)
-			errno = ENOSPC;
-		pg_fatal("could not write to output file: %s",
-				 CFH->get_error_func(CFH));
-	}
+	CFH->write_func(buf, len, CFH);
 }
 
 /*
@@ -558,10 +508,10 @@ _ReadBuf(ArchiveHandle *AH, void *buf, size_t len)
 	CompressFileHandle *CFH = ctx->dataFH;
 
 	/*
-	 * If there was an I/O error, we already exited in readF(), so here we
-	 * exit on short reads.
+	 * We do not expect a short read, so fail if we get one.  The read_func
+	 * already dealt with any outright I/O error.
 	 */
-	if (!CFH->read_func(buf, len, NULL, CFH))
+	if (CFH->read_func(buf, len, CFH) != len)
 		pg_fatal("could not read from input file: end of file");
 }
 
@@ -704,14 +654,7 @@ _EndLO(ArchiveHandle *AH, TocEntry *te, Oid oid)
 
 	/* register the LO in blobs_NNN.toc */
 	len = snprintf(buf, sizeof(buf), "%u blob_%u.dat\n", oid, oid);
-	if (!CFH->write_func(buf, len, CFH))
-	{
-		/* if write didn't set errno, assume problem is no disk space */
-		if (errno == 0)
-			errno = ENOSPC;
-		pg_fatal("could not write to LOs TOC file: %s",
-				 CFH->get_error_func(CFH));
-	}
+	CFH->write_func(buf, len, CFH);
 }
 
 /*
@@ -780,7 +723,7 @@ _PrepParallelRestore(ArchiveHandle *AH)
 			continue;
 
 		/* We may ignore items not due to be restored */
-		if ((te->reqs & REQ_DATA) == 0)
+		if ((te->reqs & (REQ_DATA | REQ_STATS)) == 0)
 			continue;
 
 		/*
@@ -826,7 +769,7 @@ _Clone(ArchiveHandle *AH)
 {
 	lclContext *ctx = (lclContext *) AH->formatData;
 
-	AH->formatData = (lclContext *) pg_malloc(sizeof(lclContext));
+	AH->formatData = pg_malloc_object(lclContext);
 	memcpy(AH->formatData, ctx, sizeof(lclContext));
 	ctx = (lclContext *) AH->formatData;
 

@@ -5,7 +5,7 @@
  * Archive streamer for verification of a tar format backup (including
  * compressed tar format backups).
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * src/bin/pg_verifybackup/astreamer_verify.c
  *
@@ -14,6 +14,7 @@
 
 #include "postgres_fe.h"
 
+#include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
 #include "pg_verifybackup.h"
 
@@ -68,7 +69,7 @@ astreamer_verify_content_new(astreamer *next, verifier_context *context,
 {
 	astreamer_verify *streamer;
 
-	streamer = palloc0(sizeof(astreamer_verify));
+	streamer = palloc0_object(astreamer_verify);
 	*((const astreamer_ops **) &streamer->base.bbs_ops) =
 		&astreamer_verify_ops;
 
@@ -78,7 +79,7 @@ astreamer_verify_content_new(astreamer *next, verifier_context *context,
 	streamer->tblspc_oid = tblspc_oid;
 
 	if (!context->skip_checksums)
-		streamer->checksum_ctx = pg_malloc(sizeof(pg_checksum_context));
+		streamer->checksum_ctx = pg_malloc_object(pg_checksum_context);
 
 	return &streamer->base;
 }
@@ -126,7 +127,7 @@ astreamer_verify_content(astreamer *streamer, astreamer_member *member,
 
 		default:
 			/* Shouldn't happen. */
-			pg_fatal("unexpected state while parsing tar file");
+			pg_fatal("unexpected state while parsing tar archive");
 	}
 }
 
@@ -194,7 +195,7 @@ member_verify_header(astreamer *streamer, astreamer_member *member)
 	if (m == NULL)
 	{
 		report_backup_error(mystreamer->context,
-							"\"%s\" is present in \"%s\" but not in the manifest",
+							"file \"%s\" is present in archive \"%s\" but not in the manifest",
 							member->pathname, mystreamer->archive_name);
 		return;
 	}
@@ -207,11 +208,11 @@ member_verify_header(astreamer *streamer, astreamer_member *member)
 	if (m->size != member->size)
 	{
 		report_backup_error(mystreamer->context,
-							"\"%s\" has size %llu in \"%s\" but size %llu in the manifest",
+							"file \"%s\" has size %llu in archive \"%s\" but size %" PRIu64 " in the manifest",
 							member->pathname,
 							(unsigned long long) member->size,
 							mystreamer->archive_name,
-							(unsigned long long) m->size);
+							m->size);
 		m->bad = true;
 		return;
 	}
@@ -225,7 +226,7 @@ member_verify_header(astreamer *streamer, astreamer_member *member)
 		(!mystreamer->context->skip_checksums && should_verify_checksum(m));
 	mystreamer->verify_control_data =
 		mystreamer->context->manifest->version != 1 &&
-		!m->bad && strcmp(m->pathname, "global/pg_control") == 0;
+		!m->bad && strcmp(m->pathname, XLOG_CONTROL_FILE) == 0;
 
 	/* If we're going to verify the checksum, initial a checksum context. */
 	if (mystreamer->verify_checksum &&
@@ -267,7 +268,7 @@ member_compute_checksum(astreamer *streamer, astreamer_member *member,
 	mystreamer->checksum_bytes += len;
 
 	/* Feed these bytes to the checksum calculation. */
-	if (pg_checksum_update(checksum_ctx, (uint8 *) data, len) < 0)
+	if (pg_checksum_update(checksum_ctx, (const uint8 *) data, len) < 0)
 	{
 		report_backup_error(mystreamer->context,
 							"could not update checksum of file \"%s\"",
@@ -296,10 +297,10 @@ member_verify_checksum(astreamer *streamer)
 	if (mystreamer->checksum_bytes != m->size)
 	{
 		report_backup_error(mystreamer->context,
-							"file \"%s\" in \"%s\" should contain %llu bytes, but read %llu bytes",
+							"file \"%s\" in archive \"%s\" should contain %" PRIu64 " bytes, but %" PRIu64 " bytes were read",
 							m->pathname, mystreamer->archive_name,
-							(unsigned long long) m->size,
-							(unsigned long long) mystreamer->checksum_bytes);
+							m->size,
+							mystreamer->checksum_bytes);
 		return;
 	}
 
@@ -316,12 +317,12 @@ member_verify_checksum(astreamer *streamer)
 	/* And check it against the manifest. */
 	if (checksumlen != m->checksum_length)
 		report_backup_error(mystreamer->context,
-							"file \"%s\" in \"%s\" has checksum of length %d, but expected %d",
+							"file \"%s\" in archive \"%s\" has checksum of length %d, but expected %d",
 							m->pathname, mystreamer->archive_name,
 							m->checksum_length, checksumlen);
 	else if (memcmp(checksumbuf, m->checksum_payload, checksumlen) != 0)
 		report_backup_error(mystreamer->context,
-							"checksum mismatch for file \"%s\" in \"%s\"",
+							"checksum mismatch for file \"%s\" in archive \"%s\"",
 							m->pathname, mystreamer->archive_name);
 }
 
@@ -370,7 +371,7 @@ member_verify_control_data(astreamer *streamer)
 	pg_crc32c	crc;
 
 	/* Should be here only for control file */
-	Assert(strcmp(mystreamer->mfile->pathname, "global/pg_control") == 0);
+	Assert(strcmp(mystreamer->mfile->pathname, XLOG_CONTROL_FILE) == 0);
 	Assert(mystreamer->verify_control_data);
 
 	/*
@@ -408,11 +409,11 @@ member_verify_control_data(astreamer *streamer)
 	/* System identifiers should match. */
 	if (manifest->system_identifier !=
 		mystreamer->control_file.system_identifier)
-		report_fatal_error("%s: %s: manifest system identifier is %llu, but control file has %llu",
+		report_fatal_error("%s: %s: manifest system identifier is %" PRIu64 ", but control file has %" PRIu64,
 						   mystreamer->archive_name,
 						   mystreamer->mfile->pathname,
-						   (unsigned long long) manifest->system_identifier,
-						   (unsigned long long) mystreamer->control_file.system_identifier);
+						   manifest->system_identifier,
+						   mystreamer->control_file.system_identifier);
 }
 
 /*

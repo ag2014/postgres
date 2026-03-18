@@ -4,7 +4,7 @@
  *	  prototypes for various files in optimizer/plan
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/planmain.h
@@ -20,6 +20,7 @@
 /* GUC parameters */
 #define DEFAULT_CURSOR_TUPLE_FRACTION 0.1
 extern PGDLLIMPORT double cursor_tuple_fraction;
+extern PGDLLIMPORT bool enable_self_join_elimination;
 
 /* query_planner callback to compute query_pathkeys */
 typedef void (*query_pathkeys_callback) (PlannerInfo *root, void *extra);
@@ -54,7 +55,7 @@ extern Sort *make_sort_from_sortclauses(List *sortcls, Plan *lefttree);
 extern Agg *make_agg(List *tlist, List *qual,
 					 AggStrategy aggstrategy, AggSplit aggsplit,
 					 int numGroupCols, AttrNumber *grpColIdx, Oid *grpOperators, Oid *grpCollations,
-					 List *groupingSets, List *chain, double dNumGroups,
+					 List *groupingSets, List *chain, Cardinality numGroups,
 					 Size transitionSpace, Plan *lefttree);
 extern Limit *make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount,
 						 LimitOption limitOption, int uniqNumCols,
@@ -74,6 +75,8 @@ extern void add_vars_to_targetlist(PlannerInfo *root, List *vars,
 								   Relids where_needed);
 extern void add_vars_to_attr_needed(PlannerInfo *root, List *vars,
 									Relids where_needed);
+extern void remove_useless_groupby_columns(PlannerInfo *root);
+extern void setup_eager_aggregation(PlannerInfo *root);
 extern void find_lateral_references(PlannerInfo *root);
 extern void rebuild_lateral_attr_needed(PlannerInfo *root);
 extern void create_lateral_join_info(PlannerInfo *root);
@@ -112,6 +115,11 @@ extern bool query_is_distinct_for(Query *query, List *colnos, List *opids);
 extern bool innerrel_is_unique(PlannerInfo *root,
 							   Relids joinrelids, Relids outerrelids, RelOptInfo *innerrel,
 							   JoinType jointype, List *restrictlist, bool force_cache);
+extern bool innerrel_is_unique_ext(PlannerInfo *root, Relids joinrelids,
+								   Relids outerrelids, RelOptInfo *innerrel,
+								   JoinType jointype, List *restrictlist,
+								   bool force_cache, List **extra_clauses);
+extern List *remove_useless_self_joins(PlannerInfo *root, List *joinlist);
 
 /*
  * prototypes for plan/setrefs.c

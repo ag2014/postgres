@@ -129,6 +129,9 @@
     In all cases, a trigger is executed as part of the same transaction as
     the statement that triggered it, so if either the statement or the
     trigger causes an error, the effects of both will be rolled back.
+    Also, the trigger will always run as the role that queued the trigger
+    event, unless the trigger function is marked as <literal>SECURITY
+    DEFINER</literal>, in which case it will run as the function owner.
    </para>
 
    <para>
@@ -289,6 +292,10 @@
     <literal>BEFORE</literal> trigger.  Changes to the value of a generated
     column in a <literal>BEFORE</literal> trigger are ignored and will be
     overwritten.
+    Virtual generated columns are never computed when triggers fire.  In the C
+    language interface, their content is undefined in a trigger function.
+    Higher-level programming languages should prevent access to virtual
+    generated columns in triggers.
    </para>
 
    <para>
@@ -816,7 +823,7 @@ typedef struct Trigger
         <varname>attnum</varname> (1-based) is a member of this bitmap set,
         call <literal>bms_is_member(attnum -
         FirstLowInvalidHeapAttributeNumber,
-        trigdata->tg_updatedcols))</literal>.
+        trigdata->tg_updatedcols)</literal>.
        </para>
 
        <para>

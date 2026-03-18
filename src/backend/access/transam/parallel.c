@@ -3,7 +3,7 @@
  * parallel.c
  *	  Infrastructure for launching parallel workers
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/brin.h"
+#include "access/gin.h"
 #include "access/nbtree.h"
 #include "access/parallel.h"
 #include "access/session.h"
@@ -35,6 +36,7 @@
 #include "pgstat.h"
 #include "storage/ipc.h"
 #include "storage/predicate.h"
+#include "storage/proc.h"
 #include "storage/spin.h"
 #include "tcop/tcopprot.h"
 #include "utils/combocid.h"
@@ -43,6 +45,7 @@
 #include "utils/memutils.h"
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
+#include "utils/wait_event.h"
 
 /*
  * We don't want to waste a lot of memory on an error queue which, most of
@@ -149,12 +152,15 @@ static const struct
 		"_brin_parallel_build_main", _brin_parallel_build_main
 	},
 	{
+		"_gin_parallel_build_main", _gin_parallel_build_main
+	},
+	{
 		"parallel_vacuum_main", parallel_vacuum_main
 	}
 };
 
 /* Private functions. */
-static void HandleParallelMessage(ParallelContext *pcxt, int i, StringInfo msg);
+static void ProcessParallelMessage(ParallelContext *pcxt, int i, StringInfo msg);
 static void WaitForParallelWorkersToExit(ParallelContext *pcxt);
 static parallel_worker_main_type LookupParallelWorkerFunction(const char *libraryname, const char *funcname);
 static void ParallelWorkerShutdown(int code, Datum arg);
@@ -182,7 +188,7 @@ CreateParallelContext(const char *library_name, const char *function_name,
 	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
 
 	/* Initialize a new ParallelContext. */
-	pcxt = palloc0(sizeof(ParallelContext));
+	pcxt = palloc0_object(ParallelContext);
 	pcxt->subid = GetCurrentSubTransactionId();
 	pcxt->nworkers = nworkers;
 	pcxt->nworkers_to_launch = nworkers;
@@ -262,6 +268,10 @@ InitializeParallelDSM(ParallelContext *pcxt)
 
 	if (pcxt->nworkers > 0)
 	{
+		StaticAssertDecl(BUFFERALIGN(PARALLEL_ERROR_QUEUE_SIZE) ==
+						 PARALLEL_ERROR_QUEUE_SIZE,
+						 "parallel error queue size not buffer-aligned");
+
 		/* Estimate space for various kinds of state sharing. */
 		library_len = EstimateLibraryStateSpace();
 		shm_toc_estimate_chunk(&pcxt->estimator, library_len);
@@ -293,9 +303,6 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		shm_toc_estimate_keys(&pcxt->estimator, 12);
 
 		/* Estimate space need for error queues. */
-		StaticAssertStmt(BUFFERALIGN(PARALLEL_ERROR_QUEUE_SIZE) ==
-						 PARALLEL_ERROR_QUEUE_SIZE,
-						 "parallel error queue size not buffer-aligned");
 		shm_toc_estimate_chunk(&pcxt->estimator,
 							   mul_size(PARALLEL_ERROR_QUEUE_SIZE,
 										pcxt->nworkers));
@@ -352,7 +359,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	fps->stmt_ts = GetCurrentStatementStartTimestamp();
 	fps->serializable_xact_handle = ShareSerializableXact();
 	SpinLockInit(&fps->mutex);
-	fps->last_xlog_end = 0;
+	fps->last_xlog_end = InvalidXLogRecPtr;
 	shm_toc_insert(pcxt->toc, PARALLEL_KEY_FIXED, fps);
 
 	/* We can skip the rest of this if we're not budgeting for any workers. */
@@ -449,7 +456,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 					   clientconninfospace);
 
 		/* Allocate space for worker information. */
-		pcxt->worker = palloc0(sizeof(ParallelWorkerInfo) * pcxt->nworkers);
+		pcxt->worker = palloc0_array(ParallelWorkerInfo, pcxt->nworkers);
 
 		/*
 		 * Establish error queues in dynamic shared memory.
@@ -503,7 +510,11 @@ InitializeParallelDSM(ParallelContext *pcxt)
 void
 ReinitializeParallelDSM(ParallelContext *pcxt)
 {
+	MemoryContext oldcontext;
 	FixedParallelState *fps;
+
+	/* We might be running in a very short-lived memory context. */
+	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
 
 	/* Wait for any old workers to exit. */
 	if (pcxt->nworkers_launched > 0)
@@ -521,7 +532,7 @@ ReinitializeParallelDSM(ParallelContext *pcxt)
 
 	/* Reset a few bits of fixed parallel state to a clean state. */
 	fps = shm_toc_lookup(pcxt->toc, PARALLEL_KEY_FIXED, false);
-	fps->last_xlog_end = 0;
+	fps->last_xlog_end = InvalidXLogRecPtr;
 
 	/* Recreate error queues (if they exist). */
 	if (pcxt->nworkers > 0)
@@ -542,6 +553,9 @@ ReinitializeParallelDSM(ParallelContext *pcxt)
 			pcxt->worker[i].error_mqh = shm_mq_attach(mq, pcxt->seg, NULL);
 		}
 	}
+
+	/* Restore previous memory context. */
+	MemoryContextSwitchTo(oldcontext);
 }
 
 /*
@@ -644,8 +658,7 @@ LaunchParallelWorkers(ParallelContext *pcxt)
 	 */
 	if (pcxt->nworkers_launched > 0)
 	{
-		pcxt->known_attached_workers =
-			palloc0(sizeof(bool) * pcxt->nworkers_launched);
+		pcxt->known_attached_workers = palloc0_array(bool, pcxt->nworkers_launched);
 		pcxt->nknown_attached_workers = 0;
 	}
 
@@ -873,7 +886,7 @@ WaitForParallelWorkersToFinish(ParallelContext *pcxt)
 				 * the worker writes messages and terminates after the
 				 * CHECK_FOR_INTERRUPTS() near the top of this function and
 				 * before the call to GetBackgroundWorkerPid().  In that case,
-				 * or latch should have been set as well and the right things
+				 * our latch should have been set as well and the right things
 				 * will happen on the next pass through the loop.
 				 */
 			}
@@ -1027,7 +1040,7 @@ ParallelContextActive(void)
  *
  * Note: this is called within a signal handler!  All we can do is set
  * a flag that will cause the next CHECK_FOR_INTERRUPTS() to invoke
- * HandleParallelMessages().
+ * ProcessParallelMessages().
  */
 void
 HandleParallelMessageInterrupt(void)
@@ -1038,10 +1051,10 @@ HandleParallelMessageInterrupt(void)
 }
 
 /*
- * Handle any queued protocol messages received from parallel workers.
+ * Process any queued protocol messages received from parallel workers.
  */
 void
-HandleParallelMessages(void)
+ProcessParallelMessages(void)
 {
 	dlist_iter	iter;
 	MemoryContext oldcontext;
@@ -1064,7 +1077,7 @@ HandleParallelMessages(void)
 	 */
 	if (hpm_context == NULL)	/* first time through? */
 		hpm_context = AllocSetContextCreate(TopMemoryContext,
-											"HandleParallelMessages",
+											"ProcessParallelMessages",
 											ALLOCSET_DEFAULT_SIZES);
 	else
 		MemoryContextReset(hpm_context);
@@ -1107,7 +1120,7 @@ HandleParallelMessages(void)
 
 					initStringInfo(&msg);
 					appendBinaryStringInfo(&msg, data, nbytes);
-					HandleParallelMessage(pcxt, i, &msg);
+					ProcessParallelMessage(pcxt, i, &msg);
 					pfree(msg.data);
 				}
 				else
@@ -1127,10 +1140,10 @@ HandleParallelMessages(void)
 }
 
 /*
- * Handle a single protocol message received from a single parallel worker.
+ * Process a single protocol message received from a single parallel worker.
  */
 static void
-HandleParallelMessage(ParallelContext *pcxt, int i, StringInfo msg)
+ProcessParallelMessage(ParallelContext *pcxt, int i, StringInfo msg)
 {
 	char		msgtype;
 
@@ -1208,7 +1221,7 @@ HandleParallelMessage(ParallelContext *pcxt, int i, StringInfo msg)
 				break;
 			}
 
-		case 'P':				/* Parallel progress reporting */
+		case PqMsg_Progress:
 			{
 				/*
 				 * Only incremental progress reporting is currently supported.
@@ -1316,7 +1329,6 @@ ParallelWorkerMain(Datum main_arg)
 	InitializingParallelWorker = true;
 
 	/* Establish signal handlers. */
-	pqsignal(SIGTERM, die);
 	BackgroundWorkerUnblockSignals();
 
 	/* Determine and set our parallel worker number. */
@@ -1419,10 +1431,16 @@ ParallelWorkerMain(Datum main_arg)
 							fps->session_user_is_superuser);
 	SetCurrentRoleId(fps->outer_user_id, fps->role_is_superuser);
 
-	/* Restore database connection. */
+	/*
+	 * Restore database connection.  We skip connection authorization checks,
+	 * reasoning that (a) the leader checked these things when it started, and
+	 * (b) we do not want parallel mode to cause these failures, because that
+	 * would make use of parallel query plans not transparent to applications.
+	 */
 	BackgroundWorkerInitializeConnectionByOid(fps->database_id,
 											  fps->authenticated_user_id,
-											  0);
+											  BGWORKER_BYPASS_ALLOWCONN |
+											  BGWORKER_BYPASS_ROLELOGINCHECK);
 
 	/*
 	 * Set the client encoding to the database encoding, since that is what

@@ -17,7 +17,7 @@
  * a file is successfully archived and then the system crashes before
  * a durable record of the success has been made.
  *
- * Copyright (c) 2022-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2022-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  contrib/basic_archive/basic_archive.c
@@ -37,7 +37,10 @@
 #include "storage/fd.h"
 #include "utils/guc.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "basic_archive",
+					.version = PG_VERSION
+);
 
 static char *archive_directory = NULL;
 
@@ -62,7 +65,7 @@ void
 _PG_init(void)
 {
 	DefineCustomStringVariable("basic_archive.archive_directory",
-							   gettext_noop("Archive file destination directory."),
+							   "Archive file destination directory.",
 							   NULL,
 							   &archive_directory,
 							   "",
@@ -87,13 +90,11 @@ _PG_archive_module_init(void)
 /*
  * check_archive_directory
  *
- * Checks that the provided archive directory exists.
+ * Checks that the provided archive directory path isn't too long.
  */
 static bool
 check_archive_directory(char **newval, void **extra, GucSource source)
 {
-	struct stat st;
-
 	/*
 	 * The default value is an empty string, so we have to accept that value.
 	 * Our check_configured callback also checks for this and prevents
@@ -109,17 +110,6 @@ check_archive_directory(char **newval, void **extra, GucSource source)
 	if (strlen(*newval) + 64 + 2 >= MAXPGPATH)
 	{
 		GUC_check_errdetail("Archive directory too long.");
-		return false;
-	}
-
-	/*
-	 * Do a basic sanity check that the specified archive directory exists. It
-	 * could be removed at some point in the future, so we still need to be
-	 * prepared for it not to exist in the actual archiving logic.
-	 */
-	if (stat(*newval, &st) != 0 || !S_ISDIR(st.st_mode))
-	{
-		GUC_check_errdetail("Specified archive directory does not exist.");
 		return false;
 	}
 

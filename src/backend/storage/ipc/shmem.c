@@ -3,7 +3,7 @@
  * shmem.c
  *	  create shared memory and initialize shared memory data structures.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -65,75 +65,113 @@
 
 #include "postgres.h"
 
+#include <unistd.h>
+
+#include "common/int.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "port/pg_numa.h"
 #include "storage/lwlock.h"
 #include "storage/pg_shmem.h"
 #include "storage/shmem.h"
 #include "storage/spin.h"
 #include "utils/builtins.h"
+#include "utils/tuplestore.h"
+
+/*
+ * This is the first data structure stored in the shared memory segment, at
+ * the offset that PGShmemHeader->content_offset points to.  Allocations by
+ * ShmemAlloc() are carved out of the space after this.
+ *
+ * For the base pointer and the total size of the shmem segment, we rely on
+ * the PGShmemHeader.
+ */
+typedef struct ShmemAllocatorData
+{
+	Size		free_offset;	/* offset to first free space from ShmemBase */
+	HASHHDR    *index;			/* location of ShmemIndex */
+
+	/* protects shared memory and LWLock allocation */
+	slock_t		shmem_lock;
+} ShmemAllocatorData;
 
 static void *ShmemAllocRaw(Size size, Size *allocated_size);
 
 /* shared memory global variables */
 
 static PGShmemHeader *ShmemSegHdr;	/* shared mem segment header */
-
 static void *ShmemBase;			/* start address of shared memory */
-
 static void *ShmemEnd;			/* end+1 address of shared memory */
 
-slock_t    *ShmemLock;			/* spinlock for shared memory and LWLock
-								 * allocation */
-
+static ShmemAllocatorData *ShmemAllocator;
+slock_t    *ShmemLock;			/* points to ShmemAllocator->shmem_lock */
 static HTAB *ShmemIndex = NULL; /* primary index hashtable for shmem */
 
+/* To get reliable results for NUMA inquiry we need to "touch pages" once */
+static bool firstNumaTouch = true;
+
+Datum		pg_numa_available(PG_FUNCTION_ARGS);
 
 /*
- *	InitShmemAccess() --- set up basic pointers to shared memory.
+ *	InitShmemAllocator() --- set up basic pointers to shared memory.
+ *
+ * Called at postmaster or stand-alone backend startup, to initialize the
+ * allocator's data structure in the shared memory segment.  In EXEC_BACKEND,
+ * this is also called at backend startup, to set up pointers to the shared
+ * memory areas.
  */
 void
-InitShmemAccess(PGShmemHeader *seghdr)
+InitShmemAllocator(PGShmemHeader *seghdr)
 {
+	Assert(seghdr != NULL);
+
+	/*
+	 * We assume the pointer and offset are MAXALIGN.  Not a hard requirement,
+	 * but it's true today and keeps the math below simpler.
+	 */
+	Assert(seghdr == (void *) MAXALIGN(seghdr));
+	Assert(seghdr->content_offset == MAXALIGN(seghdr->content_offset));
+
 	ShmemSegHdr = seghdr;
 	ShmemBase = seghdr;
 	ShmemEnd = (char *) ShmemBase + seghdr->totalsize;
-}
 
-/*
- *	InitShmemAllocation() --- set up shared-memory space allocation.
- *
- * This should be called only in the postmaster or a standalone backend.
- */
-void
-InitShmemAllocation(void)
-{
-	PGShmemHeader *shmhdr = ShmemSegHdr;
-	char	   *aligned;
+#ifndef EXEC_BACKEND
+	Assert(!IsUnderPostmaster);
+#endif
+	if (IsUnderPostmaster)
+	{
+		PGShmemHeader *shmhdr = ShmemSegHdr;
 
-	Assert(shmhdr != NULL);
+		ShmemAllocator = (ShmemAllocatorData *) ((char *) shmhdr + shmhdr->content_offset);
+		ShmemLock = &ShmemAllocator->shmem_lock;
+	}
+	else
+	{
+		Size		offset;
 
-	/*
-	 * Initialize the spinlock used by ShmemAlloc.  We must use
-	 * ShmemAllocUnlocked, since obviously ShmemAlloc can't be called yet.
-	 */
-	ShmemLock = (slock_t *) ShmemAllocUnlocked(sizeof(slock_t));
+		/*
+		 * Allocations after this point should go through ShmemAlloc, which
+		 * expects to allocate everything on cache line boundaries.  Make sure
+		 * the first allocation begins on a cache line boundary.
+		 */
+		offset = CACHELINEALIGN(seghdr->content_offset + sizeof(ShmemAllocatorData));
+		if (offset > seghdr->totalsize)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of shared memory (%zu bytes requested)",
+							offset)));
 
-	SpinLockInit(ShmemLock);
+		ShmemAllocator = (ShmemAllocatorData *) ((char *) seghdr + seghdr->content_offset);
 
-	/*
-	 * Allocations after this point should go through ShmemAlloc, which
-	 * expects to allocate everything on cache line boundaries.  Make sure the
-	 * first allocation begins on a cache line boundary.
-	 */
-	aligned = (char *)
-		(CACHELINEALIGN((((char *) shmhdr) + shmhdr->freeoffset)));
-	shmhdr->freeoffset = aligned - (char *) shmhdr;
-
-	/* ShmemIndex can't be set up yet (need LWLocks first) */
-	shmhdr->index = NULL;
-	ShmemIndex = (HTAB *) NULL;
+		SpinLockInit(&ShmemAllocator->shmem_lock);
+		ShmemLock = &ShmemAllocator->shmem_lock;
+		ShmemAllocator->free_offset = offset;
+		/* ShmemIndex can't be set up yet (need LWLocks first) */
+		ShmemAllocator->index = NULL;
+		ShmemIndex = (HTAB *) NULL;
+	}
 }
 
 /*
@@ -202,13 +240,13 @@ ShmemAllocRaw(Size size, Size *allocated_size)
 
 	SpinLockAcquire(ShmemLock);
 
-	newStart = ShmemSegHdr->freeoffset;
+	newStart = ShmemAllocator->free_offset;
 
 	newFree = newStart + size;
 	if (newFree <= ShmemSegHdr->totalsize)
 	{
 		newSpace = (char *) ShmemBase + newStart;
-		ShmemSegHdr->freeoffset = newFree;
+		ShmemAllocator->free_offset = newFree;
 	}
 	else
 		newSpace = NULL;
@@ -217,45 +255,6 @@ ShmemAllocRaw(Size size, Size *allocated_size)
 
 	/* note this assert is okay with newSpace == NULL */
 	Assert(newSpace == (void *) CACHELINEALIGN(newSpace));
-
-	return newSpace;
-}
-
-/*
- * ShmemAllocUnlocked -- allocate max-aligned chunk from shared memory
- *
- * Allocate space without locking ShmemLock.  This should be used for,
- * and only for, allocations that must happen before ShmemLock is ready.
- *
- * We consider maxalign, rather than cachealign, sufficient here.
- */
-void *
-ShmemAllocUnlocked(Size size)
-{
-	Size		newStart;
-	Size		newFree;
-	void	   *newSpace;
-
-	/*
-	 * Ensure allocated space is adequately aligned.
-	 */
-	size = MAXALIGN(size);
-
-	Assert(ShmemSegHdr != NULL);
-
-	newStart = ShmemSegHdr->freeoffset;
-
-	newFree = newStart + size;
-	if (newFree > ShmemSegHdr->totalsize)
-		ereport(ERROR,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("out of shared memory (%zu bytes requested)",
-						size)));
-	ShmemSegHdr->freeoffset = newFree;
-
-	newSpace = (char *) ShmemBase + newStart;
-
-	Assert(newSpace == (void *) MAXALIGN(newSpace));
 
 	return newSpace;
 }
@@ -325,8 +324,8 @@ InitShmemIndex(void)
  */
 HTAB *
 ShmemInitHash(const char *name,		/* table string name for shmem index */
-			  long init_size,	/* initial table size */
-			  long max_size,	/* max size of the table */
+			  int64 init_size,	/* initial table size */
+			  int64 max_size,	/* max size of the table */
 			  HASHCTL *infoP,	/* info about key and bucket size */
 			  int hash_flags)	/* info about infoP */
 {
@@ -388,16 +387,14 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 
 	if (!ShmemIndex)
 	{
-		PGShmemHeader *shmemseghdr = ShmemSegHdr;
-
 		/* Must be trying to create/attach to ShmemIndex itself */
 		Assert(strcmp(name, "ShmemIndex") == 0);
 
 		if (IsUnderPostmaster)
 		{
 			/* Must be initializing a (non-standalone) backend */
-			Assert(shmemseghdr->index != NULL);
-			structPtr = shmemseghdr->index;
+			Assert(ShmemAllocator->index != NULL);
+			structPtr = ShmemAllocator->index;
 			*foundPtr = true;
 		}
 		else
@@ -410,9 +407,9 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 			 * index has been initialized.  This should be OK because no other
 			 * process can be accessing shared memory yet.
 			 */
-			Assert(shmemseghdr->index == NULL);
+			Assert(ShmemAllocator->index == NULL);
 			structPtr = ShmemAlloc(size);
-			shmemseghdr->index = structPtr;
+			ShmemAllocator->index = structPtr;
 			*foundPtr = false;
 		}
 		LWLockRelease(ShmemIndexLock);
@@ -489,9 +486,7 @@ add_size(Size s1, Size s2)
 {
 	Size		result;
 
-	result = s1 + s2;
-	/* We are assuming Size is an unsigned type here... */
-	if (result < s1 || result < s2)
+	if (pg_add_size_overflow(s1, s2, &result))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("requested shared memory size overflows size_t")));
@@ -506,11 +501,7 @@ mul_size(Size s1, Size s2)
 {
 	Size		result;
 
-	if (s1 == 0 || s2 == 0)
-		return 0;
-	result = s1 * s2;
-	/* We are assuming Size is an unsigned type here... */
-	if (result / s2 != s1)
+	if (pg_mul_size_overflow(s1, s2, &result))
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("requested shared memory size overflows size_t")));
@@ -552,19 +543,224 @@ pg_get_shmem_allocations(PG_FUNCTION_ARGS)
 	/* output shared memory allocated but not counted via the shmem index */
 	values[0] = CStringGetTextDatum("<anonymous>");
 	nulls[1] = true;
-	values[2] = Int64GetDatum(ShmemSegHdr->freeoffset - named_allocated);
+	values[2] = Int64GetDatum(ShmemAllocator->free_offset - named_allocated);
 	values[3] = values[2];
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 
 	/* output as-of-yet unused shared memory */
 	nulls[0] = true;
-	values[1] = Int64GetDatum(ShmemSegHdr->freeoffset);
+	values[1] = Int64GetDatum(ShmemAllocator->free_offset);
 	nulls[1] = false;
-	values[2] = Int64GetDatum(ShmemSegHdr->totalsize - ShmemSegHdr->freeoffset);
+	values[2] = Int64GetDatum(ShmemSegHdr->totalsize - ShmemAllocator->free_offset);
 	values[3] = values[2];
 	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 
 	LWLockRelease(ShmemIndexLock);
 
 	return (Datum) 0;
+}
+
+/*
+ * SQL SRF showing NUMA memory nodes for allocated shared memory
+ *
+ * Compared to pg_get_shmem_allocations(), this function does not return
+ * information about shared anonymous allocations and unused shared memory.
+ */
+Datum
+pg_get_shmem_allocations_numa(PG_FUNCTION_ARGS)
+{
+#define PG_GET_SHMEM_NUMA_SIZES_COLS 3
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	HASH_SEQ_STATUS hstat;
+	ShmemIndexEnt *ent;
+	Datum		values[PG_GET_SHMEM_NUMA_SIZES_COLS];
+	bool		nulls[PG_GET_SHMEM_NUMA_SIZES_COLS];
+	Size		os_page_size;
+	void	  **page_ptrs;
+	int		   *pages_status;
+	uint64		shm_total_page_count,
+				shm_ent_page_count,
+				max_nodes;
+	Size	   *nodes;
+
+	if (pg_numa_init() == -1)
+		elog(ERROR, "libnuma initialization failed or NUMA is not supported on this platform");
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	max_nodes = pg_numa_get_max_node();
+	nodes = palloc_array(Size, max_nodes + 2);
+
+	/*
+	 * Shared memory allocations can vary in size and may not align with OS
+	 * memory page boundaries, while NUMA queries work on pages.
+	 *
+	 * To correctly map each allocation to NUMA nodes, we need to: 1.
+	 * Determine the OS memory page size. 2. Align each allocation's start/end
+	 * addresses to page boundaries. 3. Query NUMA node information for all
+	 * pages spanning the allocation.
+	 */
+	os_page_size = pg_get_shmem_pagesize();
+
+	/*
+	 * Allocate memory for page pointers and status based on total shared
+	 * memory size. This simplified approach allocates enough space for all
+	 * pages in shared memory rather than calculating the exact requirements
+	 * for each segment.
+	 *
+	 * Add 1, because we don't know how exactly the segments align to OS
+	 * pages, so the allocation might use one more memory page. In practice
+	 * this is not very likely, and moreover we have more entries, each of
+	 * them using only fraction of the total pages.
+	 */
+	shm_total_page_count = (ShmemSegHdr->totalsize / os_page_size) + 1;
+	page_ptrs = palloc0_array(void *, shm_total_page_count);
+	pages_status = palloc_array(int, shm_total_page_count);
+
+	if (firstNumaTouch)
+		elog(DEBUG1, "NUMA: page-faulting shared memory segments for proper NUMA readouts");
+
+	LWLockAcquire(ShmemIndexLock, LW_SHARED);
+
+	hash_seq_init(&hstat, ShmemIndex);
+
+	/* output all allocated entries */
+	while ((ent = (ShmemIndexEnt *) hash_seq_search(&hstat)) != NULL)
+	{
+		int			i;
+		char	   *startptr,
+				   *endptr;
+		Size		total_len;
+
+		/*
+		 * Calculate the range of OS pages used by this segment. The segment
+		 * may start / end half-way through a page, we want to count these
+		 * pages too. So we align the start/end pointers down/up, and then
+		 * calculate the number of pages from that.
+		 */
+		startptr = (char *) TYPEALIGN_DOWN(os_page_size, ent->location);
+		endptr = (char *) TYPEALIGN(os_page_size,
+									(char *) ent->location + ent->allocated_size);
+		total_len = (endptr - startptr);
+
+		shm_ent_page_count = total_len / os_page_size;
+
+		/*
+		 * If we ever get 0xff (-1) back from kernel inquiry, then we probably
+		 * have a bug in mapping buffers to OS pages.
+		 */
+		memset(pages_status, 0xff, sizeof(int) * shm_ent_page_count);
+
+		/*
+		 * Setup page_ptrs[] with pointers to all OS pages for this segment,
+		 * and get the NUMA status using pg_numa_query_pages.
+		 *
+		 * In order to get reliable results we also need to touch memory
+		 * pages, so that inquiry about NUMA memory node doesn't return -2
+		 * (ENOENT, which indicates unmapped/unallocated pages).
+		 */
+		for (i = 0; i < shm_ent_page_count; i++)
+		{
+			page_ptrs[i] = startptr + (i * os_page_size);
+
+			if (firstNumaTouch)
+				pg_numa_touch_mem_if_required(page_ptrs[i]);
+
+			CHECK_FOR_INTERRUPTS();
+		}
+
+		if (pg_numa_query_pages(0, shm_ent_page_count, page_ptrs, pages_status) == -1)
+			elog(ERROR, "failed NUMA pages inquiry status: %m");
+
+		/* Count number of NUMA nodes used for this shared memory entry */
+		memset(nodes, 0, sizeof(Size) * (max_nodes + 2));
+
+		for (i = 0; i < shm_ent_page_count; i++)
+		{
+			int			s = pages_status[i];
+
+			/* Ensure we are adding only valid index to the array */
+			if (s >= 0 && s <= max_nodes)
+			{
+				/* valid NUMA node */
+				nodes[s]++;
+				continue;
+			}
+			else if (s == -2)
+			{
+				/* -2 means ENOENT (e.g. page was moved to swap) */
+				nodes[max_nodes + 1]++;
+				continue;
+			}
+
+			elog(ERROR, "invalid NUMA node id outside of allowed range "
+				 "[0, " UINT64_FORMAT "]: %d", max_nodes, s);
+		}
+
+		/* no NULLs for regular nodes */
+		memset(nulls, 0, sizeof(nulls));
+
+		/*
+		 * Add one entry for each NUMA node, including those without allocated
+		 * memory for this segment.
+		 */
+		for (i = 0; i <= max_nodes; i++)
+		{
+			values[0] = CStringGetTextDatum(ent->key);
+			values[1] = Int32GetDatum(i);
+			values[2] = Int64GetDatum(nodes[i] * os_page_size);
+
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+								 values, nulls);
+		}
+
+		/* The last entry is used for pages without a NUMA node. */
+		nulls[1] = true;
+		values[0] = CStringGetTextDatum(ent->key);
+		values[2] = Int64GetDatum(nodes[max_nodes + 1] * os_page_size);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 values, nulls);
+	}
+
+	LWLockRelease(ShmemIndexLock);
+	firstNumaTouch = false;
+
+	return (Datum) 0;
+}
+
+/*
+ * Determine the memory page size used for the shared memory segment.
+ *
+ * If the shared segment was allocated using huge pages, returns the size of
+ * a huge page. Otherwise returns the size of regular memory page.
+ *
+ * This should be used only after the server is started.
+ */
+Size
+pg_get_shmem_pagesize(void)
+{
+	Size		os_page_size;
+#ifdef WIN32
+	SYSTEM_INFO sysinfo;
+
+	GetSystemInfo(&sysinfo);
+	os_page_size = sysinfo.dwPageSize;
+#else
+	os_page_size = sysconf(_SC_PAGESIZE);
+#endif
+
+	Assert(IsUnderPostmaster);
+	Assert(huge_pages_status != HUGE_PAGES_UNKNOWN);
+
+	if (huge_pages_status == HUGE_PAGES_ON)
+		GetHugePageSize(&os_page_size, NULL);
+
+	return os_page_size;
+}
+
+Datum
+pg_numa_available(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_BOOL(pg_numa_init() != -1);
 }

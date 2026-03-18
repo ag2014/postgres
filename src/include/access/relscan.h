@@ -4,7 +4,7 @@
  *	  POSTGRES relation scan descriptor definitions.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/relscan.h
@@ -16,17 +16,14 @@
 
 #include "access/htup_details.h"
 #include "access/itup.h"
+#include "nodes/tidbitmap.h"
 #include "port/atomics.h"
-#include "storage/buf.h"
 #include "storage/relfilelocator.h"
 #include "storage/spin.h"
 #include "utils/relcache.h"
 
 
 struct ParallelTableScanDescData;
-
-struct TBMIterator;
-struct TBMSharedIterator;
 
 /*
  * Generic descriptor for table scans. This is the base-class for table scans,
@@ -45,12 +42,8 @@ typedef struct TableScanDescData
 	 */
 	union
 	{
-		/* Iterators for Bitmap Table Scans */
-		struct
-		{
-			struct TBMIterator *rs_iterator;
-			struct TBMSharedIterator *rs_shared_iterator;
-		}			bitmap;
+		/* Iterator for Bitmap Table Scans */
+		TBMIterator rs_tbmiterator;
 
 		/*
 		 * Range of ItemPointers for table_scan_getnextslot_tidrange() to
@@ -102,6 +95,8 @@ typedef struct ParallelBlockTableScanDescData
 	BlockNumber phs_nblocks;	/* # blocks in relation at start of scan */
 	slock_t		phs_mutex;		/* mutual exclusion for setting startblock */
 	BlockNumber phs_startblock; /* starting block number */
+	BlockNumber phs_numblock;	/* # blocks to scan, or InvalidBlockNumber if
+								 * no limit */
 	pg_atomic_uint64 phs_nallocated;	/* number of blocks allocated to
 										 * workers so far. */
 }			ParallelBlockTableScanDescData;
@@ -129,6 +124,8 @@ typedef struct IndexFetchTableData
 	Relation	rel;
 } IndexFetchTableData;
 
+struct IndexScanInstrumentation;
+
 /*
  * We use the same IndexScanDescData structure for both amgettuple-based
  * and amgetbitmap-based index scans.  Some fields are only relevant in
@@ -155,6 +152,12 @@ typedef struct IndexScanDescData
 
 	/* index access method's private state */
 	void	   *opaque;			/* access-method-specific info */
+
+	/*
+	 * Instrumentation counters maintained by all index AMs during both
+	 * amgettuple calls and amgetbitmap calls (unless field remains NULL)
+	 */
+	struct IndexScanInstrumentation *instrument;
 
 	/*
 	 * In an index-only scan, a successful amgettuple call must fill either
@@ -187,14 +190,15 @@ typedef struct IndexScanDescData
 
 	/* parallel index scan information, in shared memory */
 	struct ParallelIndexScanDescData *parallel_scan;
-}			IndexScanDescData;
+} IndexScanDescData;
 
 /* Generic structure for parallel scans */
 typedef struct ParallelIndexScanDescData
 {
 	RelFileLocator ps_locator;	/* physical table relation to scan */
 	RelFileLocator ps_indexlocator; /* physical index relation to scan */
-	Size		ps_offset;		/* Offset in bytes of am specific structure */
+	Size		ps_offset_ins;	/* Offset to SharedIndexScanInstrumentation */
+	Size		ps_offset_am;	/* Offset to am-specific structure */
 	char		ps_snapshot_data[FLEXIBLE_ARRAY_MEMBER];
 }			ParallelIndexScanDescData;
 
@@ -209,6 +213,6 @@ typedef struct SysScanDescData
 	struct IndexScanDescData *iscan;	/* only valid in index-scan case */
 	struct SnapshotData *snapshot;	/* snapshot to unregister at end of scan */
 	struct TupleTableSlot *slot;
-}			SysScanDescData;
+} SysScanDescData;
 
 #endif							/* RELSCAN_H */

@@ -10,7 +10,7 @@
  * And contributors:
  * Nabil Sayegh <postgresql@e-trolley.de>
  *
- * Copyright (c) 2002-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2026, PostgreSQL Global Development Group
  *
  * Permission to use, copy, modify, and distribute this software and its
  * documentation for any purpose, without fee, and without a written agreement
@@ -43,8 +43,12 @@
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/tuplestore.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "tablefunc",
+					.version = PG_VERSION
+);
 
 static HTAB *load_categories_hash(char *cats_sql, MemoryContext per_query_ctx);
 static Tuplestorestate *get_crosstab_tuplestore(char *sql,
@@ -204,7 +208,7 @@ normal_rand(PG_FUNCTION_ARGS)
 		funcctx->max_calls = num_tuples;
 
 		/* allocate memory for user context */
-		fctx = (normal_rand_fctx *) palloc(sizeof(normal_rand_fctx));
+		fctx = palloc_object(normal_rand_fctx);
 
 		/*
 		 * Use fctx to keep track of upper and lower bounds from call to call.
@@ -763,7 +767,7 @@ load_categories_hash(char *cats_sql, MemoryContext per_query_ctx)
 
 			SPIcontext = MemoryContextSwitchTo(per_query_ctx);
 
-			catdesc = (crosstab_cat_desc *) palloc(sizeof(crosstab_cat_desc));
+			catdesc = palloc_object(crosstab_cat_desc);
 			catdesc->catname = catname;
 			catdesc->attidx = i;
 

@@ -4,7 +4,7 @@
  *	  definition of the "event trigger" system catalog (pg_event_trigger)
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_event_trigger.h
@@ -19,13 +19,15 @@
 #define PG_EVENT_TRIGGER_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_event_trigger_d.h"
+#include "catalog/pg_event_trigger_d.h" /* IWYU pragma: export */
 
 /* ----------------
  *		pg_event_trigger definition.    cpp turns this into
  *		typedef struct FormData_pg_event_trigger
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_event_trigger,3466,EventTriggerRelationId)
 {
 	Oid			oid;			/* oid */
@@ -41,6 +43,8 @@ CATALOG(pg_event_trigger,3466,EventTriggerRelationId)
 	text		evttags[1];		/* command TAGs this event trigger targets */
 #endif
 } FormData_pg_event_trigger;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_event_trigger corresponds to a pointer to a tuple with

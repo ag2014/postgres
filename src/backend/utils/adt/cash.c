@@ -85,7 +85,7 @@ append_num_word(StringInfo buf, Cash value)
 		else
 			appendStringInfo(buf, "%s %s", big[tu / 10], small[tu % 10]);
 	}
-}								/* num_word() */
+}
 
 static inline Cash
 cash_pl_cash(Cash c1, Cash c2)
@@ -1035,7 +1035,7 @@ cash_words(PG_FUNCTION_ARGS)
 	appendStringInfoString(&buf, m0 == 1 ? " cent" : " cents");
 
 	/* capitalize output */
-	buf.data[0] = pg_toupper((unsigned char) buf.data[0]);
+	buf.data[0] = pg_ascii_toupper((unsigned char) buf.data[0]);
 
 	/* return as text datum */
 	res = cstring_to_text_with_len(buf.data, buf.len);

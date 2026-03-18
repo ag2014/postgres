@@ -8,7 +8,7 @@
  *
  * This code is released under the terms of the PostgreSQL License.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/test/regress/pg_regress.c
@@ -196,7 +196,7 @@ unlimit_core_size(void)
 void
 add_stringlist_item(_stringlist **listhead, const char *str)
 {
-	_stringlist *newentry = pg_malloc(sizeof(_stringlist));
+	_stringlist *newentry = pg_malloc_object(_stringlist);
 	_stringlist *oldentry;
 
 	newentry->str = pg_strdup(str);
@@ -518,10 +518,14 @@ make_temp_sockdir(void)
 	 * Remove the directory before dying to the usual signals.  Omit SIGQUIT,
 	 * preserving it as a quick, untidy exit.
 	 */
-	pqsignal(SIGHUP, signal_remove_temp);
 	pqsignal(SIGINT, signal_remove_temp);
-	pqsignal(SIGPIPE, signal_remove_temp);
 	pqsignal(SIGTERM, signal_remove_temp);
+
+	/* the following are not valid on Windows */
+#ifndef WIN32
+	pqsignal(SIGHUP, signal_remove_temp);
+	pqsignal(SIGPIPE, signal_remove_temp);
+#endif
 
 	return temp_sockdir;
 }
@@ -670,7 +674,7 @@ load_resultmap(void)
 		 */
 		if (string_matches_pattern(host_platform, platform))
 		{
-			_resultmap *entry = pg_malloc(sizeof(_resultmap));
+			_resultmap *entry = pg_malloc_object(_resultmap);
 
 			entry->test = pg_strdup(buf);
 			entry->type = pg_strdup(file_type);
@@ -689,7 +693,7 @@ static
 const char *
 get_expectfile(const char *testname, const char *file)
 {
-	char	   *file_type;
+	const char *file_type;
 	_resultmap *rm;
 
 	/*
@@ -1331,7 +1335,7 @@ make_directory(const char *dir)
 }
 
 /*
- * In: filename.ext, Return: filename_i.ext, where 0 < i <= 9
+ * In: filename.ext, Return: filename_i.ext, where 0 <= i <= 9
  */
 static char *
 get_alternative_expectfile(const char *expectfile, int i)
@@ -1553,7 +1557,7 @@ wait_for_tests(PID_TYPE * pids, int *statuses, instr_time *stoptimes,
 	int			i;
 
 #ifdef WIN32
-	PID_TYPE   *active_pids = pg_malloc(num_tests * sizeof(PID_TYPE));
+	PID_TYPE   *active_pids = pg_malloc_array(PID_TYPE, num_tests);
 
 	memcpy(active_pids, pids, num_tests * sizeof(PID_TYPE));
 #endif
@@ -1964,10 +1968,10 @@ create_database(const char *dbname)
 	 */
 	if (encoding)
 		psql_add_command(buf, "CREATE DATABASE \"%s\" TEMPLATE=template0 ENCODING='%s'%s", dbname, encoding,
-						 (nolocale) ? " LOCALE='C'" : "");
+						 (nolocale) ? " LOCALE='C' LOCALE_PROVIDER='builtin'" : "");
 	else
 		psql_add_command(buf, "CREATE DATABASE \"%s\" TEMPLATE=template0%s", dbname,
-						 (nolocale) ? " LOCALE='C'" : "");
+						 (nolocale) ? " LOCALE='C' LOCALE_PROVIDER='builtin'" : "");
 	psql_add_command(buf,
 					 "ALTER DATABASE \"%s\" SET lc_messages TO 'C';"
 					 "ALTER DATABASE \"%s\" SET lc_monetary TO 'C';"
@@ -2397,6 +2401,7 @@ regression_main(int argc, char *argv[],
 
 		fputs("\n# Configuration added by pg_regress\n\n", pg_conf);
 		fputs("log_autovacuum_min_duration = 0\n", pg_conf);
+		fputs("log_autoanalyze_min_duration = 0\n", pg_conf);
 		fputs("log_checkpoints = on\n", pg_conf);
 		fputs("log_line_prefix = '%m %b[%p] %q%a '\n", pg_conf);
 		fputs("log_lock_waits = on\n", pg_conf);

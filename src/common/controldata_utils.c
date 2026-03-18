@@ -4,7 +4,7 @@
  *		Common code for control data file output.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,6 +37,7 @@
 #ifndef FRONTEND
 #include "pgstat.h"
 #include "storage/fd.h"
+#include "utils/wait_event.h"
 #endif
 
 /*
@@ -53,7 +54,7 @@ get_controlfile(const char *DataDir, bool *crc_ok_p)
 {
 	char		ControlFilePath[MAXPGPATH];
 
-	snprintf(ControlFilePath, MAXPGPATH, "%s/global/pg_control", DataDir);
+	snprintf(ControlFilePath, MAXPGPATH, "%s/%s", DataDir, XLOG_CONTROL_FILE);
 
 	return get_controlfile_by_exact_path(ControlFilePath, crc_ok_p);
 }
@@ -135,7 +136,7 @@ retry:
 	/* Check the CRC. */
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc,
-				(char *) ControlFile,
+				ControlFile,
 				offsetof(ControlFileData, crc));
 	FIN_CRC32C(crc);
 
@@ -199,7 +200,7 @@ update_controlfile(const char *DataDir,
 	/* Recalculate CRC of control file */
 	INIT_CRC32C(ControlFile->crc);
 	COMP_CRC32C(ControlFile->crc,
-				(char *) ControlFile,
+				ControlFile,
 				offsetof(ControlFileData, crc));
 	FIN_CRC32C(ControlFile->crc);
 

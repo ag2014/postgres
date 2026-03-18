@@ -3,7 +3,7 @@
  * libpq_source.c
  *	  Functions for fetching files from a remote server via libpq.
  *
- * Copyright (c) 2013-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2026, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -84,7 +84,7 @@ init_libpq_source(PGconn *conn)
 
 	init_libpq_conn(conn);
 
-	src = pg_malloc0(sizeof(libpq_source));
+	src = pg_malloc0_object(libpq_source);
 
 	src->common.traverse_files = libpq_traverse_files;
 	src->common.fetch_file = libpq_fetch_file;
@@ -215,7 +215,7 @@ libpq_get_current_wal_insert_lsn(rewind_source *source)
 
 	val = run_simple_query(conn, "SELECT pg_current_wal_insert_lsn()");
 
-	if (sscanf(val, "%X/%X", &hi, &lo) != 2)
+	if (sscanf(val, "%X/%08X", &hi, &lo) != 2)
 		pg_fatal("unrecognized result \"%s\" for current WAL insert location", val);
 
 	result = ((uint64) hi) << 32 | lo;
@@ -459,7 +459,7 @@ process_queued_fetch_requests(libpq_source *src)
 
 		appendArrayEscapedString(&src->paths, rq->path);
 		appendStringInfo(&src->offsets, INT64_FORMAT, (int64) rq->offset);
-		appendStringInfo(&src->lengths, INT64_FORMAT, (int64) rq->length);
+		appendStringInfo(&src->lengths, "%zu", rq->length);
 	}
 	appendStringInfoChar(&src->paths, '}');
 	appendStringInfoChar(&src->offsets, '}');
@@ -567,8 +567,8 @@ process_queued_fetch_requests(libpq_source *src)
 		}
 		else
 		{
-			pg_log_debug("received chunk for file \"%s\", offset %lld, size %d",
-						 filename, (long long int) chunkoff, chunksize);
+			pg_log_debug("received chunk for file \"%s\", offset %" PRId64 ", size %d",
+						 filename, chunkoff, chunksize);
 
 			if (strcmp(filename, rq->path) != 0)
 			{
@@ -576,8 +576,8 @@ process_queued_fetch_requests(libpq_source *src)
 						 filename, rq->path);
 			}
 			if (chunkoff != rq->offset)
-				pg_fatal("received data at offset %lld of file \"%s\", when requested for offset %lld",
-						 (long long int) chunkoff, rq->path, (long long int) rq->offset);
+				pg_fatal("received data at offset %" PRId64 " of file \"%s\", when requested for offset %lld",
+						 chunkoff, rq->path, (long long int) rq->offset);
 
 			/*
 			 * We should not receive more data than we requested, or

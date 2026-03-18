@@ -9,7 +9,7 @@
  * into a lot of low-level code.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/reloptions.h
@@ -29,6 +29,7 @@
 typedef enum relopt_type
 {
 	RELOPT_TYPE_BOOL,
+	RELOPT_TYPE_TERNARY,		/* on, off, unset */
 	RELOPT_TYPE_INT,
 	RELOPT_TYPE_REAL,
 	RELOPT_TYPE_ENUM,
@@ -80,11 +81,12 @@ typedef struct relopt_value
 	union
 	{
 		bool		bool_val;
+		pg_ternary	ternary_val;
 		int			int_val;
 		double		real_val;
 		int			enum_val;
 		char	   *string_val; /* allocated separately */
-	}			values;
+	};
 } relopt_value;
 
 /* reloptions records for specific variable types */
@@ -93,6 +95,12 @@ typedef struct relopt_bool
 	relopt_gen	gen;
 	bool		default_val;
 } relopt_bool;
+
+typedef struct relopt_ternary
+{
+	relopt_gen	gen;
+	/* ternaries have no default_val: otherwise they'd just be bools */
+} relopt_ternary;
 
 typedef struct relopt_int
 {
@@ -182,6 +190,8 @@ typedef struct local_relopts
 extern relopt_kind add_reloption_kind(void);
 extern void add_bool_reloption(bits32 kinds, const char *name, const char *desc,
 							   bool default_val, LOCKMODE lockmode);
+extern void add_ternary_reloption(bits32 kinds, const char *name,
+								  const char *desc, LOCKMODE lockmode);
 extern void add_int_reloption(bits32 kinds, const char *name, const char *desc,
 							  int default_val, int min_val, int max_val,
 							  LOCKMODE lockmode);
@@ -201,6 +211,9 @@ extern void register_reloptions_validator(local_relopts *relopts,
 extern void add_local_bool_reloption(local_relopts *relopts, const char *name,
 									 const char *desc, bool default_val,
 									 int offset);
+extern void add_local_ternary_reloption(local_relopts *relopts,
+										const char *name, const char *desc,
+										int offset);
 extern void add_local_int_reloption(local_relopts *relopts, const char *name,
 									const char *desc, int default_val,
 									int min_val, int max_val, int offset);
@@ -220,7 +233,7 @@ extern void add_local_string_reloption(local_relopts *relopts, const char *name,
 									   fill_string_relopt filler, int offset);
 
 extern Datum transformRelOptions(Datum oldOptions, List *defList,
-								 const char *namspace, const char *const validnsps[],
+								 const char *nameSpace, const char *const validnsps[],
 								 bool acceptOidsOff, bool isReset);
 extern List *untransformRelOptions(Datum options);
 extern bytea *extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,

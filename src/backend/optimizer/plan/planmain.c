@@ -9,7 +9,7 @@
  * shorn of features like subselects, inheritance, aggregates, grouping,
  * and so on.  (Those are the things planner.c deals with.)
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -76,6 +76,9 @@ query_planner(PlannerInfo *root,
 	root->placeholder_list = NIL;
 	root->placeholder_array = NULL;
 	root->placeholder_array_size = 0;
+	root->agg_clause_list = NIL;
+	root->group_expr_list = NIL;
+	root->tlist_vars = NIL;
 	root->fkey_list = NIL;
 	root->initial_rels = NIL;
 
@@ -169,6 +172,9 @@ query_planner(PlannerInfo *root,
 	 */
 	add_base_rels_to_query(root, (Node *) parse->jointree);
 
+	/* Remove any redundant GROUP BY columns */
+	remove_useless_groupby_columns(root);
+
 	/*
 	 * Examine the targetlist and join tree, adding entries to baserel
 	 * targetlists for all referenced Vars, and generating PlaceHolderInfo
@@ -231,6 +237,11 @@ query_planner(PlannerInfo *root,
 	reduce_unique_semijoins(root);
 
 	/*
+	 * Remove self joins on a unique column.
+	 */
+	joinlist = remove_useless_self_joins(root, joinlist);
+
+	/*
 	 * Now distribute "placeholders" to base rels as needed.  This has to be
 	 * done after join removal because removal could change whether a
 	 * placeholder is evaluable at a base rel.
@@ -256,6 +267,12 @@ query_planner(PlannerInfo *root,
 	 * restriction OR clauses from.
 	 */
 	extract_restriction_or_clauses(root);
+
+	/*
+	 * Check if eager aggregation is applicable, and if so, set up
+	 * root->agg_clause_list and root->group_expr_list.
+	 */
+	setup_eager_aggregation(root);
 
 	/*
 	 * Now expand appendrels by adding "otherrels" for their children.  We

@@ -1,9 +1,9 @@
 /*-------------------------------------------------------------------------
  *
  * initsplan.c
- *	  Target list, qualification, joininfo initialization routines
+ *	  Target list, group by, qualification, joininfo initialization routines
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,6 +14,9 @@
  */
 #include "postgres.h"
 
+#include "access/nbtree.h"
+#include "access/sysattr.h"
+#include "catalog/pg_constraint.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
@@ -80,6 +83,12 @@ typedef struct JoinTreeItem
 } JoinTreeItem;
 
 
+static bool is_partial_agg_memory_risky(PlannerInfo *root);
+static void create_agg_clause_infos(PlannerInfo *root);
+static void create_grouping_expr_infos(PlannerInfo *root);
+static EquivalenceClass *get_eclass_for_sortgroupclause(PlannerInfo *root,
+														SortGroupClause *sgc,
+														Expr *expr);
 static void extract_lateral_references(PlannerInfo *root, RelOptInfo *brel,
 									   Index rtindex);
 static List *deconstruct_recurse(PlannerInfo *root, Node *jtnode,
@@ -386,6 +395,606 @@ add_vars_to_attr_needed(PlannerInfo *root, List *vars,
 	}
 }
 
+/*****************************************************************************
+ *
+ *	  GROUP BY
+ *
+ *****************************************************************************/
+
+/*
+ * remove_useless_groupby_columns
+ *		Remove any columns in the GROUP BY clause that are redundant due to
+ *		being functionally dependent on other GROUP BY columns.
+ *
+ * Since some other DBMSes do not allow references to ungrouped columns, it's
+ * not unusual to find all columns listed in GROUP BY even though listing the
+ * primary-key columns, or columns of a unique constraint would be sufficient.
+ * Deleting such excess columns avoids redundant sorting or hashing work, so
+ * it's worth doing.
+ *
+ * Relcache invalidations will ensure that cached plans become invalidated
+ * when the underlying supporting indexes are dropped or if a column's NOT
+ * NULL attribute is removed.
+ */
+void
+remove_useless_groupby_columns(PlannerInfo *root)
+{
+	Query	   *parse = root->parse;
+	Bitmapset **groupbyattnos;
+	Bitmapset **surplusvars;
+	bool		tryremove = false;
+	ListCell   *lc;
+	int			relid;
+
+	/* No chance to do anything if there are less than two GROUP BY items */
+	if (list_length(root->processed_groupClause) < 2)
+		return;
+
+	/* Don't fiddle with the GROUP BY clause if the query has grouping sets */
+	if (parse->groupingSets)
+		return;
+
+	/*
+	 * Scan the GROUP BY clause to find GROUP BY items that are simple Vars.
+	 * Fill groupbyattnos[k] with a bitmapset of the column attnos of RTE k
+	 * that are GROUP BY items.
+	 */
+	groupbyattnos = palloc0_array(Bitmapset *, list_length(parse->rtable) + 1);
+	foreach(lc, root->processed_groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sgc, parse->targetList);
+		Var		   *var = (Var *) tle->expr;
+
+		/*
+		 * Ignore non-Vars and Vars from other query levels.
+		 *
+		 * XXX in principle, stable expressions containing Vars could also be
+		 * removed, if all the Vars are functionally dependent on other GROUP
+		 * BY items.  But it's not clear that such cases occur often enough to
+		 * be worth troubling over.
+		 */
+		if (!IsA(var, Var) ||
+			var->varlevelsup > 0)
+			continue;
+
+		/* OK, remember we have this Var */
+		relid = var->varno;
+		Assert(relid <= list_length(parse->rtable));
+
+		/*
+		 * If this isn't the first column for this relation then we now have
+		 * multiple columns.  That means there might be some that can be
+		 * removed.
+		 */
+		tryremove |= !bms_is_empty(groupbyattnos[relid]);
+		groupbyattnos[relid] = bms_add_member(groupbyattnos[relid],
+											  var->varattno - FirstLowInvalidHeapAttributeNumber);
+	}
+
+	/*
+	 * No Vars or didn't find multiple Vars for any relation in the GROUP BY?
+	 * If so, nothing can be removed, so don't waste more effort trying.
+	 */
+	if (!tryremove)
+		return;
+
+	/*
+	 * Consider each relation and see if it is possible to remove some of its
+	 * Vars from GROUP BY.  For simplicity and speed, we do the actual removal
+	 * in a separate pass.  Here, we just fill surplusvars[k] with a bitmapset
+	 * of the column attnos of RTE k that are removable GROUP BY items.
+	 */
+	surplusvars = NULL;			/* don't allocate array unless required */
+	relid = 0;
+	foreach(lc, parse->rtable)
+	{
+		RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+		RelOptInfo *rel;
+		Bitmapset  *relattnos;
+		Bitmapset  *best_keycolumns = NULL;
+		int32		best_nkeycolumns = PG_INT32_MAX;
+
+		relid++;
+
+		/* Only plain relations could have primary-key constraints */
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+
+		/*
+		 * We must skip inheritance parent tables as some of the child rels
+		 * may cause duplicate rows.  This cannot happen with partitioned
+		 * tables, however.
+		 */
+		if (rte->inh && rte->relkind != RELKIND_PARTITIONED_TABLE)
+			continue;
+
+		/* Nothing to do unless this rel has multiple Vars in GROUP BY */
+		relattnos = groupbyattnos[relid];
+		if (bms_membership(relattnos) != BMS_MULTIPLE)
+			continue;
+
+		rel = root->simple_rel_array[relid];
+
+		/*
+		 * Now check each index for this relation to see if there are any with
+		 * columns which are a proper subset of the grouping columns for this
+		 * relation.
+		 */
+		foreach_node(IndexOptInfo, index, rel->indexlist)
+		{
+			Bitmapset  *ind_attnos;
+			bool		nulls_check_ok;
+
+			/*
+			 * Skip any non-unique and deferrable indexes.  Predicate indexes
+			 * have not been checked yet, so we must skip those too as the
+			 * predOK check that's done later might fail.
+			 */
+			if (!index->unique || !index->immediate || index->indpred != NIL)
+				continue;
+
+			/* For simplicity, we currently don't support expression indexes */
+			if (index->indexprs != NIL)
+				continue;
+
+			ind_attnos = NULL;
+			nulls_check_ok = true;
+			for (int i = 0; i < index->nkeycolumns; i++)
+			{
+				/*
+				 * We must insist that the index columns are all defined NOT
+				 * NULL otherwise duplicate NULLs could exist.  However, we
+				 * can relax this check when the index is defined with NULLS
+				 * NOT DISTINCT as there can only be 1 NULL row, therefore
+				 * functional dependency on the unique columns is maintained,
+				 * despite the NULL.
+				 */
+				if (!index->nullsnotdistinct &&
+					!bms_is_member(index->indexkeys[i],
+								   rel->notnullattnums))
+				{
+					nulls_check_ok = false;
+					break;
+				}
+
+				ind_attnos =
+					bms_add_member(ind_attnos,
+								   index->indexkeys[i] -
+								   FirstLowInvalidHeapAttributeNumber);
+			}
+
+			if (!nulls_check_ok)
+				continue;
+
+			/*
+			 * Skip any indexes where the indexed columns aren't a proper
+			 * subset of the GROUP BY.
+			 */
+			if (bms_subset_compare(ind_attnos, relattnos) != BMS_SUBSET1)
+				continue;
+
+			/*
+			 * Record the attribute numbers from the index with the fewest
+			 * columns.  This allows the largest number of columns to be
+			 * removed from the GROUP BY clause.  In the future, we may wish
+			 * to consider using the narrowest set of columns and looking at
+			 * pg_statistic.stawidth as it might be better to use an index
+			 * with, say two INT4s, rather than, say, one long varlena column.
+			 */
+			if (index->nkeycolumns < best_nkeycolumns)
+			{
+				best_keycolumns = ind_attnos;
+				best_nkeycolumns = index->nkeycolumns;
+			}
+		}
+
+		/* Did we find a suitable index? */
+		if (!bms_is_empty(best_keycolumns))
+		{
+			/*
+			 * To easily remember whether we've found anything to do, we don't
+			 * allocate the surplusvars[] array until we find something.
+			 */
+			if (surplusvars == NULL)
+				surplusvars = palloc0_array(Bitmapset *, list_length(parse->rtable) + 1);
+
+			/* Remember the attnos of the removable columns */
+			surplusvars[relid] = bms_difference(relattnos, best_keycolumns);
+		}
+	}
+
+	/*
+	 * If we found any surplus Vars, build a new GROUP BY clause without them.
+	 * (Note: this may leave some TLEs with unreferenced ressortgroupref
+	 * markings, but that's harmless.)
+	 */
+	if (surplusvars != NULL)
+	{
+		List	   *new_groupby = NIL;
+
+		foreach(lc, root->processed_groupClause)
+		{
+			SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+			TargetEntry *tle = get_sortgroupclause_tle(sgc, parse->targetList);
+			Var		   *var = (Var *) tle->expr;
+
+			/*
+			 * New list must include non-Vars, outer Vars, and anything not
+			 * marked as surplus.
+			 */
+			if (!IsA(var, Var) ||
+				var->varlevelsup > 0 ||
+				!bms_is_member(var->varattno - FirstLowInvalidHeapAttributeNumber,
+							   surplusvars[var->varno]))
+				new_groupby = lappend(new_groupby, sgc);
+		}
+
+		root->processed_groupClause = new_groupby;
+	}
+}
+
+/*
+ * setup_eager_aggregation
+ *	  Check if eager aggregation is applicable, and if so collect suitable
+ *	  aggregate expressions and grouping expressions in the query.
+ */
+void
+setup_eager_aggregation(PlannerInfo *root)
+{
+	/*
+	 * Don't apply eager aggregation if disabled by user.
+	 */
+	if (!enable_eager_aggregate)
+		return;
+
+	/*
+	 * Don't apply eager aggregation if there are no available GROUP BY
+	 * clauses.
+	 */
+	if (!root->processed_groupClause)
+		return;
+
+	/*
+	 * For now we don't try to support grouping sets.
+	 */
+	if (root->parse->groupingSets)
+		return;
+
+	/*
+	 * For now we don't try to support DISTINCT or ORDER BY aggregates.
+	 */
+	if (root->numOrderedAggs > 0)
+		return;
+
+	/*
+	 * If there are any aggregates that do not support partial mode, or any
+	 * partial aggregates that are non-serializable, do not apply eager
+	 * aggregation.
+	 */
+	if (root->hasNonPartialAggs || root->hasNonSerialAggs)
+		return;
+
+	/*
+	 * We don't try to apply eager aggregation if there are set-returning
+	 * functions in targetlist.
+	 */
+	if (root->parse->hasTargetSRFs)
+		return;
+
+	/*
+	 * Eager aggregation only makes sense if there are multiple base rels in
+	 * the query.
+	 */
+	if (bms_membership(root->all_baserels) != BMS_MULTIPLE)
+		return;
+
+	/*
+	 * Don't apply eager aggregation if any aggregate poses a risk of
+	 * excessive memory usage during partial aggregation.
+	 */
+	if (is_partial_agg_memory_risky(root))
+		return;
+
+	/*
+	 * Collect aggregate expressions and plain Vars that appear in the
+	 * targetlist and havingQual.
+	 */
+	create_agg_clause_infos(root);
+
+	/*
+	 * If there are no suitable aggregate expressions, we cannot apply eager
+	 * aggregation.
+	 */
+	if (root->agg_clause_list == NIL)
+		return;
+
+	/*
+	 * Collect grouping expressions that appear in grouping clauses.
+	 */
+	create_grouping_expr_infos(root);
+}
+
+/*
+ * is_partial_agg_memory_risky
+ *	  Check if any aggregate poses a risk of excessive memory usage during
+ *	  partial aggregation.
+ *
+ * We check if any aggregate has a negative aggtransspace value, which
+ * indicates that its transition state data can grow unboundedly in size.
+ * Applying eager aggregation in such cases risks high memory usage since
+ * partial aggregation results might be stored in join hash tables or
+ * materialized nodes.
+ */
+static bool
+is_partial_agg_memory_risky(PlannerInfo *root)
+{
+	ListCell   *lc;
+
+	foreach(lc, root->aggtransinfos)
+	{
+		AggTransInfo *transinfo = lfirst_node(AggTransInfo, lc);
+
+		if (transinfo->aggtransspace < 0)
+			return true;
+	}
+
+	return false;
+}
+
+/*
+ * create_agg_clause_infos
+ *	  Search the targetlist and havingQual for Aggrefs and plain Vars, and
+ *	  create an AggClauseInfo for each Aggref node.
+ */
+static void
+create_agg_clause_infos(PlannerInfo *root)
+{
+	List	   *tlist_exprs;
+	List	   *agg_clause_list = NIL;
+	List	   *tlist_vars = NIL;
+	Relids		aggregate_relids = NULL;
+	bool		eager_agg_applicable = true;
+	ListCell   *lc;
+
+	Assert(root->agg_clause_list == NIL);
+	Assert(root->tlist_vars == NIL);
+
+	tlist_exprs = pull_var_clause((Node *) root->processed_tlist,
+								  PVC_INCLUDE_AGGREGATES |
+								  PVC_RECURSE_WINDOWFUNCS |
+								  PVC_RECURSE_PLACEHOLDERS);
+
+	/*
+	 * Aggregates within the HAVING clause need to be processed in the same
+	 * way as those in the targetlist.  Note that HAVING can contain Aggrefs
+	 * but not WindowFuncs.
+	 */
+	if (root->parse->havingQual != NULL)
+	{
+		List	   *having_exprs;
+
+		having_exprs = pull_var_clause((Node *) root->parse->havingQual,
+									   PVC_INCLUDE_AGGREGATES |
+									   PVC_RECURSE_PLACEHOLDERS);
+		if (having_exprs != NIL)
+		{
+			tlist_exprs = list_concat(tlist_exprs, having_exprs);
+			list_free(having_exprs);
+		}
+	}
+
+	foreach(lc, tlist_exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		Aggref	   *aggref;
+		Relids		agg_eval_at;
+		AggClauseInfo *ac_info;
+
+		/* For now we don't try to support GROUPING() expressions */
+		if (IsA(expr, GroupingFunc))
+		{
+			eager_agg_applicable = false;
+			break;
+		}
+
+		/* Collect plain Vars for future reference */
+		if (IsA(expr, Var))
+		{
+			tlist_vars = list_append_unique(tlist_vars, expr);
+			continue;
+		}
+
+		aggref = castNode(Aggref, expr);
+
+		Assert(aggref->aggorder == NIL);
+		Assert(aggref->aggdistinct == NIL);
+
+		/*
+		 * If there are any securityQuals, do not try to apply eager
+		 * aggregation if any non-leakproof aggregate functions are present.
+		 * This is overly strict, but for now...
+		 */
+		if (root->qual_security_level > 0 &&
+			!get_func_leakproof(aggref->aggfnoid))
+		{
+			eager_agg_applicable = false;
+			break;
+		}
+
+		agg_eval_at = pull_varnos(root, (Node *) aggref);
+
+		/*
+		 * If all base relations in the query are referenced by aggregate
+		 * functions, then eager aggregation is not applicable.
+		 */
+		aggregate_relids = bms_add_members(aggregate_relids, agg_eval_at);
+		if (bms_is_subset(root->all_baserels, aggregate_relids))
+		{
+			eager_agg_applicable = false;
+			break;
+		}
+
+		/* OK, create the AggClauseInfo node */
+		ac_info = makeNode(AggClauseInfo);
+		ac_info->aggref = aggref;
+		ac_info->agg_eval_at = agg_eval_at;
+
+		/* ... and add it to the list */
+		agg_clause_list = list_append_unique(agg_clause_list, ac_info);
+	}
+
+	list_free(tlist_exprs);
+
+	if (eager_agg_applicable)
+	{
+		root->agg_clause_list = agg_clause_list;
+		root->tlist_vars = tlist_vars;
+	}
+	else
+	{
+		list_free_deep(agg_clause_list);
+		list_free(tlist_vars);
+	}
+}
+
+/*
+ * create_grouping_expr_infos
+ *	  Create a GroupingExprInfo for each expression usable as grouping key.
+ *
+ * If any grouping expression is not suitable, we will just return with
+ * root->group_expr_list being NIL.
+ */
+static void
+create_grouping_expr_infos(PlannerInfo *root)
+{
+	List	   *exprs = NIL;
+	List	   *sortgrouprefs = NIL;
+	List	   *ecs = NIL;
+	ListCell   *lc,
+			   *lc1,
+			   *lc2,
+			   *lc3;
+
+	Assert(root->group_expr_list == NIL);
+
+	foreach(lc, root->processed_groupClause)
+	{
+		SortGroupClause *sgc = lfirst_node(SortGroupClause, lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sgc, root->processed_tlist);
+		TypeCacheEntry *tce;
+		Oid			equalimageproc;
+
+		Assert(tle->ressortgroupref > 0);
+
+		/*
+		 * For now we only support plain Vars as grouping expressions.
+		 */
+		if (!IsA(tle->expr, Var))
+			return;
+
+		/*
+		 * Eager aggregation is only possible if equality implies image
+		 * equality for each grouping key.  Otherwise, placing keys with
+		 * different byte images into the same group may result in the loss of
+		 * information that could be necessary to evaluate upper qual clauses.
+		 *
+		 * For instance, the NUMERIC data type is not supported, as values
+		 * that are considered equal by the equality operator (e.g., 0 and
+		 * 0.0) can have different scales.
+		 */
+		tce = lookup_type_cache(exprType((Node *) tle->expr),
+								TYPECACHE_BTREE_OPFAMILY);
+		if (!OidIsValid(tce->btree_opf) ||
+			!OidIsValid(tce->btree_opintype))
+			return;
+
+		equalimageproc = get_opfamily_proc(tce->btree_opf,
+										   tce->btree_opintype,
+										   tce->btree_opintype,
+										   BTEQUALIMAGE_PROC);
+		if (!OidIsValid(equalimageproc) ||
+			!DatumGetBool(OidFunctionCall1Coll(equalimageproc,
+											   tce->typcollation,
+											   ObjectIdGetDatum(tce->btree_opintype))))
+			return;
+
+		exprs = lappend(exprs, tle->expr);
+		sortgrouprefs = lappend_int(sortgrouprefs, tle->ressortgroupref);
+		ecs = lappend(ecs, get_eclass_for_sortgroupclause(root, sgc, tle->expr));
+	}
+
+	/*
+	 * Construct a GroupingExprInfo for each expression.
+	 */
+	forthree(lc1, exprs, lc2, sortgrouprefs, lc3, ecs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc1);
+		int			sortgroupref = lfirst_int(lc2);
+		EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc3);
+		GroupingExprInfo *ge_info;
+
+		ge_info = makeNode(GroupingExprInfo);
+		ge_info->expr = (Expr *) copyObject(expr);
+		ge_info->sortgroupref = sortgroupref;
+		ge_info->ec = ec;
+
+		root->group_expr_list = lappend(root->group_expr_list, ge_info);
+	}
+}
+
+/*
+ * get_eclass_for_sortgroupclause
+ *	  Given a group clause and an expression, find an existing equivalence
+ *	  class that the expression is a member of; return NULL if none.
+ */
+static EquivalenceClass *
+get_eclass_for_sortgroupclause(PlannerInfo *root, SortGroupClause *sgc,
+							   Expr *expr)
+{
+	Oid			opfamily,
+				opcintype,
+				collation;
+	CompareType cmptype;
+	Oid			equality_op;
+	List	   *opfamilies;
+
+	/* Punt if the group clause is not sortable */
+	if (!OidIsValid(sgc->sortop))
+		return NULL;
+
+	/* Find the operator in pg_amop --- failure shouldn't happen */
+	if (!get_ordering_op_properties(sgc->sortop,
+									&opfamily, &opcintype, &cmptype))
+		elog(ERROR, "operator %u is not a valid ordering operator",
+			 sgc->sortop);
+
+	/* Because SortGroupClause doesn't carry collation, consult the expr */
+	collation = exprCollation((Node *) expr);
+
+	/*
+	 * EquivalenceClasses need to contain opfamily lists based on the family
+	 * membership of mergejoinable equality operators, which could belong to
+	 * more than one opfamily.  So we have to look up the opfamily's equality
+	 * operator and get its membership.
+	 */
+	equality_op = get_opfamily_member_for_cmptype(opfamily,
+												  opcintype,
+												  opcintype,
+												  COMPARE_EQ);
+	if (!OidIsValid(equality_op))	/* shouldn't happen */
+		elog(ERROR, "missing operator %d(%u,%u) in opfamily %u",
+			 COMPARE_EQ, opcintype, opcintype, opfamily);
+	opfamilies = get_mergejoin_opfamilies(equality_op);
+	if (!opfamilies)			/* certainly should find some */
+		elog(ERROR, "could not find opfamilies for equality operator %u",
+			 equality_op);
+
+	/* Now find a matching EquivalenceClass */
+	return get_eclass_for_sort_expr(root, expr, opfamilies, opcintype,
+									collation, sgc->tleSortGroupRef,
+									NULL, false);
+}
 
 /*****************************************************************************
  *
@@ -2804,42 +3413,6 @@ add_base_clause_to_rel(PlannerInfo *root, Index relid,
 }
 
 /*
- * expr_is_nonnullable
- *	  Check to see if the Expr cannot be NULL
- *
- * If the Expr is a simple Var that is defined NOT NULL and meanwhile is not
- * nulled by any outer joins, then we can know that it cannot be NULL.
- */
-static bool
-expr_is_nonnullable(PlannerInfo *root, Expr *expr)
-{
-	RelOptInfo *rel;
-	Var		   *var;
-
-	/* For now only check simple Vars */
-	if (!IsA(expr, Var))
-		return false;
-
-	var = (Var *) expr;
-
-	/* could the Var be nulled by any outer joins? */
-	if (!bms_is_empty(var->varnullingrels))
-		return false;
-
-	/* system columns cannot be NULL */
-	if (var->varattno < 0)
-		return true;
-
-	/* is the column defined NOT NULL? */
-	rel = find_base_rel(root, var->varno);
-	if (var->varattno > 0 &&
-		bms_is_member(var->varattno, rel->notnullattnums))
-		return true;
-
-	return false;
-}
-
-/*
  * restriction_is_always_true
  *	  Check to see if the RestrictInfo is always true.
  *
@@ -2850,6 +3423,15 @@ bool
 restriction_is_always_true(PlannerInfo *root,
 						   RestrictInfo *restrictinfo)
 {
+	/*
+	 * For a clone clause, we don't have a reliable way to determine if the
+	 * input expression of a NullTest is non-nullable: nullingrel bits in
+	 * clone clauses may not reflect reality, so we dare not draw conclusions
+	 * from clones about whether Vars are guaranteed not-null.
+	 */
+	if (restrictinfo->has_clone || restrictinfo->is_clone)
+		return false;
+
 	/* Check for NullTest qual */
 	if (IsA(restrictinfo->clause, NullTest))
 	{
@@ -2859,7 +3441,14 @@ restriction_is_always_true(PlannerInfo *root,
 		if (nulltest->nulltesttype != IS_NOT_NULL)
 			return false;
 
-		return expr_is_nonnullable(root, nulltest->arg);
+		/*
+		 * Empty rows can appear NULL in some contexts and NOT NULL in others,
+		 * so avoid this optimization for row expressions.
+		 */
+		if (nulltest->argisrow)
+			return false;
+
+		return expr_is_nonnullable(root, nulltest->arg, NOTNULL_SOURCE_RELOPT);
 	}
 
 	/* If it's an OR, check its sub-clauses */
@@ -2899,6 +3488,15 @@ bool
 restriction_is_always_false(PlannerInfo *root,
 							RestrictInfo *restrictinfo)
 {
+	/*
+	 * For a clone clause, we don't have a reliable way to determine if the
+	 * input expression of a NullTest is non-nullable: nullingrel bits in
+	 * clone clauses may not reflect reality, so we dare not draw conclusions
+	 * from clones about whether Vars are guaranteed not-null.
+	 */
+	if (restrictinfo->has_clone || restrictinfo->is_clone)
+		return false;
+
 	/* Check for NullTest qual */
 	if (IsA(restrictinfo->clause, NullTest))
 	{
@@ -2908,7 +3506,14 @@ restriction_is_always_false(PlannerInfo *root,
 		if (nulltest->nulltesttype != IS_NULL)
 			return false;
 
-		return expr_is_nonnullable(root, nulltest->arg);
+		/*
+		 * Empty rows can appear NULL in some contexts and NOT NULL in others,
+		 * so avoid this optimization for row expressions.
+		 */
+		if (nulltest->argisrow)
+			return false;
+
+		return expr_is_nonnullable(root, nulltest->arg, NOTNULL_SOURCE_RELOPT);
 	}
 
 	/* If it's an OR, check its sub-clauses */

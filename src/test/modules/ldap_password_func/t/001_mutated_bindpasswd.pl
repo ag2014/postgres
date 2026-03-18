@@ -1,5 +1,5 @@
 
-# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 use strict;
 use warnings FATAL => 'all';
@@ -42,7 +42,8 @@ note "setting up PostgreSQL instance";
 
 my $node = PostgreSQL::Test::Cluster->new('node');
 $node->init;
-$node->append_conf('postgresql.conf', "log_connections = on\n");
+$node->append_conf('postgresql.conf',
+	"log_connections = 'receipt,authentication,authorization'\n");
 $node->append_conf('postgresql.conf',
 	"shared_preload_libraries = 'ldap_password_func'");
 $node->start;

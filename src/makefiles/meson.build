@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 ### Compute pgxs_data, used in src/meson.build to generate Makefile.global
 ### etc, that's complete enough for PGXS to work.
@@ -6,7 +6,7 @@
 
 # Emulation of PGAC_CHECK_STRIP
 strip_bin = find_program(get_option('STRIP'), required: false, native: true)
-strip_cmd = strip_bin.found() ? [strip_bin.path()] : [':']
+strip_cmd = strip_bin.found() ? [strip_bin.full_path()] : [':']
 
 working_strip = false
 if strip_bin.found()
@@ -49,8 +49,8 @@ pgxs_kv = {
   'PORTNAME': portname,
   'PG_SYSROOT': pg_sysroot,
 
-  'abs_top_builddir': meson.build_root(),
-  'abs_top_srcdir': meson.source_root(),
+  'abs_top_builddir': meson.project_build_root(),
+  'abs_top_srcdir': meson.project_source_root(),
 
   'enable_rpath': get_option('rpath') ? 'yes' : 'no',
   'enable_nls': libintl.found() ? 'yes' : 'no',
@@ -62,8 +62,6 @@ pgxs_kv = {
 
   'DLSUFFIX': dlsuffix,
   'EXEEXT': exesuffix,
-
-  'SUN_STUDIO_CC': 'no', # not supported so far
 
   # want the chosen option, rather than the library
   'with_ssl' : ssl_library,
@@ -88,6 +86,7 @@ pgxs_kv = {
 
   'CC': var_cc,
   'CPP': var_cpp,
+  'CXX': var_cxx,
   'GCC': cc.get_argument_syntax() == 'gcc' ? 'yes' : 'no',
 
   'CPPFLAGS': var_cppflags,
@@ -119,18 +118,18 @@ pgxs_kv = {
   'FLEXFLAGS': ' '.join(flex_flags),
 
   'LIBS': var_libs,
+
+  'have_cxx': have_cxx ? 'yes' : 'no',
 }
 
 if llvm.found()
   pgxs_kv += {
-    'CLANG': clang.path(),
-    'CXX': ' '.join(cpp.cmd_array()),
+    'CLANG': clang.full_path(),
     'LLVM_BINPATH': llvm_binpath,
   }
 else
   pgxs_kv += {
     'CLANG': '',
-    'CXX': '',
     'LLVM_BINPATH': '',
   }
 endif
@@ -156,9 +155,10 @@ pgxs_bins = {
 pgxs_empty = [
   'ICU_CFLAGS', # needs to be added, included by public server headers
 
-  # hard to see why we'd need either?
+  # hard to see why we'd need these ones?
   'ZIC',
   'TCLSH',
+  'NM',
 
   # docs don't seem to be supported by pgxs
   'XMLLINT',
@@ -179,7 +179,7 @@ pgxs_empty = [
   'WANTED_LANGUAGES',
 
   # Not needed because we don't build the server / PLs with the generated makefile
-  'LIBOBJS', 'PG_CRC32C_OBJS', 'TAS',
+  'LIBOBJS', 'PG_CRC32C_OBJS',
   'PG_TEST_EXTRA',
   'DTRACEFLAGS', # only server has dtrace probes
 
@@ -199,6 +199,12 @@ pgxs_empty = [
   'PTHREAD_CFLAGS', 'PTHREAD_LIBS',
 
   'ICU_LIBS',
+
+  'LIBNUMA_CFLAGS', 'LIBNUMA_LIBS',
+
+  'LIBURING_CFLAGS', 'LIBURING_LIBS',
+
+  'LIBCURL_CPPFLAGS', 'LIBCURL_LDFLAGS', 'LIBCURL_LDLIBS',
 ]
 
 if host_system == 'windows' and cc.get_argument_syntax() != 'msvc'
@@ -229,6 +235,9 @@ pgxs_deps = {
   'gssapi': gssapi,
   'icu': icu,
   'ldap': ldap,
+  'libcurl': libcurl,
+  'libnuma': libnuma,
+  'liburing': liburing,
   'libxml': libxml,
   'libxslt': libxslt,
   'llvm': llvm,
@@ -249,7 +258,7 @@ pgxs_deps = {
 pgxs_cdata = configuration_data(pgxs_kv)
 
 foreach b, p : pgxs_bins
-  pgxs_cdata.set(b, p.found() ? p.path() : '')
+  pgxs_cdata.set(b, p.found() ? p.full_path() : '')
 endforeach
 
 foreach pe : pgxs_empty

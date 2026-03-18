@@ -7,15 +7,13 @@
  * indexes or other on-disk structures. See hashfn.h if you need stability.
  *
  *
- * Portions Copyright (c) 2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2024-2026, PostgreSQL Global Development Group
  *
  * src/include/common/hashfn_unstable.h
  */
 #ifndef HASHFN_UNSTABLE_H
 #define HASHFN_UNSTABLE_H
 
-#include "port/pg_bitutils.h"
-#include "port/pg_bswap.h"
 
 /*
  * fasthash is a modification of code taken from
@@ -52,9 +50,7 @@
 /*
  * fasthash as implemented here has two interfaces:
  *
- * 1) Standalone functions, e.g. fasthash32() for a single value with a
- * known length. These return the same hash code as the original, at
- * least on little-endian machines.
+ * 1) Standalone functions that take a single input.
  *
  * 2) Incremental interface. This can used for incorporating multiple
  * inputs. First, initialize the hash state (here with a zero seed):
@@ -62,6 +58,7 @@
  * fasthash_state hs;
  * fasthash_init(&hs, 0);
  *
+ * Next, accumulate input into the hash state.
  * If the inputs are of types that can be trivially cast to uint64, it's
  * sufficient to do:
  *
@@ -75,9 +72,19 @@
  * flexible, but more verbose method. The standalone functions use this
  * internally, so see fasthash64() for an example of this.
  *
- * After all inputs have been mixed in, finalize the hash:
+ * After all inputs have been mixed in, finalize the hash and optionally
+ * reduce to 32 bits. If all inputs are fixed-length, it's sufficient
+ * to pass zero for the tweak:
  *
  * hashcode = fasthash_final32(&hs, 0);
+ *
+ * For variable length input, experimentation has found that SMHasher
+ * fails unless we pass the length for the tweak. When accumulating
+ * multiple varlen values, it's probably safest to calculate a tweak
+ * such that the bits of all individual lengths are present, for example:
+ *
+ * lengths = len1 + (len2 << 10) + (len3 << 20);
+ * hashcode = fasthash_final32(&hs, lengths);
  *
  * The incremental interface allows an optimization for NUL-terminated
  * C strings:
@@ -85,10 +92,8 @@
  * len = fasthash_accum_cstring(&hs, str);
  * hashcode = fasthash_final32(&hs, len);
  *
- * By handling the terminator on-the-fly, we can avoid needing a strlen()
- * call to tell us how many bytes to hash. Experimentation has found that
- * SMHasher fails unless we incorporate the length, so it is passed to
- * the finalizer as a tweak.
+ * By computing the length on-the-fly, we can avoid needing a strlen()
+ * call to tell us how many bytes to hash.
  */
 
 
@@ -153,23 +158,23 @@ fasthash_accum(fasthash_state *hs, const char *k, size_t len)
 			break;
 		case 7:
 			hs->accum |= (uint64) k[6] << 8;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 6:
 			hs->accum |= (uint64) k[5] << 16;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 5:
 			hs->accum |= (uint64) k[4] << 24;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 4:
 			memcpy(&lower_four, k, sizeof(lower_four));
 			hs->accum |= (uint64) lower_four << 32;
 			break;
 		case 3:
 			hs->accum |= (uint64) k[2] << 40;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 2:
 			hs->accum |= (uint64) k[1] << 48;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 1:
 			hs->accum |= (uint64) k[0] << 56;
 			break;
@@ -184,23 +189,23 @@ fasthash_accum(fasthash_state *hs, const char *k, size_t len)
 			break;
 		case 7:
 			hs->accum |= (uint64) k[6] << 48;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 6:
 			hs->accum |= (uint64) k[5] << 40;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 5:
 			hs->accum |= (uint64) k[4] << 32;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 4:
 			memcpy(&lower_four, k, sizeof(lower_four));
 			hs->accum |= lower_four;
 			break;
 		case 3:
 			hs->accum |= (uint64) k[2] << 16;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 2:
 			hs->accum |= (uint64) k[1] << 8;
-			/* FALLTHROUGH */
+			pg_fallthrough;
 		case 1:
 			hs->accum |= (uint64) k[0];
 			break;
@@ -218,13 +223,6 @@ fasthash_accum(fasthash_state *hs, const char *k, size_t len)
  */
 #define haszero64(v) \
 	(((v) - 0x0101010101010101) & ~(v) & 0x8080808080808080)
-
-/* get first byte in memory order */
-#ifdef WORDS_BIGENDIAN
-#define firstbyte64(v) ((v) >> 56)
-#else
-#define firstbyte64(v) ((v) & 0xFF)
-#endif
 
 /*
  * all-purpose workhorse for fasthash_accum_cstring
@@ -262,33 +260,20 @@ static inline size_t
 fasthash_accum_cstring_aligned(fasthash_state *hs, const char *str)
 {
 	const char *const start = str;
-	uint64		chunk;
+	size_t		remainder;
 	uint64		zero_byte_low;
 
 	Assert(PointerIsAligned(start, uint64));
 
 	/*
 	 * For every chunk of input, check for zero bytes before mixing into the
-	 * hash. The chunk with zeros must contain the NUL terminator. We arrange
-	 * so that zero_byte_low tells us not only that a zero exists, but also
-	 * where it is, so we can hash the remainder of the string.
-	 *
-	 * The haszero64 calculation will set bits corresponding to the lowest
-	 * byte where a zero exists, so that suffices for little-endian machines.
-	 * For big-endian machines, we would need bits set for the highest zero
-	 * byte in the chunk, since the trailing junk past the terminator could
-	 * contain additional zeros. haszero64 does not give us that, so we
-	 * byteswap the chunk first.
+	 * hash. The chunk with zeros must contain the NUL terminator.
 	 */
 	for (;;)
 	{
-		chunk = *(uint64 *) str;
+		uint64		chunk = *(const uint64 *) str;
 
-#ifdef WORDS_BIGENDIAN
-		zero_byte_low = haszero64(pg_bswap64(chunk));
-#else
 		zero_byte_low = haszero64(chunk);
-#endif
 		if (zero_byte_low)
 			break;
 
@@ -297,33 +282,9 @@ fasthash_accum_cstring_aligned(fasthash_state *hs, const char *str)
 		str += FH_SIZEOF_ACCUM;
 	}
 
-	if (firstbyte64(chunk) != 0)
-	{
-		size_t		remainder;
-		uint64		mask;
-
-		/*
-		 * The byte corresponding to the NUL will be 0x80, so the rightmost
-		 * bit position will be in the range 15, 23, ..., 63. Turn this into
-		 * byte position by dividing by 8.
-		 */
-		remainder = pg_rightmost_one_pos64(zero_byte_low) / BITS_PER_BYTE;
-
-		/*
-		 * Create a mask for the remaining bytes so we can combine them into
-		 * the hash. This must have the same result as mixing the remaining
-		 * bytes with fasthash_accum().
-		 */
-#ifdef WORDS_BIGENDIAN
-		mask = ~UINT64CONST(0) << BITS_PER_BYTE * (FH_SIZEOF_ACCUM - remainder);
-#else
-		mask = ~UINT64CONST(0) >> BITS_PER_BYTE * (FH_SIZEOF_ACCUM - remainder);
-#endif
-		hs->accum = chunk & mask;
-		fasthash_combine(hs);
-
-		str += remainder;
-	}
+	/* mix in remaining bytes */
+	remainder = fasthash_accum_cstring_unaligned(hs, str);
+	str += remainder;
 
 	return str - start;
 }
@@ -396,9 +357,13 @@ fasthash_final32(fasthash_state *hs, uint64 tweak)
 	return fasthash_reduce32(fasthash_final64(hs, tweak));
 }
 
+
+/* Standalone functions */
+
 /*
  * The original fasthash64 function, re-implemented using the incremental
- * interface. Returns a 64-bit hashcode. 'len' controls not only how
+ * interface. Returns the same 64-bit hashcode as the original,
+ * at least on little-endian machines. 'len' controls not only how
  * many bytes to hash, but also modifies the internal seed.
  * 'seed' can be zero.
  */
@@ -420,6 +385,11 @@ fasthash64(const char *k, size_t len, uint64 seed)
 	}
 
 	fasthash_accum(&hs, k, len);
+
+	/*
+	 * Since we already mixed the input length into the seed, we can just pass
+	 * zero here. This matches upstream behavior as well.
+	 */
 	return fasthash_final64(&hs, 0);
 }
 
@@ -432,6 +402,9 @@ fasthash32(const char *k, size_t len, uint64 seed)
 
 /*
  * Convenience function for hashing NUL-terminated strings
+ *
+ * Note: This is faster than, and computes a different result from,
+ * "fasthash32(s, strlen(s))"
  */
 static inline uint32
 hash_string(const char *s)

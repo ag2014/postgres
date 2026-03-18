@@ -36,10 +36,14 @@
 #include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 #include "utils/typcache.h"
 
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pltcl",
+					.version = PG_VERSION
+);
 
 #define HAVE_TCL_VERSION(maj,min) \
 	((TCL_MAJOR_VERSION > maj) || \
@@ -259,7 +263,7 @@ typedef struct
 } TclExceptionNameMap;
 
 static const TclExceptionNameMap exception_name_map[] = {
-#include "pltclerrcodes.h"		/* pgrminclude ignore */
+#include "pltclerrcodes.h"
 	{NULL, 0}
 };
 
@@ -1583,7 +1587,7 @@ compile_pltcl_function(Oid fn_oid, Oid tgreloid,
 		 * struct prodesc and subsidiary data must all live in proc_cxt.
 		 ************************************************************/
 		oldcontext = MemoryContextSwitchTo(proc_cxt);
-		prodesc = (pltcl_proc_desc *) palloc0(sizeof(pltcl_proc_desc));
+		prodesc = palloc0_object(pltcl_proc_desc);
 		prodesc->user_proname = pstrdup(user_proname);
 		MemoryContextSetIdentifier(proc_cxt, prodesc->user_proname);
 		prodesc->internal_proname = pstrdup(internal_proname);
@@ -2542,7 +2546,7 @@ pltcl_process_SPI_result(Tcl_Interp *interp,
 				break;
 			}
 			/* fall through for utility returning tuples */
-			/* FALLTHROUGH */
+			pg_fallthrough;
 
 		case SPI_OK_SELECT:
 		case SPI_OK_INSERT_RETURNING:
@@ -2665,7 +2669,7 @@ pltcl_SPI_prepare(ClientData cdata, Tcl_Interp *interp,
 									 "PL/Tcl spi_prepare query",
 									 ALLOCSET_SMALL_SIZES);
 	MemoryContextSwitchTo(plan_cxt);
-	qdesc = (pltcl_query_desc *) palloc0(sizeof(pltcl_query_desc));
+	qdesc = palloc0_object(pltcl_query_desc);
 	snprintf(qdesc->qname, sizeof(qdesc->qname), "%p", qdesc);
 	qdesc->nargs = nargs;
 	qdesc->argtypes = (Oid *) palloc(nargs * sizeof(Oid));
@@ -3205,6 +3209,9 @@ pltcl_build_tuple_argument(HeapTuple tuple, TupleDesc tupdesc, bool include_gene
 		{
 			/* don't include unless requested */
 			if (!include_generated)
+				continue;
+			/* never include virtual columns */
+			if (att->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
 				continue;
 		}
 

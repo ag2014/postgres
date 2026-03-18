@@ -2,7 +2,7 @@
  * output_plugin.h
  *	   PostgreSQL Logical Decode Plugin Interface
  *
- * Copyright (c) 2012-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2026, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -94,7 +94,7 @@ typedef void (*LogicalDecodeMessageCB) (struct LogicalDecodingContext *ctx,
  * Filter changes by origin.
  */
 typedef bool (*LogicalDecodeFilterByOriginCB) (struct LogicalDecodingContext *ctx,
-											   RepOriginId origin_id);
+											   ReplOriginId origin_id);
 
 /*
  * Called to shutdown an output plugin.

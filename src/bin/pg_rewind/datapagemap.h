@@ -2,7 +2,7 @@
  *
  * datapagemap.h
  *
- * Copyright (c) 2013-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2026, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */

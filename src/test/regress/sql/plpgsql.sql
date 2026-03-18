@@ -2072,7 +2072,8 @@ declare
   p2 int4 := 1006;
   n int4;
 begin
-  open c1 (p1 := p1, p2 := p2, debug := 2);
+  -- use both supported syntaxes for named arguments
+  open c1 (p1 := p1, p2 => p2, debug => 2);
   fetch c1 into n;
   return n;
 end $$ language plpgsql;
@@ -2934,7 +2935,8 @@ begin
     raise notice '% from %', r.i, c;
   end loop;
   -- again, to test if cursor was closed properly
-  for r in c(9,10) loop
+  -- (and while we're at it, test named-parameter notation)
+  for r in c(r2 := 10, r1 => 9) loop
     raise notice '% from %', r.i, c;
   end loop;
   -- and test a parameterless cursor
@@ -3770,28 +3772,6 @@ select fail();
 drop function fail();
 
 -- Test handling of string literals.
-
-set standard_conforming_strings = off;
-
-create or replace function strtest() returns text as $$
-begin
-  raise notice 'foo\\bar\041baz';
-  return 'foo\\bar\041baz';
-end
-$$ language plpgsql;
-
-select strtest();
-
-create or replace function strtest() returns text as $$
-begin
-  raise notice E'foo\\bar\041baz';
-  return E'foo\\bar\041baz';
-end
-$$ language plpgsql;
-
-select strtest();
-
-set standard_conforming_strings = on;
 
 create or replace function strtest() returns text as $$
 begin

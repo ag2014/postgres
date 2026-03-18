@@ -8,7 +8,7 @@
  * child process is allocated a PMChild struct from a fixed pool of structs.
  * The size of the pool is determined by various settings that configure how
  * many worker processes and backend connections are allowed, i.e.
- * autovacuum_max_workers, max_worker_processes, max_wal_senders, and
+ * autovacuum_worker_slots, max_worker_processes, max_wal_senders, and
  * max_connections.
  *
  * Dead-end backends are handled slightly differently.  There is no limit
@@ -20,7 +20,7 @@
  * pmsignal.c, that mirrors this.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -58,6 +58,17 @@ NON_EXEC_STATIC int num_pmchild_slots = 0;
  * List of active child processes.  This includes dead-end children.
  */
 dlist_head	ActiveChildList;
+
+/*
+ * Dummy pointer to persuade Valgrind that we've not leaked the array of
+ * PMChild structs.  Make it global to ensure the compiler doesn't
+ * optimize it away.
+ */
+#ifdef USE_VALGRIND
+extern PMChild *pmchild_array;
+PMChild    *pmchild_array;
+#endif
+
 
 /*
  * MaxLivePostmasterChildren
@@ -99,8 +110,9 @@ InitPostmasterChildSlots(void)
 	 */
 	pmchild_pools[B_BACKEND].size = 2 * (MaxConnections + max_wal_senders);
 
-	pmchild_pools[B_AUTOVAC_WORKER].size = autovacuum_max_workers;
+	pmchild_pools[B_AUTOVAC_WORKER].size = autovacuum_worker_slots;
 	pmchild_pools[B_BG_WORKER].size = max_worker_processes;
+	pmchild_pools[B_IO_WORKER].size = MAX_IO_WORKERS;
 
 	/*
 	 * There can be only one of each of these running at a time.  They each
@@ -124,8 +136,13 @@ InitPostmasterChildSlots(void)
 	for (int i = 0; i < BACKEND_NUM_TYPES; i++)
 		num_pmchild_slots += pmchild_pools[i].size;
 
-	/* Initialize them */
+	/* Allocate enough slots, and make sure Valgrind doesn't complain */
 	slots = palloc(num_pmchild_slots * sizeof(PMChild));
+#ifdef USE_VALGRIND
+	pmchild_array = slots;
+#endif
+
+	/* Initialize them */
 	slotno = 0;
 	for (int btype = 0; btype < BACKEND_NUM_TYPES; btype++)
 	{

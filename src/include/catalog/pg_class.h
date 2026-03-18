@@ -4,7 +4,7 @@
  *	  definition of the "relation" system catalog (pg_class)
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_class.h
@@ -19,7 +19,7 @@
 #define PG_CLASS_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_class_d.h"
+#include "catalog/pg_class_d.h" /* IWYU pragma: export */
 
 /* ----------------
  *		pg_class definition.  cpp turns this into
@@ -29,6 +29,8 @@
  * BKI_BOOTSTRAP catalogs, since only those rows appear in pg_class.dat.
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,RelationRelation_Rowtype_Id) BKI_SCHEMA_MACRO
 {
 	/* oid */
@@ -67,6 +69,9 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 
 	/* # of all-visible blocks (not always up-to-date) */
 	int32		relallvisible BKI_DEFAULT(0);
+
+	/* # of all-frozen blocks (not always up-to-date) */
+	int32		relallfrozen BKI_DEFAULT(0);
 
 	/* OID of toast table; 0 if none */
 	Oid			reltoastrelid BKI_DEFAULT(0) BKI_LOOKUP_OPT(pg_class);
@@ -141,6 +146,8 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 #endif
 } FormData_pg_class;
 
+END_CATALOG_STRUCT
+
 /* Size of fixed part of pg_class tuples, not counting var-length fields */
 #define CLASS_TUPLE_SIZE \
 	 (offsetof(FormData_pg_class,relminmxid) + sizeof(TransactionId))
@@ -171,6 +178,7 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
 #define		  RELKIND_FOREIGN_TABLE   'f'	/* foreign table */
 #define		  RELKIND_PARTITIONED_TABLE 'p' /* partitioned table */
 #define		  RELKIND_PARTITIONED_INDEX 'I' /* partitioned index */
+#define		  RELKIND_PROPGRAPH		  'g'	/* property graph */
 
 #define		  RELPERSISTENCE_PERMANENT	'p' /* regular table */
 #define		  RELPERSISTENCE_UNLOGGED	'u' /* unlogged permanent table */
@@ -228,8 +236,8 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
 	 (relkind) == RELKIND_TOASTVALUE || \
 	 (relkind) == RELKIND_MATVIEW)
 
-extern int	errdetail_relkind_not_supported(char relkind);
-
 #endif							/* EXPOSE_TO_CLIENT_CODE */
+
+extern int	errdetail_relkind_not_supported(char relkind);
 
 #endif							/* PG_CLASS_H */

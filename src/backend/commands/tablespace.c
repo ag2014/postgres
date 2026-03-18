@@ -35,7 +35,7 @@
  * and munge the system catalogs of the new database.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -70,6 +70,7 @@
 #include "miscadmin.h"
 #include "postmaster/bgwriter.h"
 #include "storage/fd.h"
+#include "storage/procsignal.h"
 #include "storage/standby.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -241,6 +242,12 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 				(errcode(ERRCODE_INVALID_NAME),
 				 errmsg("tablespace location cannot contain single quotes")));
 
+	/* Report error if name has \n or \r character. */
+	if (strpbrk(stmt->tablespacename, "\n\r"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("tablespace name \"%s\" contains a newline or carriage return character", stmt->tablespacename)));
+
 	in_place = allow_in_place_tablespaces && strlen(location) == 0;
 
 	/*
@@ -363,9 +370,9 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 		xlrec.ts_id = tablespaceoid;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec,
+		XLogRegisterData(&xlrec,
 						 offsetof(xl_tblspc_create_rec, ts_path));
-		XLogRegisterData((char *) location, strlen(location) + 1);
+		XLogRegisterData(location, strlen(location) + 1);
 
 		(void) XLogInsert(RM_TBLSPC_ID, XLOG_TBLSPC_CREATE);
 	}
@@ -500,7 +507,7 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 		 * mustn't delete.  So instead, we force a checkpoint which will clean
 		 * out any lingering files, and try again.
 		 */
-		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
 		/*
 		 * On Windows, an unlinked file persists in the directory listing
@@ -533,7 +540,7 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 		xlrec.ts_id = tablespaceoid;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, sizeof(xl_tblspc_drop_rec));
+		XLogRegisterData(&xlrec, sizeof(xl_tblspc_drop_rec));
 
 		(void) XLogInsert(RM_TBLSPC_ID, XLOG_TBLSPC_DROP);
 	}
@@ -969,6 +976,12 @@ RenameTableSpace(const char *oldname, const char *newname)
 				(errcode(ERRCODE_RESERVED_NAME),
 				 errmsg("unacceptable tablespace name \"%s\"", newname),
 				 errdetail("The prefix \"pg_\" is reserved for system tablespaces.")));
+
+	/* Report error if name has \n or \r character. */
+	if (strpbrk(newname, "\n\r"))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("tablespace name \"%s\" contains a newline or carriage return character", newname)));
 
 	/*
 	 * If built with appropriate switch, whine when regression-testing

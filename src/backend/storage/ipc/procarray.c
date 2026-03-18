@@ -34,7 +34,7 @@
  * happen, it would tie up KnownAssignedXids indefinitely, so we protect
  * ourselves by pruning the array when a valid list of running XIDs arrives.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -54,16 +54,20 @@
 #include "access/xlogutils.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_authid.h"
-#include "commands/dbcommands.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "postmaster/bgworker.h"
 #include "port/pg_lfind.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/procsignal.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/injection_point.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/wait_event.h"
 
 #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
 
@@ -706,8 +710,6 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid)
 		/* be sure this is cleared in abort */
 		proc->delayChkptFlags = 0;
 
-		proc->recoveryConflictPending = false;
-
 		/* must be cleared with xid/xmin: */
 		/* avoid unnecessarily dirtying shared cachelines */
 		if (proc->statusFlags & PROC_VACUUM_STATE_MASK)
@@ -747,8 +749,6 @@ ProcArrayEndTransactionInternal(PGPROC *proc, TransactionId latestXid)
 
 	/* be sure this is cleared in abort */
 	proc->delayChkptFlags = 0;
-
-	proc->recoveryConflictPending = false;
 
 	/* must be cleared with xid/xmin: */
 	/* avoid unnecessarily dirtying shared cachelines */
@@ -931,7 +931,6 @@ ProcArrayClearTransaction(PGPROC *proc)
 
 	proc->vxid.lxid = InvalidLocalTransactionId;
 	proc->xmin = InvalidTransactionId;
-	proc->recoveryConflictPending = false;
 
 	Assert(!(proc->statusFlags & PROC_VACUUM_STATE_MASK));
 	Assert(!proc->delayChkptFlags);
@@ -1162,7 +1161,7 @@ ProcArrayApplyRecoveryInfo(RunningTransactions running)
 	 * Allocate a temporary array to avoid modifying the array passed as
 	 * argument.
 	 */
-	xids = palloc(sizeof(TransactionId) * (running->xcnt + running->subxcnt));
+	xids = palloc_array(TransactionId, running->xcnt + running->subxcnt);
 
 	/*
 	 * Add to the temp array any xids which have not already completed.
@@ -1620,58 +1619,6 @@ TransactionIdIsInProgress(TransactionId xid)
 
 	cachedXidIsNotInProgress = xid;
 	return false;
-}
-
-/*
- * TransactionIdIsActive -- is xid the top-level XID of an active backend?
- *
- * This differs from TransactionIdIsInProgress in that it ignores prepared
- * transactions, as well as transactions running on the primary if we're in
- * hot standby.  Also, we ignore subtransactions since that's not needed
- * for current uses.
- */
-bool
-TransactionIdIsActive(TransactionId xid)
-{
-	bool		result = false;
-	ProcArrayStruct *arrayP = procArray;
-	TransactionId *other_xids = ProcGlobal->xids;
-	int			i;
-
-	/*
-	 * Don't bother checking a transaction older than RecentXmin; it could not
-	 * possibly still be running.
-	 */
-	if (TransactionIdPrecedes(xid, RecentXmin))
-		return false;
-
-	LWLockAcquire(ProcArrayLock, LW_SHARED);
-
-	for (i = 0; i < arrayP->numProcs; i++)
-	{
-		int			pgprocno = arrayP->pgprocnos[i];
-		PGPROC	   *proc = &allProcs[pgprocno];
-		TransactionId pxid;
-
-		/* Fetch xid just once - see GetNewTransactionId */
-		pxid = UINT32_ACCESS_ONCE(other_xids[i]);
-
-		if (!TransactionIdIsValid(pxid))
-			continue;
-
-		if (proc->pid == 0)
-			continue;			/* ignore prepared transactions */
-
-		if (TransactionIdEquals(pxid, xid))
-		{
-			result = true;
-			break;
-		}
-	}
-
-	LWLockRelease(ProcArrayLock);
-
-	return result;
 }
 
 
@@ -2866,8 +2813,10 @@ GetRunningTransactionData(void)
  *
  * Similar to GetSnapshotData but returns just oldestActiveXid. We include
  * all PGPROCs with an assigned TransactionId, even VACUUM processes.
- * We look at all databases, though there is no need to include WALSender
- * since this has no effect on hot standby conflicts.
+ *
+ * If allDbs is true, we look at all databases, though there is no need to
+ * include WALSender since this has no effect on hot standby conflicts. If
+ * allDbs is false, skip processes attached to other databases.
  *
  * This is never executed during recovery so there is no need to look at
  * KnownAssignedXids.
@@ -2875,9 +2824,12 @@ GetRunningTransactionData(void)
  * We don't worry about updating other counters, we want to keep this as
  * simple as possible and leave GetSnapshotData() as the primary code for
  * that bookkeeping.
+ *
+ * inCommitOnly indicates getting the oldestActiveXid among the transactions
+ * in the commit critical section.
  */
 TransactionId
-GetOldestActiveTransactionId(void)
+GetOldestActiveTransactionId(bool inCommitOnly, bool allDbs)
 {
 	ProcArrayStruct *arrayP = procArray;
 	TransactionId *other_xids = ProcGlobal->xids;
@@ -2904,11 +2856,20 @@ GetOldestActiveTransactionId(void)
 	for (index = 0; index < arrayP->numProcs; index++)
 	{
 		TransactionId xid;
+		int			pgprocno = arrayP->pgprocnos[index];
+		PGPROC	   *proc = &allProcs[pgprocno];
 
 		/* Fetch xid just once - see GetNewTransactionId */
 		xid = UINT32_ACCESS_ONCE(other_xids[index]);
 
 		if (!TransactionIdIsNormal(xid))
+			continue;
+
+		if (inCommitOnly &&
+			(proc->delayChkptFlags & DELAY_CHKPT_IN_COMMIT) == 0)
+			continue;
+
+		if (!allDbs && proc->databaseId != MyDatabaseId)
 			continue;
 
 		if (TransactionIdPrecedes(xid, oldestRunningXid))
@@ -3050,8 +3011,7 @@ GetVirtualXIDsDelayingChkpt(int *nvxids, int type)
 	Assert(type != 0);
 
 	/* allocate what's certainly enough result space */
-	vxids = (VirtualTransactionId *)
-		palloc(sizeof(VirtualTransactionId) * arrayP->maxProcs);
+	vxids = palloc_array(VirtualTransactionId, arrayP->maxProcs);
 
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 
@@ -3331,8 +3291,7 @@ GetCurrentVirtualXIDs(TransactionId limitXmin, bool excludeXmin0,
 	int			index;
 
 	/* allocate what's certainly enough result space */
-	vxids = (VirtualTransactionId *)
-		palloc(sizeof(VirtualTransactionId) * arrayP->maxProcs);
+	vxids = palloc_array(VirtualTransactionId, arrayP->maxProcs);
 
 	LWLockAcquire(ProcArrayLock, LW_SHARED);
 
@@ -3483,19 +3442,46 @@ GetConflictingVirtualXIDs(TransactionId limitXmin, Oid dbOid)
 }
 
 /*
- * CancelVirtualTransaction - used in recovery conflict processing
+ * SignalRecoveryConflict -- signal that a process is blocking recovery
  *
- * Returns pid of the process signaled, or 0 if not found.
+ * The 'pid' is redundant with 'proc', but it acts as a cross-check to
+ * detect process had exited and the PGPROC entry was reused for a different
+ * process.
+ *
+ * Returns true if the process was signaled, or false if not found.
  */
-pid_t
-CancelVirtualTransaction(VirtualTransactionId vxid, ProcSignalReason sigmode)
+bool
+SignalRecoveryConflict(PGPROC *proc, pid_t pid, RecoveryConflictReason reason)
 {
-	return SignalVirtualTransaction(vxid, sigmode, true);
+	bool		found = false;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+
+	/*
+	 * Kill the pid if it's still here. If not, that's what we wanted so
+	 * ignore any errors.
+	 */
+	if (proc->pid == pid)
+	{
+		(void) pg_atomic_fetch_or_u32(&proc->pendingRecoveryConflicts, (1 << reason));
+
+		/* wake up the process */
+		(void) SendProcSignal(pid, PROCSIG_RECOVERY_CONFLICT, GetNumberFromPGProc(proc));
+		found = true;
+	}
+
+	LWLockRelease(ProcArrayLock);
+
+	return found;
 }
 
-pid_t
-SignalVirtualTransaction(VirtualTransactionId vxid, ProcSignalReason sigmode,
-						 bool conflictPending)
+/*
+ * SignalRecoveryConflictWithVirtualXID -- signal that a VXID is blocking recovery
+ *
+ * Like SignalRecoveryConflict, but the target is identified by VXID
+ */
+bool
+SignalRecoveryConflictWithVirtualXID(VirtualTransactionId vxid, RecoveryConflictReason reason)
 {
 	ProcArrayStruct *arrayP = procArray;
 	int			index;
@@ -3514,15 +3500,16 @@ SignalVirtualTransaction(VirtualTransactionId vxid, ProcSignalReason sigmode,
 		if (procvxid.procNumber == vxid.procNumber &&
 			procvxid.localTransactionId == vxid.localTransactionId)
 		{
-			proc->recoveryConflictPending = conflictPending;
 			pid = proc->pid;
 			if (pid != 0)
 			{
+				(void) pg_atomic_fetch_or_u32(&proc->pendingRecoveryConflicts, (1 << reason));
+
 				/*
 				 * Kill the pid if it's still here. If not, that's what we
 				 * wanted so ignore any errors.
 				 */
-				(void) SendProcSignal(pid, sigmode, vxid.procNumber);
+				(void) SendProcSignal(pid, PROCSIG_RECOVERY_CONFLICT, vxid.procNumber);
 			}
 			break;
 		}
@@ -3530,7 +3517,50 @@ SignalVirtualTransaction(VirtualTransactionId vxid, ProcSignalReason sigmode,
 
 	LWLockRelease(ProcArrayLock);
 
-	return pid;
+	return pid != 0;
+}
+
+/*
+ * SignalRecoveryConflictWithDatabase -- signal backends using specified database
+ *
+ * Like SignalRecoveryConflict, but signals all backends using the database.
+ */
+void
+SignalRecoveryConflictWithDatabase(Oid databaseid, RecoveryConflictReason reason)
+{
+	ProcArrayStruct *arrayP = procArray;
+	int			index;
+
+	/* tell all backends to die */
+	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+
+	for (index = 0; index < arrayP->numProcs; index++)
+	{
+		int			pgprocno = arrayP->pgprocnos[index];
+		PGPROC	   *proc = &allProcs[pgprocno];
+
+		if (databaseid == InvalidOid || proc->databaseId == databaseid)
+		{
+			VirtualTransactionId procvxid;
+			pid_t		pid;
+
+			GET_VXID_FROM_PGPROC(procvxid, *proc);
+
+			pid = proc->pid;
+			if (pid != 0)
+			{
+				(void) pg_atomic_fetch_or_u32(&proc->pendingRecoveryConflicts, (1 << reason));
+
+				/*
+				 * Kill the pid if it's still here. If not, that's what we
+				 * wanted so ignore any errors.
+				 */
+				(void) SendProcSignal(pid, PROCSIG_RECOVERY_CONFLICT, procvxid.procNumber);
+			}
+		}
+	}
+
+	LWLockRelease(ProcArrayLock);
 }
 
 /*
@@ -3622,8 +3652,7 @@ CountDBBackends(Oid databaseid)
 }
 
 /*
- * CountDBConnections --- counts database backends ignoring any background
- *		worker processes
+ * CountDBConnections --- counts database backends (only regular backends)
  */
 int
 CountDBConnections(Oid databaseid)
@@ -3641,8 +3670,8 @@ CountDBConnections(Oid databaseid)
 
 		if (proc->pid == 0)
 			continue;			/* do not count prepared xacts */
-		if (proc->isBackgroundWorker)
-			continue;			/* do not count background workers */
+		if (proc->backendType != B_BACKEND)
+			continue;			/* count only regular backend processes */
 		if (!OidIsValid(databaseid) ||
 			proc->databaseId == databaseid)
 			count++;
@@ -3654,47 +3683,8 @@ CountDBConnections(Oid databaseid)
 }
 
 /*
- * CancelDBBackends --- cancel backends that are using specified database
- */
-void
-CancelDBBackends(Oid databaseid, ProcSignalReason sigmode, bool conflictPending)
-{
-	ProcArrayStruct *arrayP = procArray;
-	int			index;
-
-	/* tell all backends to die */
-	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
-
-	for (index = 0; index < arrayP->numProcs; index++)
-	{
-		int			pgprocno = arrayP->pgprocnos[index];
-		PGPROC	   *proc = &allProcs[pgprocno];
-
-		if (databaseid == InvalidOid || proc->databaseId == databaseid)
-		{
-			VirtualTransactionId procvxid;
-			pid_t		pid;
-
-			GET_VXID_FROM_PGPROC(procvxid, *proc);
-
-			proc->recoveryConflictPending = conflictPending;
-			pid = proc->pid;
-			if (pid != 0)
-			{
-				/*
-				 * Kill the pid if it's still here. If not, that's what we
-				 * wanted so ignore any errors.
-				 */
-				(void) SendProcSignal(pid, sigmode, procvxid.procNumber);
-			}
-		}
-	}
-
-	LWLockRelease(ProcArrayLock);
-}
-
-/*
  * CountUserBackends --- count backends that are used by specified user
+ * (only regular backends, not any type of background worker)
  */
 int
 CountUserBackends(Oid roleid)
@@ -3712,8 +3702,8 @@ CountUserBackends(Oid roleid)
 
 		if (proc->pid == 0)
 			continue;			/* do not count prepared xacts */
-		if (proc->isBackgroundWorker)
-			continue;			/* do not count background workers */
+		if (proc->backendType != B_BACKEND)
+			continue;			/* count only regular backend processes */
 		if (proc->roleId == roleid)
 			count++;
 	}
@@ -3727,8 +3717,10 @@ CountUserBackends(Oid roleid)
  * CountOtherDBBackends -- check for other backends running in the given DB
  *
  * If there are other backends in the DB, we will wait a maximum of 5 seconds
- * for them to exit.  Autovacuum backends are encouraged to exit early by
- * sending them SIGTERM, but normal user backends are just waited for.
+ * for them to exit (or 0.3s for testing purposes).  Autovacuum backends are
+ * encouraged to exit early by sending them SIGTERM, but normal user backends
+ * are just waited for.  If background workers connected to this database are
+ * marked as interruptible, they are terminated.
  *
  * The current backend is always ignored; it is caller's responsibility to
  * check whether the current backend uses the given DB, if it's important.
@@ -3753,10 +3745,19 @@ CountOtherDBBackends(Oid databaseId, int *nbackends, int *nprepared)
 
 #define MAXAUTOVACPIDS	10		/* max autovacs to SIGTERM per iteration */
 	int			autovac_pids[MAXAUTOVACPIDS];
-	int			tries;
 
-	/* 50 tries with 100ms sleep between tries makes 5 sec total wait */
-	for (tries = 0; tries < 50; tries++)
+	/*
+	 * Retry up to 50 times with 100ms between attempts (max 5s total). Can be
+	 * reduced to 3 attempts (max 0.3s total) to speed up tests.
+	 */
+	int			ntries = 50;
+
+#ifdef USE_INJECTION_POINTS
+	if (IS_INJECTION_POINT_ATTACHED("procarray-reduce-count"))
+		ntries = 3;
+#endif
+
+	for (int tries = 0; tries < ntries; tries++)
 	{
 		int			nautovacs = 0;
 		bool		found = false;
@@ -3805,6 +3806,12 @@ CountOtherDBBackends(Oid databaseId, int *nbackends, int *nprepared)
 		 */
 		for (index = 0; index < nautovacs; index++)
 			(void) kill(autovac_pids[index], SIGTERM);	/* ignore any error */
+
+		/*
+		 * Terminate all background workers for this database, if they have
+		 * requested it (BGWORKER_INTERRUPTIBLE).
+		 */
+		TerminateBackgroundWorkersForDatabase(databaseId);
 
 		/* sleep, then try again */
 		pg_usleep(100 * 1000L); /* 100ms */
@@ -4497,8 +4504,22 @@ ExpireTreeKnownAssignedTransactionIds(TransactionId xid, int nsubxids,
 void
 ExpireAllKnownAssignedTransactionIds(void)
 {
+	FullTransactionId latestXid;
+
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 	KnownAssignedXidsRemovePreceding(InvalidTransactionId);
+
+	/* Reset latestCompletedXid to nextXid - 1 */
+	Assert(FullTransactionIdIsValid(TransamVariables->nextXid));
+	latestXid = TransamVariables->nextXid;
+	FullTransactionIdRetreat(&latestXid);
+	TransamVariables->latestCompletedXid = latestXid;
+
+	/*
+	 * Any transactions that were in-progress were effectively aborted, so
+	 * advance xactCompletionCount.
+	 */
+	TransamVariables->xactCompletionCount++;
 
 	/*
 	 * Reset lastOverflowedXid.  Currently, lastOverflowedXid has no use after
@@ -4517,7 +4538,17 @@ ExpireAllKnownAssignedTransactionIds(void)
 void
 ExpireOldKnownAssignedTransactionIds(TransactionId xid)
 {
+	TransactionId latestXid;
+
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
+
+	/* As in ProcArrayEndTransaction, advance latestCompletedXid */
+	latestXid = xid;
+	TransactionIdRetreat(latestXid);
+	MaintainLatestCompletedXidRecovery(latestXid);
+
+	/* ... and xactCompletionCount */
+	TransamVariables->xactCompletionCount++;
 
 	/*
 	 * Reset lastOverflowedXid if we know all transactions that have been

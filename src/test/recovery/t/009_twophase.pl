@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # Tests dedicated to two-phase commit in recovery
 use strict;
@@ -222,7 +222,7 @@ $cur_primary->psql(
 	SAVEPOINT s1;
 	INSERT INTO t_009_tbl VALUES (22, 'issued to ${cur_primary_name}');
 	PREPARE TRANSACTION 'xact_009_10';");
-$cur_primary->teardown_node;
+$cur_primary->stop;
 $cur_standby->promote;
 
 # change roles
@@ -319,6 +319,7 @@ $cur_primary->psql('postgres', "COMMIT PREPARED 'xact_009_12'");
 
 $cur_primary->psql(
 	'postgres', "
+	SET synchronous_commit='remote_apply'; -- To ensure the standby is caught up
 	CREATE TABLE t_009_tbl_standby_mvcc (id int, msg text);
 	BEGIN;
 	INSERT INTO t_009_tbl_standby_mvcc VALUES (1, 'issued to ${cur_primary_name}');

@@ -6,7 +6,7 @@
  *	  changes should be made with care.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/gist.h
@@ -21,6 +21,7 @@
 #include "access/transam.h"
 #include "access/xlog.h"
 #include "access/xlogdefs.h"
+#include "nodes/primnodes.h"
 #include "storage/block.h"
 #include "storage/bufpage.h"
 #include "utils/relcache.h"
@@ -39,7 +40,7 @@
 #define GIST_FETCH_PROC					9
 #define GIST_OPTIONS_PROC				10
 #define GIST_SORTSUPPORT_PROC			11
-#define GIST_STRATNUM_PROC				12
+#define GIST_TRANSLATE_CMPTYPE_PROC		12
 #define GISTNProcs					12
 
 /*
@@ -185,8 +186,8 @@ typedef struct GISTENTRY
 #define GistMarkFollowRight(page) ( GistPageGetOpaque(page)->flags |= F_FOLLOW_RIGHT)
 #define GistClearFollowRight(page)	( GistPageGetOpaque(page)->flags &= ~F_FOLLOW_RIGHT)
 
-#define GistPageGetNSN(page) ( PageXLogRecPtrGet(GistPageGetOpaque(page)->nsn))
-#define GistPageSetNSN(page, val) ( PageXLogRecPtrSet(GistPageGetOpaque(page)->nsn, val))
+#define GistPageGetNSN(page) ( PageXLogRecPtrGet(&GistPageGetOpaque(page)->nsn))
+#define GistPageSetNSN(page, val) ( PageXLogRecPtrSet(&GistPageGetOpaque(page)->nsn, val))
 
 
 /*
@@ -247,6 +248,6 @@ typedef struct
 	do { (e).key = (k); (e).rel = (r); (e).page = (pg); \
 		 (e).offset = (o); (e).leafkey = (l); } while (0)
 
-extern StrategyNumber GistTranslateStratnum(Oid opclass, StrategyNumber strat);
+extern StrategyNumber gisttranslatecmptype(CompareType cmptype, Oid opfamily);
 
 #endif							/* GIST_H */

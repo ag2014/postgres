@@ -3,7 +3,7 @@
  * pg_verifybackup.c
  *	  Verify a backup against a backup manifest.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/pg_verifybackup/pg_verifybackup.c
@@ -15,14 +15,15 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <time.h>
 
+#include "access/xlog_internal.h"
 #include "common/logging.h"
 #include "common/parse_manifest.h"
 #include "fe_utils/simple_list.h"
 #include "getopt_long.h"
-#include "limits.h"
 #include "pg_verifybackup.h"
 #include "pgtime.h"
 
@@ -69,9 +70,9 @@ static void verifybackup_per_wal_range_cb(JsonManifestParseContext *context,
 										  TimeLineID tli,
 										  XLogRecPtr start_lsn,
 										  XLogRecPtr end_lsn);
-static void report_manifest_error(JsonManifestParseContext *context,
-								  const char *fmt,...)
-			pg_attribute_printf(2, 3) pg_attribute_noreturn();
+pg_noreturn static void report_manifest_error(JsonManifestParseContext *context,
+											  const char *fmt,...)
+			pg_attribute_printf(2, 3);
 
 static void verify_tar_backup(verifier_context *context, DIR *dir);
 static void verify_plain_backup_directory(verifier_context *context,
@@ -337,7 +338,7 @@ main(int argc, char **argv)
 	if (!no_parse_wal && context.format == 't')
 	{
 		pg_log_error("pg_waldump cannot read tar files");
-		pg_log_error_hint("You must use -n or --no-parse-wal when verifying a tar-format backup.");
+		pg_log_error_hint("You must use -n/--no-parse-wal when verifying a tar-format backup.");
 		exit(1);
 	}
 
@@ -417,7 +418,7 @@ parse_manifest_file(char *manifest_path)
 	/* Create the hash table. */
 	ht = manifest_files_create(initial_size, NULL);
 
-	result = pg_malloc0(sizeof(manifest_data));
+	result = pg_malloc0_object(manifest_data);
 	result->files = ht;
 	context.private_data = result;
 	context.version_cb = verifybackup_version_cb;
@@ -583,7 +584,7 @@ verifybackup_per_wal_range_cb(JsonManifestParseContext *context,
 	manifest_wal_range *range;
 
 	/* Allocate and initialize a struct describing this WAL range. */
-	range = palloc(sizeof(manifest_wal_range));
+	range = palloc_object(manifest_wal_range);
 	range->tli = tli;
 	range->start_lsn = start_lsn;
 	range->end_lsn = end_lsn;
@@ -693,11 +694,11 @@ verify_plain_backup_file(verifier_context *context, char *relpath,
 		return;
 	}
 
-	/* If it's not a directory, it should be a plain file. */
+	/* If it's not a directory, it should be a regular file. */
 	if (!S_ISREG(sb.st_mode))
 	{
 		report_backup_error(context,
-							"\"%s\" is not a file or directory",
+							"\"%s\" is not a regular file or directory",
 							relpath);
 		return;
 	}
@@ -730,7 +731,7 @@ verify_plain_backup_file(verifier_context *context, char *relpath,
 	 * version 1.
 	 */
 	if (context->manifest->version != 1 &&
-		strcmp(relpath, "global/pg_control") == 0)
+		strcmp(relpath, XLOG_CONTROL_FILE) == 0)
 		verify_control_file(fullpath, context->manifest->system_identifier);
 
 	/* Update statistics for progress report, if necessary */
@@ -770,10 +771,10 @@ verify_control_file(const char *controlpath, uint64 manifest_system_identifier)
 
 	/* System identifiers should match. */
 	if (manifest_system_identifier != control_file->system_identifier)
-		report_fatal_error("%s: manifest system identifier is %llu, but control file has %llu",
+		report_fatal_error("%s: manifest system identifier is %" PRIu64 ", but control file has %" PRIu64,
 						   controlpath,
-						   (unsigned long long) manifest_system_identifier,
-						   (unsigned long long) control_file->system_identifier);
+						   manifest_system_identifier,
+						   control_file->system_identifier);
 
 	/* Release memory. */
 	pfree(control_file);
@@ -898,11 +899,11 @@ precheck_tar_backup_file(verifier_context *context, char *relpath,
 		return;
 	}
 
-	/* In a tar format backup, we expect only plain files. */
+	/* In a tar format backup, we expect only regular files. */
 	if (!S_ISREG(sb.st_mode))
 	{
 		report_backup_error(context,
-							"\"%s\" is not a plain file",
+							"file \"%s\" is not a regular file",
 							relpath);
 		return;
 	}
@@ -969,7 +970,7 @@ precheck_tar_backup_file(verifier_context *context, char *relpath,
 	 * Append the information to the list for complete verification at a later
 	 * stage.
 	 */
-	tar = pg_malloc(sizeof(tar_file));
+	tar = pg_malloc_object(tar_file);
 	tar->relpath = pstrdup(relpath);
 	tar->tblspc_oid = tblspc_oid;
 	tar->compress_algorithm = compress_algorithm;
@@ -1064,7 +1065,7 @@ verify_backup_checksums(verifier_context *context)
 
 	progress_report(false);
 
-	buffer = pg_malloc(READ_CHUNK_SIZE * sizeof(uint8));
+	buffer = pg_malloc_array(uint8, READ_CHUNK_SIZE);
 
 	manifest_files_start_iterate(manifest->files, &it);
 	while ((m = manifest_files_iterate(manifest->files, &it)) != NULL)
@@ -1165,9 +1166,8 @@ verify_file_checksum(verifier_context *context, manifest_file *m,
 	if (bytes_read != m->size)
 	{
 		report_backup_error(context,
-							"file \"%s\" should contain %llu bytes, but read %llu bytes",
-							relpath, (unsigned long long) m->size,
-							(unsigned long long) bytes_read);
+							"file \"%s\" should contain %" PRIu64 " bytes, but read %" PRIu64,
+							relpath, m->size, bytes_read);
 		return;
 	}
 
@@ -1207,7 +1207,7 @@ parse_required_wal(verifier_context *context, char *pg_waldump_path,
 	{
 		char	   *pg_waldump_cmd;
 
-		pg_waldump_cmd = psprintf("\"%s\" --quiet --path=\"%s\" --timeline=%u --start=%X/%X --end=%X/%X\n",
+		pg_waldump_cmd = psprintf("\"%s\" --quiet --path=\"%s\" --timeline=%u --start=%X/%08X --end=%X/%08X\n",
 								  pg_waldump_path, wal_directory, this_wal_range->tli,
 								  LSN_FORMAT_ARGS(this_wal_range->start_lsn),
 								  LSN_FORMAT_ARGS(this_wal_range->end_lsn));

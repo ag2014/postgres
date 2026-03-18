@@ -2,7 +2,7 @@
  *
  * pg_waldump.c - decode and display WAL
  *
- * Copyright (c) 2013-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_waldump/pg_waldump.c
@@ -39,7 +39,6 @@
 
 static const char *progname;
 
-static int	WalSegSz;
 static volatile sig_atomic_t time_to_stop = false;
 
 static const RelFileLocator emptyRelFileLocator = {0, 0, 0};
@@ -160,7 +159,7 @@ create_fullpage_directory(char *path)
 static void
 split_path(const char *path, char **dir, char **fname)
 {
-	char	   *sep;
+	const char *sep;
 
 	/* split filepath into directory & filename */
 	sep = strrchr(path, '/');
@@ -203,11 +202,11 @@ open_file_in_directory(const char *directory, const char *fname)
 /*
  * Try to find fname in the given directory. Returns true if it is found,
  * false otherwise. If fname is NULL, search the complete directory for any
- * file with a valid WAL file name. If file is successfully opened, set the
- * wal segment size.
+ * file with a valid WAL file name. If file is successfully opened, set
+ * *WaSegSz to the WAL segment size.
  */
 static bool
-search_directory(const char *directory, const char *fname)
+search_directory(const char *directory, const char *fname, int *WalSegSz)
 {
 	int			fd = -1;
 	DIR		   *xldir;
@@ -249,17 +248,17 @@ search_directory(const char *directory, const char *fname)
 		{
 			XLogLongPageHeader longhdr = (XLogLongPageHeader) buf.data;
 
-			WalSegSz = longhdr->xlp_seg_size;
-
-			if (!IsValidWalSegSize(WalSegSz))
+			if (!IsValidWalSegSize(longhdr->xlp_seg_size))
 			{
 				pg_log_error(ngettext("invalid WAL segment size in WAL file \"%s\" (%d byte)",
 									  "invalid WAL segment size in WAL file \"%s\" (%d bytes)",
-									  WalSegSz),
-							 fname, WalSegSz);
+									  longhdr->xlp_seg_size),
+							 fname, longhdr->xlp_seg_size);
 				pg_log_error_detail("The WAL segment size must be a power of two between 1 MB and 1 GB.");
 				exit(1);
 			}
+
+			*WalSegSz = longhdr->xlp_seg_size;
 		}
 		else if (r < 0)
 			pg_fatal("could not read file \"%s\": %m",
@@ -286,21 +285,22 @@ search_directory(const char *directory, const char *fname)
  *	 XLOGDIR /
  *	 $PGDATA / XLOGDIR /
  *
- * The valid target directory is returned.
+ * The valid target directory is returned, and *WalSegSz is set to the
+ * size of the WAL segment found in that directory.
  */
 static char *
-identify_target_directory(char *directory, char *fname)
+identify_target_directory(char *directory, char *fname, int *WalSegSz)
 {
 	char		fpath[MAXPGPATH];
 
 	if (directory != NULL)
 	{
-		if (search_directory(directory, fname))
+		if (search_directory(directory, fname, WalSegSz))
 			return pg_strdup(directory);
 
 		/* directory / XLOGDIR */
 		snprintf(fpath, MAXPGPATH, "%s/%s", directory, XLOGDIR);
-		if (search_directory(fpath, fname))
+		if (search_directory(fpath, fname, WalSegSz))
 			return pg_strdup(fpath);
 	}
 	else
@@ -308,10 +308,10 @@ identify_target_directory(char *directory, char *fname)
 		const char *datadir;
 
 		/* current directory */
-		if (search_directory(".", fname))
+		if (search_directory(".", fname, WalSegSz))
 			return pg_strdup(".");
 		/* XLOGDIR */
-		if (search_directory(XLOGDIR, fname))
+		if (search_directory(XLOGDIR, fname, WalSegSz))
 			return pg_strdup(XLOGDIR);
 
 		datadir = getenv("PGDATA");
@@ -319,7 +319,7 @@ identify_target_directory(char *directory, char *fname)
 		if (datadir != NULL)
 		{
 			snprintf(fpath, MAXPGPATH, "%s/%s", datadir, XLOGDIR);
-			if (search_directory(fpath, fname))
+			if (search_directory(fpath, fname, WalSegSz))
 				return pg_strdup(fpath);
 		}
 	}
@@ -393,7 +393,7 @@ WALDumpReadPage(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
 	int			count = XLOG_BLCKSZ;
 	WALReadError errinfo;
 
-	if (private->endptr != InvalidXLogRecPtr)
+	if (XLogRecPtrIsValid(private->endptr))
 	{
 		if (targetPagePtr + XLOG_BLCKSZ <= private->endptr)
 			count = XLOG_BLCKSZ;
@@ -637,7 +637,7 @@ XLogDumpDisplayStats(XLogDumpConfig *config, XLogStats *stats)
 	/*
 	 * Leave if no stats have been computed yet, as tracked by the end LSN.
 	 */
-	if (XLogRecPtrIsInvalid(stats->endptr))
+	if (!XLogRecPtrIsValid(stats->endptr))
 		return;
 
 	/*
@@ -656,7 +656,7 @@ XLogDumpDisplayStats(XLogDumpConfig *config, XLogStats *stats)
 	}
 	total_len = total_rec_len + total_fpi_len;
 
-	printf("WAL statistics between %X/%X and %X/%X:\n",
+	printf("WAL statistics between %X/%08X and %X/%08X:\n",
 		   LSN_FORMAT_ARGS(stats->startptr), LSN_FORMAT_ARGS(stats->endptr));
 
 	/*
@@ -801,6 +801,7 @@ main(int argc, char **argv)
 	XLogRecPtr	first_record;
 	char	   *waldir = NULL;
 	char	   *errormsg;
+	int			WalSegSz;
 
 	static struct option long_options[] = {
 		{"bkp-details", no_argument, NULL, 'b'},
@@ -904,7 +905,7 @@ main(int argc, char **argv)
 				config.filter_by_extended = true;
 				break;
 			case 'e':
-				if (sscanf(optarg, "%X/%X", &xlogid, &xrecoff) != 2)
+				if (sscanf(optarg, "%X/%08X", &xlogid, &xrecoff) != 2)
 				{
 					pg_log_error("invalid WAL location: \"%s\"",
 								 optarg);
@@ -1002,7 +1003,7 @@ main(int argc, char **argv)
 				config.filter_by_extended = true;
 				break;
 			case 's':
-				if (sscanf(optarg, "%X/%X", &xlogid, &xrecoff) != 2)
+				if (sscanf(optarg, "%X/%08X", &xlogid, &xrecoff) != 2)
 				{
 					pg_log_error("invalid WAL location: \"%s\"",
 								 optarg);
@@ -1127,7 +1128,7 @@ main(int argc, char **argv)
 				pg_fatal("could not open directory \"%s\": %m", waldir);
 		}
 
-		waldir = identify_target_directory(waldir, fname);
+		waldir = identify_target_directory(waldir, fname, &WalSegSz);
 		fd = open_file_in_directory(waldir, fname);
 		if (fd < 0)
 			pg_fatal("could not open file \"%s\"", fname);
@@ -1136,18 +1137,18 @@ main(int argc, char **argv)
 		/* parse position from file */
 		XLogFromFileName(fname, &private.timeline, &segno, WalSegSz);
 
-		if (XLogRecPtrIsInvalid(private.startptr))
+		if (!XLogRecPtrIsValid(private.startptr))
 			XLogSegNoOffsetToRecPtr(segno, 0, WalSegSz, private.startptr);
 		else if (!XLByteInSeg(private.startptr, segno, WalSegSz))
 		{
-			pg_log_error("start WAL location %X/%X is not inside file \"%s\"",
+			pg_log_error("start WAL location %X/%08X is not inside file \"%s\"",
 						 LSN_FORMAT_ARGS(private.startptr),
 						 fname);
 			goto bad_argument;
 		}
 
 		/* no second file specified, set end position */
-		if (!(optind + 1 < argc) && XLogRecPtrIsInvalid(private.endptr))
+		if (!(optind + 1 < argc) && !XLogRecPtrIsValid(private.endptr))
 			XLogSegNoOffsetToRecPtr(segno + 1, 0, WalSegSz, private.endptr);
 
 		/* parse ENDSEG if passed */
@@ -1170,7 +1171,7 @@ main(int argc, char **argv)
 				pg_fatal("ENDSEG %s is before STARTSEG %s",
 						 argv[optind + 1], argv[optind]);
 
-			if (XLogRecPtrIsInvalid(private.endptr))
+			if (!XLogRecPtrIsValid(private.endptr))
 				XLogSegNoOffsetToRecPtr(endsegno + 1, 0, WalSegSz,
 										private.endptr);
 
@@ -1182,17 +1183,17 @@ main(int argc, char **argv)
 		if (!XLByteInSeg(private.endptr, segno, WalSegSz) &&
 			private.endptr != (segno + 1) * WalSegSz)
 		{
-			pg_log_error("end WAL location %X/%X is not inside file \"%s\"",
+			pg_log_error("end WAL location %X/%08X is not inside file \"%s\"",
 						 LSN_FORMAT_ARGS(private.endptr),
 						 argv[argc - 1]);
 			goto bad_argument;
 		}
 	}
 	else
-		waldir = identify_target_directory(waldir, NULL);
+		waldir = identify_target_directory(waldir, NULL, &WalSegSz);
 
 	/* we don't know what to print */
-	if (XLogRecPtrIsInvalid(private.startptr))
+	if (!XLogRecPtrIsValid(private.startptr))
 	{
 		pg_log_error("no start WAL location given");
 		goto bad_argument;
@@ -1213,8 +1214,8 @@ main(int argc, char **argv)
 	/* first find a valid recptr to start from */
 	first_record = XLogFindNextRecord(xlogreader_state, private.startptr);
 
-	if (first_record == InvalidXLogRecPtr)
-		pg_fatal("could not find a valid record after %X/%X",
+	if (!XLogRecPtrIsValid(first_record))
+		pg_fatal("could not find a valid record after %X/%08X",
 				 LSN_FORMAT_ARGS(private.startptr));
 
 	/*
@@ -1224,8 +1225,8 @@ main(int argc, char **argv)
 	 */
 	if (first_record != private.startptr &&
 		XLogSegmentOffset(private.startptr, WalSegSz) != 0)
-		pg_log_info(ngettext("first record is after %X/%X, at %X/%X, skipping over %u byte",
-							 "first record is after %X/%X, at %X/%X, skipping over %u bytes",
+		pg_log_info(ngettext("first record is after %X/%08X, at %X/%08X, skipping over %u byte",
+							 "first record is after %X/%08X, at %X/%08X, skipping over %u bytes",
 							 (first_record - private.startptr)),
 					LSN_FORMAT_ARGS(private.startptr),
 					LSN_FORMAT_ARGS(first_record),
@@ -1309,7 +1310,7 @@ main(int argc, char **argv)
 		exit(0);
 
 	if (errormsg)
-		pg_fatal("error in WAL record at %X/%X: %s",
+		pg_fatal("error in WAL record at %X/%08X: %s",
 				 LSN_FORMAT_ARGS(xlogreader_state->ReadRecPtr),
 				 errormsg);
 

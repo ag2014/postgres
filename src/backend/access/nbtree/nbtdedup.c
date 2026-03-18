@@ -3,7 +3,7 @@
  * nbtdedup.c
  *	  Deduplicate or bottom-up delete items in Postgres btrees.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,6 +16,7 @@
 
 #include "access/nbtree.h"
 #include "access/nbtxlog.h"
+#include "access/tableam.h"
 #include "access/xloginsert.h"
 #include "miscadmin.h"
 #include "utils/rel.h"
@@ -68,6 +69,7 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
 	Size		pagesaving PG_USED_FOR_ASSERTS_ONLY = 0;
 	bool		singlevalstrat = false;
 	int			nkeyatts = IndexRelationGetNumberOfKeyAttributes(rel);
+	XLogRecPtr	recptr;
 
 	/* Passed-in newitemsz is MAXALIGNED but does not include line pointer */
 	newitemsz += sizeof(ItemIdData);
@@ -81,10 +83,10 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
 	 * That ought to leave us with a good split point when pages full of
 	 * duplicates can be split several times.
 	 */
-	state = (BTDedupState) palloc(sizeof(BTDedupStateData));
+	state = palloc_object(BTDedupStateData);
 	state->deduplicate = true;
 	state->nmaxitems = 0;
-	state->maxpostingsize = Min(BTMaxItemSize(page) / 2, INDEX_SIZE_MASK);
+	state->maxpostingsize = Min(BTMaxItemSize / 2, INDEX_SIZE_MASK);
 	/* Metadata about base tuple of current pending posting list */
 	state->base = NULL;
 	state->baseoff = InvalidOffsetNumber;
@@ -125,8 +127,7 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
 		Size		hitemsz = ItemIdGetLength(hitemid);
 		IndexTuple	hitem = (IndexTuple) PageGetItem(page, hitemid);
 
-		if (PageAddItem(newpage, (Item) hitem, hitemsz, P_HIKEY,
-						false, false) == InvalidOffsetNumber)
+		if (PageAddItem(newpage, hitem, hitemsz, P_HIKEY, false, false) == InvalidOffsetNumber)
 			elog(ERROR, "deduplication failed to add highkey");
 	}
 
@@ -245,27 +246,28 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
 	/* XLOG stuff */
 	if (RelationNeedsWAL(rel))
 	{
-		XLogRecPtr	recptr;
 		xl_btree_dedup xlrec_dedup;
 
 		xlrec_dedup.nintervals = state->nintervals;
 
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
-		XLogRegisterData((char *) &xlrec_dedup, SizeOfBtreeDedup);
+		XLogRegisterData(&xlrec_dedup, SizeOfBtreeDedup);
 
 		/*
 		 * The intervals array is not in the buffer, but pretend that it is.
 		 * When XLogInsert stores the whole buffer, the array need not be
 		 * stored too.
 		 */
-		XLogRegisterBufData(0, (char *) state->intervals,
+		XLogRegisterBufData(0, state->intervals,
 							state->nintervals * sizeof(BTDedupInterval));
 
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_DEDUP);
-
-		PageSetLSN(page, recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(page, recptr);
 
 	END_CRIT_SECTION();
 
@@ -321,7 +323,7 @@ _bt_bottomupdel_pass(Relation rel, Buffer buf, Relation heapRel,
 	newitemsz += sizeof(ItemIdData);
 
 	/* Initialize deduplication state */
-	state = (BTDedupState) palloc(sizeof(BTDedupStateData));
+	state = palloc_object(BTDedupStateData);
 	state->deduplicate = true;
 	state->nmaxitems = 0;
 	state->maxpostingsize = BLCKSZ; /* We're not really deduplicating */
@@ -355,8 +357,8 @@ _bt_bottomupdel_pass(Relation rel, Buffer buf, Relation heapRel,
 	delstate.bottomup = true;
 	delstate.bottomupfreespace = Max(BLCKSZ / 16, newitemsz);
 	delstate.ndeltids = 0;
-	delstate.deltids = palloc(MaxTIDsPerBTreePage * sizeof(TM_IndexDelete));
-	delstate.status = palloc(MaxTIDsPerBTreePage * sizeof(TM_IndexStatus));
+	delstate.deltids = palloc_array(TM_IndexDelete, MaxTIDsPerBTreePage);
+	delstate.status = palloc_array(TM_IndexStatus, MaxTIDsPerBTreePage);
 
 	minoff = P_FIRSTDATAKEY(opaque);
 	maxoff = PageGetMaxOffsetNumber(page);
@@ -568,9 +570,8 @@ _bt_dedup_finish_pending(Page newpage, BTDedupState state)
 		/* Use original, unchanged base tuple */
 		tuplesz = IndexTupleSize(state->base);
 		Assert(tuplesz == MAXALIGN(IndexTupleSize(state->base)));
-		Assert(tuplesz <= BTMaxItemSize(newpage));
-		if (PageAddItem(newpage, (Item) state->base, tuplesz, tupoff,
-						false, false) == InvalidOffsetNumber)
+		Assert(tuplesz <= BTMaxItemSize);
+		if (PageAddItem(newpage, state->base, tuplesz, tupoff, false, false) == InvalidOffsetNumber)
 			elog(ERROR, "deduplication failed to add tuple to page");
 
 		spacesaving = 0;
@@ -588,9 +589,8 @@ _bt_dedup_finish_pending(Page newpage, BTDedupState state)
 		state->intervals[state->nintervals].nitems = state->nitems;
 
 		Assert(tuplesz == MAXALIGN(IndexTupleSize(final)));
-		Assert(tuplesz <= BTMaxItemSize(newpage));
-		if (PageAddItem(newpage, (Item) final, tuplesz, tupoff, false,
-						false) == InvalidOffsetNumber)
+		Assert(tuplesz <= BTMaxItemSize);
+		if (PageAddItem(newpage, final, tuplesz, tupoff, false, false) == InvalidOffsetNumber)
 			elog(ERROR, "deduplication failed to add tuple to page");
 
 		pfree(final);
@@ -861,7 +861,7 @@ _bt_singleval_fillfactor(Page page, BTDedupState state, Size newitemsz)
  * returned posting list tuple (they must be included in htids array.)
  */
 IndexTuple
-_bt_form_posting(IndexTuple base, ItemPointer htids, int nhtids)
+_bt_form_posting(IndexTuple base, const ItemPointerData *htids, int nhtids)
 {
 	uint32		keysize,
 				newsize;

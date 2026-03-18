@@ -3,7 +3,7 @@
  * hashinsert.c
  *	  Item insertion in hash tables for Postgres.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -221,12 +221,12 @@ restart_insert:
 		xlrec.offnum = itup_off;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, SizeOfHashInsert);
+		XLogRegisterData(&xlrec, SizeOfHashInsert);
 
 		XLogRegisterBuffer(1, metabuf, REGBUF_STANDARD);
 
 		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
-		XLogRegisterBufData(0, (char *) itup, IndexTupleSize(itup));
+		XLogRegisterBufData(0, itup, IndexTupleSize(itup));
 
 		recptr = XLogInsert(RM_HASH_ID, XLOG_HASH_INSERT);
 
@@ -310,10 +310,8 @@ _hash_pgaddtup(Relation rel, Buffer buf, Size itemsize, IndexTuple itup,
 		itup_off = _hash_binsearch(page, hashkey);
 	}
 
-	if (PageAddItem(page, (Item) itup, itemsize, itup_off, false, false)
-		== InvalidOffsetNumber)
-		elog(ERROR, "failed to add index item to \"%s\"",
-			 RelationGetRelationName(rel));
+	if (PageAddItem(page, itup, itemsize, itup_off, false, false) == InvalidOffsetNumber)
+		elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(rel));
 
 	return itup_off;
 }
@@ -352,10 +350,8 @@ _hash_pgaddmultitup(Relation rel, Buffer buf, IndexTuple *itups,
 
 		itup_offsets[i] = itup_off;
 
-		if (PageAddItem(page, (Item) itups[i], itemsize, itup_off, false, false)
-			== InvalidOffsetNumber)
-			elog(ERROR, "failed to add index item to \"%s\"",
-				 RelationGetRelationName(rel));
+		if (PageAddItem(page, itups[i], itemsize, itup_off, false, false) == InvalidOffsetNumber)
+			elog(ERROR, "failed to add index item to \"%s\"", RelationGetRelationName(rel));
 	}
 }
 
@@ -436,14 +432,14 @@ _hash_vacuum_one_page(Relation rel, Relation hrel, Buffer metabuf, Buffer buf)
 
 			XLogBeginInsert();
 			XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
-			XLogRegisterData((char *) &xlrec, SizeOfHashVacuumOnePage);
+			XLogRegisterData(&xlrec, SizeOfHashVacuumOnePage);
 
 			/*
 			 * We need the target-offsets array whether or not we store the
 			 * whole buffer, to allow us to find the snapshotConflictHorizon
 			 * on a standby server.
 			 */
-			XLogRegisterData((char *) deletable,
+			XLogRegisterData(deletable,
 							 ndeletable * sizeof(OffsetNumber));
 
 			XLogRegisterBuffer(1, metabuf, REGBUF_STANDARD);

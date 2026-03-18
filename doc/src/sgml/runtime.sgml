@@ -490,6 +490,7 @@ ExecStart=/usr/local/pgsql/bin/postgres -D /usr/local/pgsql/data
 ExecReload=/bin/kill -HUP $MAINPID
 KillMode=mixed
 KillSignal=SIGINT
+Restart=on-failure
 TimeoutSec=infinity
 
 [Install]
@@ -839,7 +840,7 @@ psql: error: connection to server on socket "/tmp/.s.PGSQL.5432" failed: No such
     When using System V semaphores,
     <productname>PostgreSQL</productname> uses one semaphore per allowed connection
     (<xref linkend="guc-max-connections"/>), allowed autovacuum worker process
-    (<xref linkend="guc-autovacuum-max-workers"/>), allowed WAL sender process
+    (<xref linkend="guc-autovacuum-worker-slots"/>), allowed WAL sender process
     (<xref linkend="guc-max-wal-senders"/>), allowed background
     process (<xref linkend="guc-max-worker-processes"/>), etc., in sets of 16.
     The runtime-computed parameter <xref linkend="guc-num-os-semaphores"/>
@@ -892,7 +893,7 @@ $ <userinput>postgres -D $PGDATA -C num_os_semaphores</userinput>
     When using POSIX semaphores, the number of semaphores needed is the
     same as for System V, that is one semaphore per allowed connection
     (<xref linkend="guc-max-connections"/>), allowed autovacuum worker process
-    (<xref linkend="guc-autovacuum-max-workers"/>), allowed WAL sender process
+    (<xref linkend="guc-autovacuum-worker-slots"/>), allowed WAL sender process
     (<xref linkend="guc-max-wal-senders"/>), allowed background
     process (<xref linkend="guc-max-worker-processes"/>), etc.
     On the platforms where this option is preferred, there is no specific
@@ -901,6 +902,29 @@ $ <userinput>postgres -D $PGDATA -C num_os_semaphores</userinput>
 
 
     <variablelist>
+     <varlistentry>
+      <term><systemitem class="osname">AIX</systemitem>
+      <indexterm><primary>AIX</primary><secondary>IPC configuration</secondary></indexterm>
+      </term>
+      <listitem>
+       <para>
+        It should not be necessary to do
+        any special configuration for such parameters as
+        <varname>SHMMAX</varname>, as it appears this is configured to
+        allow all memory to be used as shared memory.  That is the
+        sort of configuration commonly used for other databases such
+        as <application>DB/2</application>.</para>
+
+       <para> It might, however, be necessary to modify the global
+       <command>ulimit</command> information in
+       <filename>/etc/security/limits</filename>, as the default hard
+       limits for file sizes (<varname>fsize</varname>) and numbers of
+       files (<varname>nofiles</varname>) might be too low.
+       </para>
+      </listitem>
+     </varlistentry>
+
+
      <varlistentry>
       <term><systemitem class="osname">FreeBSD</systemitem>
       <indexterm><primary>FreeBSD</primary><secondary>IPC configuration</secondary></indexterm>
@@ -953,10 +977,10 @@ $ <userinput>postgres -D $PGDATA -C num_os_semaphores</userinput>
        <para>
         The default shared memory settings are usually good enough, unless
         you have set <literal>shared_memory_type</literal> to <literal>sysv</literal>.
-        You will usually want to increase <literal>kern.ipc.semmni</literal>
+        However, you will need to increase <literal>kern.ipc.semmni</literal>
         and <literal>kern.ipc.semmns</literal>,
         as <systemitem class="osname">NetBSD</systemitem>'s default settings
-        for these are uncomfortably small.
+        for these are unworkably small.
        </para>
 
        <para>
@@ -987,11 +1011,11 @@ $ <userinput>postgres -D $PGDATA -C num_os_semaphores</userinput>
        <para>
         The default shared memory settings are usually good enough, unless
         you have set <literal>shared_memory_type</literal> to <literal>sysv</literal>.
-        You will usually want to
+        However, you will need to
         increase <literal>kern.seminfo.semmni</literal>
         and <literal>kern.seminfo.semmns</literal>,
         as <systemitem class="osname">OpenBSD</systemitem>'s default settings
-        for these are uncomfortably small.
+        for these are unworkably small.
        </para>
 
        <para>
@@ -1104,13 +1128,8 @@ projadd -c "PostgreSQL DB User" -K "project.max-shm-memory=(privileged,8GB,deny)
        </para>
 
        <para>
-        Other recommended kernel setting changes for database servers which will
-        have a large number of connections are:
-<programlisting>
-project.max-shm-ids=(priv,32768,deny)
-project.max-sem-ids=(priv,4096,deny)
-project.max-msg-ids=(priv,4096,deny)
-</programlisting>
+        To run a very large server, or multiple servers concurrently, you
+        might also need to raise <literal>project.max-shm-ids</literal>.
        </para>
 
        <para>
@@ -1994,7 +2013,8 @@ pg_dumpall -p 5432 | psql -d postgres -p 5433
    <literal>sslmode=verify-ca</literal> or
    <literal>verify-full</literal> and have the appropriate root certificate
    file installed (<xref linkend="libq-ssl-certificates"/>). Alternatively the
-   system CA pool can be used using <literal>sslrootcert=system</literal>; in
+   <link linkend="libpq-connect-sslrootcert">system CA pool</link>, as defined
+   by the SSL implementation, can be used using <literal>sslrootcert=system</literal>; in
    this case, <literal>sslmode=verify-full</literal> is forced for safety, since
    it is generally trivial to obtain certificates which are signed by a public
    CA.

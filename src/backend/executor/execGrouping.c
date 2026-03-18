@@ -3,7 +3,7 @@
  * execGrouping.c
  *	  executor utility routines for grouping, hashing, and aggregation
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,15 +14,18 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
+#include "access/htup_details.h"
 #include "access/parallel.h"
 #include "common/hashfn.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "utils/lsyscache.h"
 
-static int	TupleHashTableMatch(struct tuplehash_hash *tb, const MinimalTuple tuple1, const MinimalTuple tuple2);
+static int	TupleHashTableMatch(struct tuplehash_hash *tb, MinimalTuple tuple1, MinimalTuple tuple2);
 static inline uint32 TupleHashTableHash_internal(struct tuplehash_hash *tb,
-												 const MinimalTuple tuple);
+												 MinimalTuple tuple);
 static inline TupleHashEntry LookupTupleHashEntry_internal(TupleHashTable hashtable,
 														   TupleTableSlot *slot,
 														   bool *isnew, uint32 hash);
@@ -135,62 +138,103 @@ execTuplesHashPrepare(int numCols,
 /*
  * Construct an empty TupleHashTable
  *
- *	numCols, keyColIdx: identify the tuple fields to use as lookup key
- *	eqfunctions: equality comparison functions to use
- *	hashfunctions: datatype-specific hashing functions to use
- *	nbuckets: initial estimate of hashtable size
- *	additionalsize: size of data stored in ->additional
- *	metacxt: memory context for long-lived allocation, but not per-entry data
- *	tablecxt: memory context in which to store table entries
+ *	parent: PlanState node that will own this hash table
+ *	inputDesc: tuple descriptor for input tuples
+ *	inputOps: slot ops for input tuples, or NULL if unknown or not fixed
+ *	numCols: number of columns to be compared (length of next 4 arrays)
+ *	keyColIdx: indexes of tuple columns to compare
+ *	eqfuncoids: OIDs of equality comparison functions to use
+ *	hashfunctions: FmgrInfos of datatype-specific hashing functions to use
+ *	collations: collations to use in comparisons
+ *	nelements: initial estimate of hashtable size
+ *	additionalsize: size of data that may be stored along with the hash entry
+ *	metacxt: memory context for long-lived data and the simplehash table
+ *	tuplescxt: memory context in which to store the hashed tuples themselves
  *	tempcxt: short-lived context for evaluation hash and comparison functions
+ *	use_variable_hash_iv: if true, adjust hash IV per-parallel-worker
  *
- * The function arrays may be made with execTuplesHashPrepare().  Note they
+ * The hashfunctions array may be made with execTuplesHashPrepare().  Note they
  * are not cross-type functions, but expect to see the table datatype(s)
  * on both sides.
  *
- * Note that keyColIdx, eqfunctions, and hashfunctions must be allocated in
- * storage that will live as long as the hashtable does.
+ * Note that the keyColIdx, hashfunctions, and collations arrays must be
+ * allocated in storage that will live as long as the hashtable does.
+ *
+ * The metacxt and tuplescxt are separate because it's usually desirable for
+ * tuplescxt to be a BumpContext to avoid memory wastage, while metacxt must
+ * support pfree in case the simplehash table needs to be enlarged.  (We could
+ * simplify the API of TupleHashTables by managing the tuplescxt internally.
+ * But that would be disadvantageous to nodeAgg.c and nodeSubplan.c, which use
+ * a single tuplescxt for multiple TupleHashTables that are reset together.)
+ *
+ * LookupTupleHashEntry, FindTupleHashEntry, and related functions may leak
+ * memory in the tempcxt.  It is caller's responsibility to reset that context
+ * reasonably often, typically once per tuple.  (We do it that way, rather
+ * than managing an extra context within the hashtable, because in many cases
+ * the caller can specify a tempcxt that it needs to reset per-tuple anyway.)
+ *
+ * We don't currently provide DestroyTupleHashTable functionality; the hash
+ * table will be cleaned up at destruction of the metacxt.  (Some callers
+ * bother to delete the tuplescxt explicitly, though it'd be sufficient to
+ * ensure it's a child of the metacxt.)  There's not much point in working
+ * harder than this so long as the expression-evaluation infrastructure
+ * behaves similarly.
  */
 TupleHashTable
-BuildTupleHashTableExt(PlanState *parent,
-					   TupleDesc inputDesc,
-					   int numCols, AttrNumber *keyColIdx,
-					   const Oid *eqfuncoids,
-					   FmgrInfo *hashfunctions,
-					   Oid *collations,
-					   long nbuckets, Size additionalsize,
-					   MemoryContext metacxt,
-					   MemoryContext tablecxt,
-					   MemoryContext tempcxt,
-					   bool use_variable_hash_iv)
+BuildTupleHashTable(PlanState *parent,
+					TupleDesc inputDesc,
+					const TupleTableSlotOps *inputOps,
+					int numCols,
+					AttrNumber *keyColIdx,
+					const Oid *eqfuncoids,
+					FmgrInfo *hashfunctions,
+					Oid *collations,
+					double nelements,
+					Size additionalsize,
+					MemoryContext metacxt,
+					MemoryContext tuplescxt,
+					MemoryContext tempcxt,
+					bool use_variable_hash_iv)
 {
 	TupleHashTable hashtable;
-	Size		entrysize = sizeof(TupleHashEntryData) + additionalsize;
-	Size		hash_mem_limit;
+	uint32		nbuckets;
 	MemoryContext oldcontext;
-	bool		allow_jit;
+	uint32		hash_iv = 0;
 
-	Assert(nbuckets > 0);
+	/*
+	 * tuplehash_create requires a uint32 element count, so we had better
+	 * clamp the given nelements to fit in that.  As long as we have to do
+	 * that, we might as well protect against completely insane input like
+	 * zero or NaN.  But it is not our job here to enforce issues like staying
+	 * within hash_mem: the caller should have done that, and we don't have
+	 * enough info to second-guess.
+	 */
+	if (isnan(nelements) || nelements <= 0)
+		nbuckets = 1;
+	else if (nelements >= PG_UINT32_MAX)
+		nbuckets = PG_UINT32_MAX;
+	else
+		nbuckets = (uint32) nelements;
 
-	/* Limit initial table size request to not more than hash_mem */
-	hash_mem_limit = get_hash_memory_limit() / entrysize;
-	if (nbuckets > hash_mem_limit)
-		nbuckets = hash_mem_limit;
+	/* tuplescxt must be separate, else ResetTupleHashTable breaks things */
+	Assert(metacxt != tuplescxt);
+
+	/* ensure additionalsize is maxalign'ed */
+	additionalsize = MAXALIGN(additionalsize);
 
 	oldcontext = MemoryContextSwitchTo(metacxt);
 
-	hashtable = (TupleHashTable) palloc(sizeof(TupleHashTableData));
+	hashtable = palloc_object(TupleHashTableData);
 
 	hashtable->numCols = numCols;
 	hashtable->keyColIdx = keyColIdx;
-	hashtable->tab_hash_funcs = hashfunctions;
 	hashtable->tab_collations = collations;
-	hashtable->tablecxt = tablecxt;
+	hashtable->tuplescxt = tuplescxt;
 	hashtable->tempcxt = tempcxt;
-	hashtable->entrysize = entrysize;
+	hashtable->additionalsize = additionalsize;
 	hashtable->tableslot = NULL;	/* will be made on first lookup */
 	hashtable->inputslot = NULL;
-	hashtable->in_hash_funcs = NULL;
+	hashtable->in_hash_expr = NULL;
 	hashtable->cur_eq_func = NULL;
 
 	/*
@@ -202,9 +246,7 @@ BuildTupleHashTableExt(PlanState *parent,
 	 * underestimated.
 	 */
 	if (use_variable_hash_iv)
-		hashtable->hash_iv = murmurhash32(ParallelWorkerNumber);
-	else
-		hashtable->hash_iv = 0;
+		hash_iv = murmurhash32(ParallelWorkerNumber);
 
 	hashtable->hashtab = tuplehash_create(metacxt, nbuckets, hashtable);
 
@@ -215,23 +257,23 @@ BuildTupleHashTableExt(PlanState *parent,
 	hashtable->tableslot = MakeSingleTupleTableSlot(CreateTupleDescCopy(inputDesc),
 													&TTSOpsMinimalTuple);
 
-	/*
-	 * If the old reset interface is used (i.e. BuildTupleHashTable, rather
-	 * than BuildTupleHashTableExt), allowing JIT would lead to the generated
-	 * functions to a) live longer than the query b) be re-generated each time
-	 * the table is being reset. Therefore prevent JIT from being used in that
-	 * case, by not providing a parent node (which prevents accessing the
-	 * JitContext in the EState).
-	 */
-	allow_jit = metacxt != tablecxt;
+	/* build hash ExprState for all columns */
+	hashtable->tab_hash_expr = ExecBuildHash32FromAttrs(inputDesc,
+														inputOps,
+														hashfunctions,
+														collations,
+														numCols,
+														keyColIdx,
+														parent,
+														hash_iv);
 
 	/* build comparator for all columns */
-	/* XXX: should we support non-minimal tuples for the inputslot? */
 	hashtable->tab_eq_func = ExecBuildGroupingEqual(inputDesc, inputDesc,
-													&TTSOpsMinimalTuple, &TTSOpsMinimalTuple,
+													inputOps,
+													&TTSOpsMinimalTuple,
 													numCols,
 													keyColIdx, eqfuncoids, collations,
-													allow_jit ? parent : NULL);
+													parent);
 
 	/*
 	 * While not pretty, it's ok to not shut down this context, but instead
@@ -247,45 +289,78 @@ BuildTupleHashTableExt(PlanState *parent,
 }
 
 /*
- * BuildTupleHashTable is a backwards-compatibility wrapper for
- * BuildTupleHashTableExt(), that allocates the hashtable's metadata in
- * tablecxt. Note that hashtables created this way cannot be reset leak-free
- * with ResetTupleHashTable().
- */
-TupleHashTable
-BuildTupleHashTable(PlanState *parent,
-					TupleDesc inputDesc,
-					int numCols, AttrNumber *keyColIdx,
-					const Oid *eqfuncoids,
-					FmgrInfo *hashfunctions,
-					Oid *collations,
-					long nbuckets, Size additionalsize,
-					MemoryContext tablecxt,
-					MemoryContext tempcxt,
-					bool use_variable_hash_iv)
-{
-	return BuildTupleHashTableExt(parent,
-								  inputDesc,
-								  numCols, keyColIdx,
-								  eqfuncoids,
-								  hashfunctions,
-								  collations,
-								  nbuckets, additionalsize,
-								  tablecxt,
-								  tablecxt,
-								  tempcxt,
-								  use_variable_hash_iv);
-}
-
-/*
  * Reset contents of the hashtable to be empty, preserving all the non-content
- * state. Note that the tablecxt passed to BuildTupleHashTableExt() should
- * also be reset, otherwise there will be leaks.
+ * state.
+ *
+ * Note: in usages where several TupleHashTables share a tuplescxt, all must
+ * be reset together, as the first one's reset call will destroy all their
+ * data.  The additional reset calls for the rest will redundantly reset the
+ * tuplescxt.  But because of mcxt.c's isReset flag, that's cheap enough that
+ * we need not avoid it.
  */
 void
 ResetTupleHashTable(TupleHashTable hashtable)
 {
 	tuplehash_reset(hashtable->hashtab);
+	MemoryContextReset(hashtable->tuplescxt);
+}
+
+/*
+ * Estimate the amount of space needed for a TupleHashTable with nentries
+ * entries, if the tuples have average data width tupleWidth and the caller
+ * requires additionalsize extra space per entry.
+ *
+ * Return SIZE_MAX if it'd overflow size_t.
+ *
+ * nentries is "double" because this is meant for use by the planner,
+ * which typically works with double rowcount estimates.  So we'd need to
+ * clamp to integer somewhere and that might as well be here.  We do expect
+ * the value not to be NaN or negative, else the result will be garbage.
+ */
+Size
+EstimateTupleHashTableSpace(double nentries,
+							Size tupleWidth,
+							Size additionalsize)
+{
+	Size		sh_space;
+	double		tuples_space;
+
+	/* First estimate the space needed for the simplehash table */
+	sh_space = tuplehash_estimate_space(nentries);
+
+	/* Give up if that's already too big */
+	if (sh_space >= SIZE_MAX)
+		return sh_space;
+
+	/*
+	 * Compute space needed for hashed tuples with additional data.  nentries
+	 * must be somewhat sane, so it should be safe to compute this product.
+	 *
+	 * We assume that the hashed tuples will be kept in a BumpContext so that
+	 * there is not additional per-tuple overhead.
+	 *
+	 * (Note that this is only accurate if MEMORY_CONTEXT_CHECKING is off,
+	 * else bump.c will add a MemoryChunk header to each tuple.  However, it
+	 * seems undesirable for debug builds to make different planning choices
+	 * than production builds, so we assume the production behavior always.)
+	 */
+	tuples_space = nentries * (MAXALIGN(SizeofMinimalTupleHeader) +
+							   MAXALIGN(tupleWidth) +
+							   MAXALIGN(additionalsize));
+
+	/*
+	 * Check for size_t overflow.  This coding is trickier than it may appear,
+	 * because on 64-bit machines SIZE_MAX cannot be represented exactly as a
+	 * double.  We must cast it explicitly to suppress compiler warnings about
+	 * an inexact conversion, and we must trust that any double value that
+	 * compares strictly less than "(double) SIZE_MAX" will cast to a
+	 * representable size_t value.
+	 */
+	if (sh_space + tuples_space >= (double) SIZE_MAX)
+		return SIZE_MAX;
+
+	/* We don't bother estimating size of the miscellaneous overhead data */
+	return (Size) (sh_space + tuples_space);
 }
 
 /*
@@ -300,7 +375,7 @@ ResetTupleHashTable(TupleHashTable hashtable)
  *
  * If isnew isn't NULL, then a new entry is created if no existing entry
  * matches.  On return, *isnew is true if the entry is newly created,
- * false if it existed already.  ->additional_data in the new entry has
+ * false if it existed already.  The additional data in the new entry has
  * been zeroed.
  */
 TupleHashEntry
@@ -316,7 +391,7 @@ LookupTupleHashEntry(TupleHashTable hashtable, TupleTableSlot *slot,
 
 	/* set up data needed by hash and match functions */
 	hashtable->inputslot = slot;
-	hashtable->in_hash_funcs = hashtable->tab_hash_funcs;
+	hashtable->in_hash_expr = hashtable->tab_hash_expr;
 	hashtable->cur_eq_func = hashtable->tab_eq_func;
 
 	local_hash = TupleHashTableHash_internal(hashtable->hashtab, NULL);
@@ -342,7 +417,7 @@ TupleHashTableHash(TupleHashTable hashtable, TupleTableSlot *slot)
 	uint32		hash;
 
 	hashtable->inputslot = slot;
-	hashtable->in_hash_funcs = hashtable->tab_hash_funcs;
+	hashtable->in_hash_expr = hashtable->tab_hash_expr;
 
 	/* Need to run the hash functions in short-lived context */
 	oldContext = MemoryContextSwitchTo(hashtable->tempcxt);
@@ -370,7 +445,7 @@ LookupTupleHashEntryHash(TupleHashTable hashtable, TupleTableSlot *slot,
 
 	/* set up data needed by hash and match functions */
 	hashtable->inputslot = slot;
-	hashtable->in_hash_funcs = hashtable->tab_hash_funcs;
+	hashtable->in_hash_expr = hashtable->tab_hash_expr;
 	hashtable->cur_eq_func = hashtable->tab_eq_func;
 
 	entry = LookupTupleHashEntry_internal(hashtable, slot, isnew, hash);
@@ -386,14 +461,14 @@ LookupTupleHashEntryHash(TupleHashTable hashtable, TupleTableSlot *slot,
  * created if there's not a match.  This is similar to the non-creating
  * case of LookupTupleHashEntry, except that it supports cross-type
  * comparisons, in which the given tuple is not of the same type as the
- * table entries.  The caller must provide the hash functions to use for
- * the input tuple, as well as the equality functions, since these may be
+ * table entries.  The caller must provide the hash ExprState to use for
+ * the input tuple, as well as the equality ExprState, since these may be
  * different from the table's internal functions.
  */
 TupleHashEntry
 FindTupleHashEntry(TupleHashTable hashtable, TupleTableSlot *slot,
 				   ExprState *eqcomp,
-				   FmgrInfo *hashfunctions)
+				   ExprState *hashexpr)
 {
 	TupleHashEntry entry;
 	MemoryContext oldContext;
@@ -404,7 +479,7 @@ FindTupleHashEntry(TupleHashTable hashtable, TupleTableSlot *slot,
 
 	/* Set up data needed by hash and match functions */
 	hashtable->inputslot = slot;
-	hashtable->in_hash_funcs = hashfunctions;
+	hashtable->in_hash_expr = hashexpr;
 	hashtable->cur_eq_func = eqcomp;
 
 	/* Search the hash table */
@@ -421,25 +496,24 @@ FindTupleHashEntry(TupleHashTable hashtable, TupleTableSlot *slot,
  * copied into the table.
  *
  * Also, the caller must select an appropriate memory context for running
- * the hash functions. (dynahash.c doesn't change CurrentMemoryContext.)
+ * the hash functions.
  */
 static uint32
 TupleHashTableHash_internal(struct tuplehash_hash *tb,
-							const MinimalTuple tuple)
+							MinimalTuple tuple)
 {
 	TupleHashTable hashtable = (TupleHashTable) tb->private_data;
-	int			numCols = hashtable->numCols;
-	AttrNumber *keyColIdx = hashtable->keyColIdx;
-	uint32		hashkey = hashtable->hash_iv;
+	uint32		hashkey;
 	TupleTableSlot *slot;
-	FmgrInfo   *hashfunctions;
-	int			i;
+	bool		isnull;
 
 	if (tuple == NULL)
 	{
 		/* Process the current input tuple for the table */
-		slot = hashtable->inputslot;
-		hashfunctions = hashtable->in_hash_funcs;
+		hashtable->exprcontext->ecxt_innertuple = hashtable->inputslot;
+		hashkey = DatumGetUInt32(ExecEvalExpr(hashtable->in_hash_expr,
+											  hashtable->exprcontext,
+											  &isnull));
 	}
 	else
 	{
@@ -449,38 +523,17 @@ TupleHashTableHash_internal(struct tuplehash_hash *tb,
 		 * (this case never actually occurs due to the way simplehash.h is
 		 * used, as the hash-value is stored in the entries)
 		 */
-		slot = hashtable->tableslot;
+		slot = hashtable->exprcontext->ecxt_innertuple = hashtable->tableslot;
 		ExecStoreMinimalTuple(tuple, slot, false);
-		hashfunctions = hashtable->tab_hash_funcs;
-	}
-
-	for (i = 0; i < numCols; i++)
-	{
-		AttrNumber	att = keyColIdx[i];
-		Datum		attr;
-		bool		isNull;
-
-		/* combine successive hashkeys by rotating */
-		hashkey = pg_rotate_left32(hashkey, 1);
-
-		attr = slot_getattr(slot, att, &isNull);
-
-		if (!isNull)			/* treat nulls as having hash key 0 */
-		{
-			uint32		hkey;
-
-			hkey = DatumGetUInt32(FunctionCall1Coll(&hashfunctions[i],
-													hashtable->tab_collations[i],
-													attr));
-			hashkey ^= hkey;
-		}
+		hashkey = DatumGetUInt32(ExecEvalExpr(hashtable->tab_hash_expr,
+											  hashtable->exprcontext,
+											  &isnull));
 	}
 
 	/*
-	 * The way hashes are combined above, among each other and with the IV,
-	 * doesn't lead to good bit perturbation. As the IV's goal is to lead to
-	 * achieve that, perform a round of hashing of the combined hash -
-	 * resulting in near perfect perturbation.
+	 * The hashing done above, even with an initial value, doesn't tend to
+	 * result in good hash perturbation.  Running the value produced above
+	 * through murmurhash32 leads to near perfect hash perturbation.
 	 */
 	return murmurhash32(hashkey);
 }
@@ -516,11 +569,21 @@ LookupTupleHashEntry_internal(TupleHashTable hashtable, TupleTableSlot *slot,
 		{
 			/* created new entry */
 			*isnew = true;
-			/* zero caller data */
-			entry->additional = NULL;
-			MemoryContextSwitchTo(hashtable->tablecxt);
-			/* Copy the first tuple into the table context */
-			entry->firstTuple = ExecCopySlotMinimalTuple(slot);
+
+			MemoryContextSwitchTo(hashtable->tuplescxt);
+
+			/*
+			 * Copy the first tuple into the tuples context, and request
+			 * additionalsize extra bytes before the allocation.
+			 *
+			 * The caller can get a pointer to the additional data with
+			 * TupleHashEntryGetAdditional(), and store arbitrary data there.
+			 * Placing both the tuple and additional data in the same
+			 * allocation avoids the need to store an extra pointer in
+			 * TupleHashEntryData or allocate an additional chunk.
+			 */
+			entry->firstTuple = ExecCopySlotMinimalTupleExtra(slot,
+															  hashtable->additionalsize);
 		}
 	}
 	else
@@ -535,7 +598,7 @@ LookupTupleHashEntry_internal(TupleHashTable hashtable, TupleTableSlot *slot,
  * See whether two tuples (presumably of the same hash value) match
  */
 static int
-TupleHashTableMatch(struct tuplehash_hash *tb, const MinimalTuple tuple1, const MinimalTuple tuple2)
+TupleHashTableMatch(struct tuplehash_hash *tb, MinimalTuple tuple1, MinimalTuple tuple2)
 {
 	TupleTableSlot *slot1;
 	TupleTableSlot *slot2;

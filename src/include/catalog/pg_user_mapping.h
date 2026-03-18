@@ -3,7 +3,7 @@
  * pg_user_mapping.h
  *	  definition of the "user mapping" system catalog (pg_user_mapping)
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_user_mapping.h
@@ -18,13 +18,15 @@
 #define PG_USER_MAPPING_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_user_mapping_d.h"
+#include "catalog/pg_user_mapping_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_user_mapping definition.  cpp turns this into
  *		typedef struct FormData_pg_user_mapping
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_user_mapping,1418,UserMappingRelationId)
 {
 	Oid			oid;			/* oid */
@@ -39,6 +41,8 @@ CATALOG(pg_user_mapping,1418,UserMappingRelationId)
 	text		umoptions[1];	/* user mapping options */
 #endif
 } FormData_pg_user_mapping;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_user_mapping corresponds to a pointer to a tuple with

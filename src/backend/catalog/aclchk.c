@@ -3,7 +3,7 @@
  * aclchk.c
  *	  Routines to check access control permissions.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -64,7 +64,6 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
-#include "commands/dbcommands.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
@@ -290,6 +289,9 @@ restrict_and_check_grant(bool is_grant, AclMode avail_goptions, bool all_privs,
 			break;
 		case OBJECT_PARAMETER_ACL:
 			whole_mask = ACL_ALL_RIGHTS_PARAMETER_ACL;
+			break;
+		case OBJECT_PROPGRAPH:
+			whole_mask = ACL_ALL_RIGHTS_PROPGRAPH;
 			break;
 		default:
 			elog(ERROR, "unrecognized object type: %d", objtype);
@@ -535,6 +537,10 @@ ExecuteGrantStmt(GrantStmt *stmt)
 			all_privileges = ACL_ALL_RIGHTS_PARAMETER_ACL;
 			errormsg = gettext_noop("invalid privilege type %s for parameter");
 			break;
+		case OBJECT_PROPGRAPH:
+			all_privileges = ACL_ALL_RIGHTS_PROPGRAPH;
+			errormsg = gettext_noop("invalid privilege type %s for property graph");
+			break;
 		default:
 			elog(ERROR, "unrecognized GrantStmt.objtype: %d",
 				 (int) stmt->objtype);
@@ -581,7 +587,7 @@ ExecuteGrantStmt(GrantStmt *stmt)
 				elog(ERROR, "AccessPriv node must specify privilege or columns");
 			priv = string_to_privilege(privnode->priv_name);
 
-			if (priv & ~((AclMode) all_privileges))
+			if (priv & ~all_privileges)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_GRANT_OPERATION),
 						 errmsg(errormsg, privilege_to_string(priv))));
@@ -605,6 +611,7 @@ ExecGrantStmt_oids(InternalGrant *istmt)
 	{
 		case OBJECT_TABLE:
 		case OBJECT_SEQUENCE:
+		case OBJECT_PROPGRAPH:
 			ExecGrant_Relation(istmt);
 			break;
 		case OBJECT_DATABASE:
@@ -659,6 +666,20 @@ ExecGrantStmt_oids(InternalGrant *istmt)
  * objectNamesToOids
  *
  * Turn a list of object names of a given type into an Oid list.
+ *
+ * XXX This function intentionally takes only an AccessShareLock.  In the face
+ * of concurrent DDL, we might easily latch onto an old version of an object,
+ * causing the GRANT or REVOKE statement to fail.  But it does prevent the
+ * object from disappearing altogether.  To do better, we would need to use a
+ * self-exclusive lock, perhaps ShareUpdateExclusiveLock, here and before
+ * *every* CatalogTupleUpdate() of a row that GRANT/REVOKE can affect.
+ * Besides that additional work, this could have operational costs.  For
+ * example, it would make GRANT ALL TABLES IN SCHEMA terminate every
+ * autovacuum running in the schema and consume a shared lock table entry per
+ * table in the schema.  The user-visible benefit of that additional work is
+ * just changing "ERROR: tuple concurrently updated" to blocking.  That's not
+ * nothing, but it might not outweigh autovacuum termination and lock table
+ * consumption spikes.
  */
 static List *
 objectNamesToOids(ObjectType objtype, List *objnames, bool is_grant)
@@ -687,6 +708,7 @@ objectNamesToOids(ObjectType objtype, List *objnames, bool is_grant)
 
 		case OBJECT_TABLE:
 		case OBJECT_SEQUENCE:
+		case OBJECT_PROPGRAPH:
 
 			/*
 			 * Here, we don't use get_object_address().  It requires that the
@@ -802,6 +824,10 @@ objectsInSchemaToOids(ObjectType objtype, List *nspnames)
 				break;
 			case OBJECT_SEQUENCE:
 				objs = getRelationsInNamespace(namespaceId, RELKIND_SEQUENCE);
+				objects = list_concat(objects, objs);
+				break;
+			case OBJECT_PROPGRAPH:
+				objs = getRelationsInNamespace(namespaceId, RELKIND_PROPGRAPH);
 				objects = list_concat(objects, objs);
 				break;
 			case OBJECT_FUNCTION:
@@ -1005,6 +1031,14 @@ ExecAlterDefaultPrivilegesStmt(ParseState *pstate, AlterDefaultPrivilegesStmt *s
 			all_privileges = ACL_ALL_RIGHTS_SCHEMA;
 			errormsg = gettext_noop("invalid privilege type %s for schema");
 			break;
+		case OBJECT_LARGEOBJECT:
+			all_privileges = ACL_ALL_RIGHTS_LARGEOBJECT;
+			errormsg = gettext_noop("invalid privilege type %s for large object");
+			break;
+		case OBJECT_PROPGRAPH:
+			all_privileges = ACL_ALL_RIGHTS_PROPGRAPH;
+			errormsg = gettext_noop("invalid privilege type %s for property graph");
+			break;
 		default:
 			elog(ERROR, "unrecognized GrantStmt.objtype: %d",
 				 (int) action->objtype);
@@ -1042,7 +1076,7 @@ ExecAlterDefaultPrivilegesStmt(ParseState *pstate, AlterDefaultPrivilegesStmt *s
 				elog(ERROR, "AccessPriv node must specify privilege");
 			priv = string_to_privilege(privnode->priv_name);
 
-			if (priv & ~((AclMode) all_privileges))
+			if (priv & ~all_privileges)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_GRANT_OPERATION),
 						 errmsg(errormsg, privilege_to_string(priv))));
@@ -1190,10 +1224,22 @@ SetDefaultACL(InternalDefaultACL *iacls)
 			if (OidIsValid(iacls->nspid))
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_GRANT_OPERATION),
-						 errmsg("cannot use IN SCHEMA clause when using GRANT/REVOKE ON SCHEMAS")));
+						 errmsg("cannot use IN SCHEMA clause when using %s",
+								"GRANT/REVOKE ON SCHEMAS")));
 			objtype = DEFACLOBJ_NAMESPACE;
 			if (iacls->all_privs && this_privileges == ACL_NO_RIGHTS)
 				this_privileges = ACL_ALL_RIGHTS_SCHEMA;
+			break;
+
+		case OBJECT_LARGEOBJECT:
+			if (OidIsValid(iacls->nspid))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_GRANT_OPERATION),
+						 errmsg("cannot use IN SCHEMA clause when using %s",
+								"GRANT/REVOKE ON LARGE OBJECTS")));
+			objtype = DEFACLOBJ_LARGEOBJECT;
+			if (iacls->all_privs && this_privileges == ACL_NO_RIGHTS)
+				this_privileges = ACL_ALL_RIGHTS_LARGEOBJECT;
 			break;
 
 		default:
@@ -1438,6 +1484,9 @@ RemoveRoleFromObjectACL(Oid roleid, Oid classid, Oid objid)
 				break;
 			case DEFACLOBJ_NAMESPACE:
 				iacls.objtype = OBJECT_SCHEMA;
+				break;
+			case DEFACLOBJ_LARGEOBJECT:
+				iacls.objtype = OBJECT_LARGEOBJECT;
 				break;
 			default:
 				/* Shouldn't get here */
@@ -1804,11 +1853,20 @@ ExecGrant_Relation(InternalGrant *istmt)
 					 errmsg("\"%s\" is not a sequence",
 							NameStr(pg_class_tuple->relname))));
 
+		if (istmt->objtype == OBJECT_PROPGRAPH &&
+			pg_class_tuple->relkind != RELKIND_PROPGRAPH)
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("\"%s\" is not a property graph",
+							NameStr(pg_class_tuple->relname))));
+
 		/* Adjust the default permissions based on object type */
 		if (istmt->all_privs && istmt->privileges == ACL_NO_RIGHTS)
 		{
 			if (pg_class_tuple->relkind == RELKIND_SEQUENCE)
 				this_privileges = ACL_ALL_RIGHTS_SEQUENCE;
+			else if (pg_class_tuple->relkind == RELKIND_PROPGRAPH)
+				this_privileges = ACL_ALL_RIGHTS_PROPGRAPH;
 			else
 				this_privileges = ACL_ALL_RIGHTS_RELATION;
 		}
@@ -1901,6 +1959,9 @@ ExecGrant_Relation(InternalGrant *istmt)
 			{
 				case RELKIND_SEQUENCE:
 					old_acl = acldefault(OBJECT_SEQUENCE, ownerId);
+					break;
+				case RELKIND_PROPGRAPH:
+					old_acl = acldefault(OBJECT_PROPGRAPH, ownerId);
 					break;
 				default:
 					old_acl = acldefault(OBJECT_TABLE, ownerId);
@@ -2083,7 +2144,7 @@ static void
 ExecGrant_common(InternalGrant *istmt, Oid classid, AclMode default_privs,
 				 void (*object_check) (InternalGrant *istmt, HeapTuple tuple))
 {
-	int			cacheid;
+	SysCacheIdentifier cacheid;
 	Relation	relation;
 	ListCell   *cell;
 
@@ -2699,6 +2760,9 @@ aclcheck_error(AclResult aclerr, ObjectType objtype,
 					case OBJECT_PROCEDURE:
 						msg = gettext_noop("permission denied for procedure %s");
 						break;
+					case OBJECT_PROPGRAPH:
+						msg = gettext_noop("permission denied for property graph %s");
+						break;
 					case OBJECT_PUBLICATION:
 						msg = gettext_noop("permission denied for publication %s");
 						break;
@@ -2824,6 +2888,9 @@ aclcheck_error(AclResult aclerr, ObjectType objtype,
 						break;
 					case OBJECT_PROCEDURE:
 						msg = gettext_noop("must be owner of procedure %s");
+						break;
+					case OBJECT_PROPGRAPH:
+						msg = gettext_noop("must be owner of property graph %s");
 						break;
 					case OBJECT_PUBLICATION:
 						msg = gettext_noop("must be owner of publication %s");
@@ -2961,6 +3028,7 @@ pg_aclmask(ObjectType objtype, Oid object_oid, AttrNumber attnum, Oid roleid,
 				pg_attribute_aclmask(object_oid, attnum, roleid, mask, how);
 		case OBJECT_TABLE:
 		case OBJECT_SEQUENCE:
+		case OBJECT_PROPGRAPH:
 			return pg_class_aclmask(object_oid, roleid, mask, how);
 		case OBJECT_DATABASE:
 			return object_aclmask(DatabaseRelationId, object_oid, roleid, mask, how);
@@ -3004,10 +3072,6 @@ pg_aclmask(ObjectType objtype, Oid object_oid, AttrNumber attnum, Oid roleid,
  * Exported routines for examining a user's privileges for various objects
  *
  * See aclmask() for a description of the common API for these functions.
- *
- * Note: we give lookup failure the full ereport treatment because the
- * has_xxx_privilege() family of functions allow users to pass any random
- * OID to these functions.
  * ****************************************************************
  */
 
@@ -3030,7 +3094,7 @@ object_aclmask_ext(Oid classid, Oid objectid, Oid roleid,
 				   AclMode mask, AclMaskHow how,
 				   bool *is_missing)
 {
-	int			cacheid;
+	SysCacheIdentifier cacheid;
 	AclMode		result;
 	HeapTuple	tuple;
 	Datum		aclDatum;
@@ -3074,10 +3138,8 @@ object_aclmask_ext(Oid classid, Oid objectid, Oid roleid,
 			return 0;
 		}
 		else
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("%s with OID %u does not exist",
-							get_object_class_descr(classid), objectid)));
+			elog(ERROR, "cache lookup failed for %s %u",
+				 get_object_class_descr(classid), objectid);
 	}
 
 	ownerId = DatumGetObjectId(SysCacheGetAttrNotNull(cacheid,
@@ -3101,7 +3163,7 @@ object_aclmask_ext(Oid classid, Oid objectid, Oid roleid,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(tuple);
@@ -3231,7 +3293,7 @@ pg_attribute_aclmask_ext(Oid table_oid, AttrNumber attnum, Oid roleid,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(attTuple);
@@ -3338,7 +3400,7 @@ pg_class_aclmask_ext(Oid table_oid, Oid roleid, AclMode mask,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(tuple);
@@ -3430,7 +3492,7 @@ pg_parameter_aclmask(const char *name, Oid roleid, AclMode mask, AclMaskHow how)
 		result = aclmask(acl, roleid, BOOTSTRAP_SUPERUSERID, mask, how);
 
 		/* if we have a detoasted copy, free it */
-		if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+		if (acl && acl != DatumGetPointer(aclDatum))
 			pfree(acl);
 
 		ReleaseSysCache(tuple);
@@ -3485,7 +3547,7 @@ pg_parameter_acl_aclmask(Oid acl_oid, Oid roleid, AclMode mask, AclMaskHow how)
 	result = aclmask(acl, roleid, BOOTSTRAP_SUPERUSERID, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(tuple);
@@ -3565,12 +3627,30 @@ pg_largeobject_aclmask_snapshot(Oid lobj_oid, Oid roleid,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	systable_endscan(scan);
 
 	table_close(pg_lo_meta, AccessShareLock);
+
+	/*
+	 * Check if ACL_SELECT is being checked and, if so, and not set already as
+	 * part of the result, then check if the user has privileges of the
+	 * pg_read_all_data role, which allows read access to all large objects.
+	 */
+	if (mask & ACL_SELECT && !(result & ACL_SELECT) &&
+		has_privs_of_role(roleid, ROLE_PG_READ_ALL_DATA))
+		result |= ACL_SELECT;
+
+	/*
+	 * Check if ACL_UPDATE is being checked and, if so, and not set already as
+	 * part of the result, then check if the user has privileges of the
+	 * pg_write_all_data role, which allows write access to all large objects.
+	 */
+	if (mask & ACL_UPDATE && !(result & ACL_UPDATE) &&
+		has_privs_of_role(roleid, ROLE_PG_WRITE_ALL_DATA))
+		result |= ACL_UPDATE;
 
 	return result;
 }
@@ -3659,7 +3739,7 @@ pg_namespace_aclmask_ext(Oid nsp_oid, Oid roleid,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(tuple);
@@ -3795,7 +3875,7 @@ pg_type_aclmask_ext(Oid type_oid, Oid roleid, AclMode mask, AclMaskHow how,
 	result = aclmask(acl, roleid, ownerId, mask, how);
 
 	/* if we have a detoasted copy, free it */
-	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+	if (acl && acl != DatumGetPointer(aclDatum))
 		pfree(acl);
 
 	ReleaseSysCache(tuple);
@@ -3979,7 +4059,7 @@ pg_attribute_aclcheck_all_ext(Oid table_oid, Oid roleid,
 			attmask = aclmask(acl, roleid, ownerId, mode, ACLMASK_ANY);
 
 			/* if we have a detoasted copy, free it */
-			if ((Pointer) acl != DatumGetPointer(aclDatum))
+			if (acl != DatumGetPointer(aclDatum))
 				pfree(acl);
 		}
 
@@ -4063,7 +4143,7 @@ pg_largeobject_aclcheck_snapshot(Oid lobj_oid, Oid roleid, AclMode mode,
 bool
 object_ownercheck(Oid classid, Oid objectid, Oid roleid)
 {
-	int			cacheid;
+	SysCacheIdentifier cacheid;
 	Oid			ownerId;
 
 	/* Superusers bypass all permission checking. */
@@ -4075,16 +4155,15 @@ object_ownercheck(Oid classid, Oid objectid, Oid roleid)
 		classid = LargeObjectMetadataRelationId;
 
 	cacheid = get_object_catcache_oid(classid);
-	if (cacheid != -1)
+	if (cacheid != SYSCACHEID_INVALID)
 	{
 		/* we can get the object's tuple from the syscache */
 		HeapTuple	tuple;
 
 		tuple = SearchSysCache1(cacheid, ObjectIdGetDatum(objectid));
 		if (!HeapTupleIsValid(tuple))
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("%s with OID %u does not exist", get_object_class_descr(classid), objectid)));
+			elog(ERROR, "cache lookup failed for %s %u",
+				 get_object_class_descr(classid), objectid);
 
 		ownerId = DatumGetObjectId(SysCacheGetAttrNotNull(cacheid,
 														  tuple,
@@ -4113,9 +4192,8 @@ object_ownercheck(Oid classid, Oid objectid, Oid roleid)
 
 		tuple = systable_getnext(scan);
 		if (!HeapTupleIsValid(tuple))
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("%s with OID %u does not exist", get_object_class_descr(classid), objectid)));
+			elog(ERROR, "could not find tuple for %s %u",
+				 get_object_class_descr(classid), objectid);
 
 		ownerId = DatumGetObjectId(heap_getattr(tuple,
 												get_object_attnum_owner(classid),
@@ -4256,6 +4334,10 @@ get_user_default_acl(ObjectType objtype, Oid ownerId, Oid nsp_oid)
 
 		case OBJECT_SCHEMA:
 			defaclobjtype = DEFACLOBJ_NAMESPACE;
+			break;
+
+		case OBJECT_LARGEOBJECT:
+			defaclobjtype = DEFACLOBJ_LARGEOBJECT;
 			break;
 
 		default:
@@ -4458,7 +4540,7 @@ recordExtObjInitPriv(Oid objoid, Oid classoid)
 	/* This will error on unsupported classoid. */
 	else if (get_object_attnum_acl(classoid) != InvalidAttrNumber)
 	{
-		int			cacheid;
+		SysCacheIdentifier cacheid;
 		Datum		aclDatum;
 		bool		isNull;
 		HeapTuple	tuple;
@@ -4842,7 +4924,7 @@ RemoveRoleFromInitPriv(Oid roleid, Oid classid, Oid objid, int32 objsubid)
 	ScanKeyData key[3];
 	SysScanDesc scan;
 	HeapTuple	oldtuple;
-	int			cacheid;
+	SysCacheIdentifier cacheid;
 	HeapTuple	objtuple;
 	Oid			ownerId;
 	Datum		oldAclDatum;

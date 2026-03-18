@@ -17,8 +17,6 @@ SELECT 'first line'
 	AS "Illegal comment within continuation";
 
 -- Unicode escapes
-SET standard_conforming_strings TO on;
-
 SELECT U&'d\0061t\+000061' AS U&"d\0061t\+000061";
 SELECT U&'d!0061t\+000061' UESCAPE '!' AS U&"d*0061t\+000061" UESCAPE '*';
 SELECT U&'a\\b' AS "a\b";
@@ -50,18 +48,11 @@ SELECT E'wrong: \udb99\u0061';
 SELECT E'wrong: \U0000db99\U00000061';
 SELECT E'wrong: \U002FFFFF';
 
+-- this is no longer allowed:
 SET standard_conforming_strings TO off;
-
-SELECT U&'d\0061t\+000061' AS U&"d\0061t\+000061";
-SELECT U&'d!0061t\+000061' UESCAPE '!' AS U&"d*0061t\+000061" UESCAPE '*';
-
-SELECT U&' \' UESCAPE '!' AS "tricky";
-SELECT 'tricky' AS U&"\" UESCAPE '!';
-
-SELECT U&'wrong: \061';
-SELECT U&'wrong: \+0061';
-SELECT U&'wrong: +0061' UESCAPE '+';
-
+-- but this should be acceptable:
+SET standard_conforming_strings TO on;
+-- or this:
 RESET standard_conforming_strings;
 
 -- bytea
@@ -76,6 +67,27 @@ SELECT E'De\\000dBeEf'::bytea;
 SELECT E'De\123dBeEf'::bytea;
 SELECT E'De\\123dBeEf'::bytea;
 SELECT E'De\\678dBeEf'::bytea;
+SELECT E'DeAd\\\\BeEf'::bytea;
+
+SELECT reverse(''::bytea);
+SELECT reverse('\xaa'::bytea);
+SELECT reverse('\xabcd'::bytea);
+
+SELECT ('\x' || repeat(' ', 32))::bytea;
+SELECT ('\x' || repeat('!', 32))::bytea;
+SELECT ('\x' || repeat('/', 34))::bytea;
+SELECT ('\x' || repeat('0', 34))::bytea;
+SELECT ('\x' || repeat('9', 32))::bytea;
+SELECT ('\x' || repeat(':', 32))::bytea;
+SELECT ('\x' || repeat('@', 34))::bytea;
+SELECT ('\x' || repeat('A', 34))::bytea;
+SELECT ('\x' || repeat('F', 32))::bytea;
+SELECT ('\x' || repeat('G', 32))::bytea;
+SELECT ('\x' || repeat('`', 34))::bytea;
+SELECT ('\x' || repeat('a', 34))::bytea;
+SELECT ('\x' || repeat('f', 32))::bytea;
+SELECT ('\x' || repeat('g', 32))::bytea;
+SELECT ('\x' || repeat('~', 34))::bytea;
 
 SET bytea_output TO escape;
 SELECT E'\\xDeAdBeEf'::bytea;
@@ -84,6 +96,7 @@ SELECT E'\\xDe00BeEf'::bytea;
 SELECT E'DeAdBeEf'::bytea;
 SELECT E'De\\000dBeEf'::bytea;
 SELECT E'De\\123dBeEf'::bytea;
+SELECT E'DeAd\\\\BeEf'::bytea;
 
 -- Test non-error-throwing API too
 SELECT pg_input_is_valid(E'\\xDeAdBeE', 'bytea');
@@ -192,6 +205,29 @@ SELECT 'abcd\efg' SIMILAR TO '_bcd\%' ESCAPE '' AS true;
 -- these behaviors are per spec, though:
 SELECT 'abcdefg' SIMILAR TO '_bcd%' ESCAPE NULL AS null;
 SELECT 'abcdefg' SIMILAR TO '_bcd#%' ESCAPE '##' AS error;
+
+-- Characters that should be left alone in character classes when a
+-- SIMILAR TO regexp pattern is converted to POSIX style.
+-- Underscore "_"
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '_[_[:alpha:]_]_';
+-- Percentage "%"
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '%[%[:alnum:]%]%';
+-- Dot "."
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '.[.[:alnum:].].';
+-- Dollar "$"
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '$[$[:alnum:]$]$';
+-- Opening parenthesis "("
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '()[([:alnum:](]()';
+-- Caret "^"
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '^[^[:alnum:]^[^^][[^^]][\^][[\^]]\^]^';
+-- Closing square bracket "]" at the beginning of character class
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '[]%][^]%][^%]%';
+-- Closing square bracket effective after two carets at the beginning
+-- of character class.
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '[^^]^';
+-- Closing square bracket after an escape sequence at the beginning of
+-- a character closes the character class
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '[|a]%' ESCAPE '|';
 
 -- Test backslash escapes in regexp_replace's replacement string
 SELECT regexp_replace('1112223333', E'(\\d{3})(\\d{3})(\\d{4})', E'(\\1) \\2-\\3');
@@ -362,6 +398,12 @@ SELECT regexp_split_to_array('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e',
 SELECT POSITION('4' IN '1234567890') = '4' AS "4";
 
 SELECT POSITION('5' IN '1234567890') = '5' AS "5";
+
+SELECT POSITION('\x11'::bytea IN ''::bytea) = 0 AS "0";
+SELECT POSITION('\x33'::bytea IN '\x1122'::bytea) = 0 AS "0";
+SELECT POSITION(''::bytea IN '\x1122'::bytea) = 1 AS "1";
+SELECT POSITION('\x22'::bytea IN '\x1122'::bytea) = 2 AS "2";
+SELECT POSITION('\x5678'::bytea IN '\x1234567890'::bytea) = 3 AS "3";
 
 -- T312 character overlay function
 SELECT OVERLAY('abcdef' PLACING '45' FROM 4) AS "abc45f";
@@ -618,6 +660,50 @@ SELECT length(c), c::text FROM toasttest;
 SELECT c FROM toasttest;
 DROP TABLE toasttest;
 
+-- test with short varlenas (up to 126 data bytes reduced to a 1-byte header)
+-- being toasted.
+CREATE TABLE toasttest (f1 text, f2 text);
+ALTER TABLE toasttest SET (toast_tuple_target = 128);
+ALTER TABLE toasttest ALTER COLUMN f1 SET STORAGE EXTERNAL;
+ALTER TABLE toasttest ALTER COLUMN f2 SET STORAGE EXTERNAL;
+-- Here, the first value is a varlena large enough to make it toasted and
+-- stored uncompressed.  The second value is a short varlena, toasted
+-- and stored uncompressed.
+INSERT INTO toasttest values(repeat('1234', 1000), repeat('5678', 30));
+SELECT reltoastrelid::regclass AS reltoastname FROM pg_class
+  WHERE oid = 'toasttest'::regclass \gset
+-- There should be two values inserted in the toast relation.
+SELECT count(*) FROM :reltoastname WHERE chunk_seq = 0;
+SELECT substr(f1, 5, 10) AS f1_data, substr(f2, 5, 10) AS f2_data
+  FROM toasttest;
+SELECT pg_column_compression(f1) AS f1_comp, pg_column_compression(f2) AS f2_comp
+  FROM toasttest;
+TRUNCATE toasttest;
+-- test with inline compressible varlenas.
+SET default_toast_compression = 'pglz';
+ALTER TABLE toasttest ALTER COLUMN f1 SET STORAGE MAIN;
+ALTER TABLE toasttest ALTER COLUMN f2 SET STORAGE MAIN;
+INSERT INTO toasttest values(repeat('1234', 1024), repeat('5678', 1024));
+-- There should be no values in the toast relation.
+SELECT substr(f1, 5, 10) AS f1_data, substr(f2, 5, 10) AS f2_data
+  FROM toasttest;
+SELECT pg_column_compression(f1) AS f1_comp, pg_column_compression(f2) AS f2_comp
+  FROM toasttest;
+SELECT count(*) FROM :reltoastname;
+TRUNCATE toasttest;
+-- test with external compressed data (default).
+ALTER TABLE toasttest ALTER COLUMN f1 SET STORAGE EXTENDED;
+ALTER TABLE toasttest ALTER COLUMN f2 SET STORAGE EXTENDED;
+INSERT INTO toasttest values(repeat('1234', 10240), NULL);
+-- There should be one value in the toast relation.
+SELECT substr(f1, 5, 10) AS f1_data, substr(f2, 5, 10) AS f2_data
+  FROM toasttest;
+SELECT pg_column_compression(f1) AS f1_comp, pg_column_compression(f2) AS f2_comp
+  FROM toasttest;
+SELECT count(*) FROM :reltoastname WHERE chunk_seq = 0;
+RESET default_toast_compression;
+DROP TABLE toasttest;
+
 --
 -- test length
 --
@@ -728,6 +814,11 @@ SELECT crc32('The quick brown fox jumps over the lazy dog.');
 SELECT crc32c('');
 SELECT crc32c('The quick brown fox jumps over the lazy dog.');
 
+SELECT crc32c(repeat('A', 127)::bytea);
+SELECT crc32c(repeat('A', 128)::bytea);
+SELECT crc32c(repeat('A', 129)::bytea);
+SELECT crc32c(repeat('A', 800)::bytea);
+
 --
 -- encode/decode
 --
@@ -738,6 +829,64 @@ SELECT decode(encode(('\x' || repeat('1234567890abcdef0001', 7))::bytea,
                      'base64'), 'base64');
 SELECT encode('\x1234567890abcdef00', 'escape');
 SELECT decode(encode('\x1234567890abcdef00', 'escape'), 'escape');
+
+-- report an error with a hint listing valid encodings when an invalid encoding is specified
+SELECT encode('\x01'::bytea, 'invalid');  -- error
+SELECT decode('00', 'invalid');           -- error
+
+--
+-- base64url encoding/decoding
+--
+SET bytea_output TO hex;
+
+-- Simple encoding/decoding
+SELECT encode('\x69b73eff', 'base64url');  -- abc-_w
+SELECT decode('abc-_w', 'base64url');      -- \x69b73eff
+
+-- Round-trip: decode(encode(x)) = x
+SELECT decode(encode('\x1234567890abcdef00', 'base64url'), 'base64url');  -- \x1234567890abcdef00
+
+-- Empty input
+SELECT encode('', 'base64url');  -- ''
+SELECT decode('', 'base64url');  -- ''
+
+-- 1 byte input
+SELECT encode('\x01', 'base64url');  -- AQ
+SELECT decode('AQ', 'base64url');    -- \x01
+
+-- 2 byte input
+SELECT encode('\x0102'::bytea, 'base64url');  -- AQI
+SELECT decode('AQI', 'base64url');            -- \x0102
+
+-- 3 byte input (no padding needed)
+SELECT encode('\x010203'::bytea, 'base64url');  -- AQID
+SELECT decode('AQID', 'base64url');             -- \x010203
+
+-- 4 byte input (results in 6 base64 chars)
+SELECT encode('\xdeadbeef'::bytea, 'base64url');  -- 3q2-7w
+SELECT decode('3q2-7w', 'base64url');             -- \xdeadbeef
+
+-- Round-trip test for all lengths from 0–4
+SELECT encode(decode(encode(E'\\x', 'base64url'), 'base64url'), 'base64url');
+SELECT encode(decode(encode(E'\\x00', 'base64url'), 'base64url'), 'base64url');
+SELECT encode(decode(encode(E'\\x0001', 'base64url'), 'base64url'), 'base64url');
+SELECT encode(decode(encode(E'\\x000102', 'base64url'), 'base64url'), 'base64url');
+SELECT encode(decode(encode(E'\\x00010203', 'base64url'), 'base64url'), 'base64url');
+
+-- Invalid inputs (should ERROR)
+-- invalid character '@'
+SELECT decode('QQ@=', 'base64url');
+
+-- missing characters (incomplete group)
+SELECT decode('QQ', 'base64url');  -- ok (1 byte)
+SELECT decode('QQI', 'base64url'); -- ok (2 bytes)
+SELECT decode('QQIDQ', 'base64url'); -- ERROR: invalid base64url end sequence
+
+-- unexpected '=' at start
+SELECT decode('=QQQ', 'base64url');
+
+-- valid base64 padding in base64url (optional, but accepted)
+SELECT decode('abc-_w==', 'base64url');  -- should decode to \x69b73eff
 
 --
 -- get_bit/set_bit etc
@@ -752,37 +901,33 @@ SELECT set_byte('\x1234567890abcdef00'::bytea, 7, 11);
 SELECT set_byte('\x1234567890abcdef00'::bytea, 99, 11);  -- error
 
 --
--- test behavior of escape_string_warning and standard_conforming_strings options
+-- conversions between bytea and integer types
 --
-set escape_string_warning = off;
-set standard_conforming_strings = off;
+SELECT 0x1234::int2::bytea AS "\x1234", (-0x1234)::int2::bytea AS "\xedcc";
+SELECT 0x12345678::int4::bytea AS "\x12345678", (-0x12345678)::int4::bytea AS "\xedcba988";
+SELECT 0x1122334455667788::int8::bytea AS "\x1122334455667788",
+       (-0x1122334455667788)::int8::bytea AS "\xeeddccbbaa998878";
 
-show escape_string_warning;
-show standard_conforming_strings;
+SELECT ''::bytea::int2 AS "0";
+SELECT '\x12'::bytea::int2 AS "18";
+SELECT '\x1234'::bytea::int2 AS "4460";
+SELECT '\x123456'::bytea::int2; -- error
 
-set escape_string_warning = on;
-set standard_conforming_strings = on;
+SELECT ''::bytea::int4 AS "0";
+SELECT '\x12'::bytea::int4 AS "18";
+SELECT '\x12345678'::bytea::int4 AS "305419896";
+SELECT '\x123456789A'::bytea::int4; -- error
 
-show escape_string_warning;
-show standard_conforming_strings;
+SELECT ''::bytea::int8 AS "0";
+SELECT '\x12'::bytea::int8 AS "18";
+SELECT '\x1122334455667788'::bytea::int8 AS "1234605616436508552";
+SELECT '\x112233445566778899'::bytea::int8; -- error
 
-select 'a\bcd' as f1, 'a\b''cd' as f2, 'a\b''''cd' as f3, 'abcd\'   as f4, 'ab\''cd' as f5, '\\' as f6;
-
-set standard_conforming_strings = off;
-
-select 'a\\bcd' as f1, 'a\\b\'cd' as f2, 'a\\b\'''cd' as f3, 'abcd\\'   as f4, 'ab\\\'cd' as f5, '\\\\' as f6;
-
-set escape_string_warning = off;
-set standard_conforming_strings = on;
-
-select 'a\bcd' as f1, 'a\b''cd' as f2, 'a\b''''cd' as f3, 'abcd\'   as f4, 'ab\''cd' as f5, '\\' as f6;
-
-set standard_conforming_strings = off;
-
-select 'a\\bcd' as f1, 'a\\b\'cd' as f2, 'a\\b\'''cd' as f3, 'abcd\\'   as f4, 'ab\\\'cd' as f5, '\\\\' as f6;
-
-reset standard_conforming_strings;
-
+-- min/max integer values
+SELECT '\x8000'::bytea::int2 AS "-32768", '\x7FFF'::bytea::int2 AS "32767";
+SELECT '\x80000000'::bytea::int4 AS "-2147483648", '\x7FFFFFFF'::bytea::int4 AS "2147483647";
+SELECT '\x8000000000000000'::bytea::int8 AS "-9223372036854775808",
+       '\x7FFFFFFFFFFFFFFF'::bytea::int8 AS "9223372036854775807";
 
 --
 -- Additional string functions

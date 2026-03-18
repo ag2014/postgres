@@ -3,7 +3,7 @@
  * globals.c
  *	  global variable declarations
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,6 +24,7 @@
 #include "miscadmin.h"
 #include "postmaster/postmaster.h"
 #include "storage/procnumber.h"
+#include "storage/procsignal.h"
 
 
 ProtocolVersion FrontendProtocol;
@@ -48,8 +49,8 @@ pg_time_t	MyStartTime;
 TimestampTz MyStartTimestamp;
 struct ClientSocket *MyClientSocket;
 struct Port *MyProcPort;
-bool		MyCancelKeyValid = false;
-int32		MyCancelKey = 0;
+uint8		MyCancelKey[MAX_CANCEL_KEY_LENGTH];
+int			MyCancelKeyLength = 0;
 int			MyPMChildSlot;
 
 /*

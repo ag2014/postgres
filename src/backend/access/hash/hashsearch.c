@@ -3,7 +3,7 @@
  * hashsearch.c
  *	  search code for postgres hash tables
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,6 +17,7 @@
 #include "access/hash.h"
 #include "access/relscan.h"
 #include "miscadmin.h"
+#include "executor/instrument_node.h"
 #include "pgstat.h"
 #include "storage/predicate.h"
 #include "utils/rel.h"
@@ -298,6 +299,8 @@ _hash_first(IndexScanDesc scan, ScanDirection dir)
 	HashScanPosItem *currItem;
 
 	pgstat_count_index_scan(rel);
+	if (scan->instrument)
+		scan->instrument->nsearches++;
 
 	/*
 	 * We do not support hash scans with no index qualification, because we

@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 # Test partial-column publication of tables
 use strict;
@@ -1209,7 +1209,7 @@ t), 'check the number of columns in the old tuple');
 # list) are considered to have the same column list.
 $node_publisher->safe_psql(
 	'postgres', qq(
-	CREATE TABLE test_mix_4 (a int PRIMARY KEY, b int, c int, d int GENERATED ALWAYS AS (a + 1) STORED);
+	CREATE TABLE test_mix_4 (a int PRIMARY KEY, b int, c int, d int GENERATED ALWAYS AS (a + 1) STORED, e int GENERATED ALWAYS AS (a + 2) VIRTUAL);
 	ALTER TABLE test_mix_4 DROP COLUMN c;
 
 	CREATE PUBLICATION pub_mix_7 FOR TABLE test_mix_4 (a, b);
@@ -1272,8 +1272,9 @@ my ($cmdret, $stdout, $stderr) = $node_subscriber->psql(
 	CREATE SUBSCRIPTION sub1 CONNECTION '$publisher_connstr' PUBLICATION pub_mix_1, pub_mix_2;
 ));
 
-ok( $stderr =~
-	  qr/cannot use different column lists for table "public.test_mix_1" in different publications/,
+like(
+	$stderr,
+	qr/cannot use different column lists for table "public.test_mix_1" in different publications/,
 	'different column lists detected');
 
 # TEST: If the column list is changed after creating the subscription, we

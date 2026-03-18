@@ -3,7 +3,7 @@
  * nodeLockRows.c
  *	  Routines to handle FOR UPDATE/FOR SHARE row locking
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -344,11 +344,20 @@ ExecInitLockRows(LockRows *node, EState *estate, int eflags)
 	foreach(lc, node->rowMarks)
 	{
 		PlanRowMark *rc = lfirst_node(PlanRowMark, lc);
+		RangeTblEntry *rte = exec_rt_fetch(rc->rti, estate);
 		ExecRowMark *erm;
 		ExecAuxRowMark *aerm;
 
 		/* ignore "parent" rowmarks; they are irrelevant at runtime */
 		if (rc->isParent)
+			continue;
+
+		/*
+		 * Also ignore rowmarks belonging to child tables that have been
+		 * pruned in ExecDoInitialPruning().
+		 */
+		if (rte->rtekind == RTE_RELATION &&
+			!bms_is_member(rc->rti, estate->es_unpruned_relids))
 			continue;
 
 		/* find ExecRowMark and build ExecAuxRowMark */

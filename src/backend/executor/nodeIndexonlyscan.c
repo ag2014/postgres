@@ -3,7 +3,7 @@
  * nodeIndexonlyscan.c
  *	  Routines to support index-only scans
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -37,6 +37,7 @@
 #include "access/visibilitymap.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "executor/nodeIndexonlyscan.h"
 #include "executor/nodeIndexscan.h"
 #include "miscadmin.h"
@@ -92,6 +93,7 @@ IndexOnlyNext(IndexOnlyScanState *node)
 		scandesc = index_beginscan(node->ss.ss_currentRelation,
 								   node->ioss_RelationDesc,
 								   estate->es_snapshot,
+								   &node->ioss_Instrument,
 								   node->ioss_NumScanKeys,
 								   node->ioss_NumOrderByKeys);
 
@@ -414,6 +416,27 @@ ExecEndIndexOnlyScan(IndexOnlyScanState *node)
 	}
 
 	/*
+	 * When ending a parallel worker, copy the statistics gathered by the
+	 * worker back into shared memory so that it can be picked up by the main
+	 * process to report in EXPLAIN ANALYZE
+	 */
+	if (node->ioss_SharedInfo != NULL && IsParallelWorker())
+	{
+		IndexScanInstrumentation *winstrument;
+
+		Assert(ParallelWorkerNumber < node->ioss_SharedInfo->num_workers);
+		winstrument = &node->ioss_SharedInfo->winstrument[ParallelWorkerNumber];
+
+		/*
+		 * We have to accumulate the stats rather than performing a memcpy.
+		 * When a Gather/GatherMerge node finishes it will perform planner
+		 * shutdown on the workers.  On rescan it will spin up new workers
+		 * which will have a new IndexOnlyScanState and zeroed stats.
+		 */
+		winstrument->nsearches += node->ioss_Instrument.nsearches;
+	}
+
+	/*
 	 * close the index relation (no-op if we didn't open it)
 	 */
 	if (indexScanDesc)
@@ -545,7 +568,8 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	 */
 	tupDesc = ExecTypeFromTL(node->indextlist);
 	ExecInitScanTupleSlot(estate, &indexstate->ss, tupDesc,
-						  &TTSOpsVirtual);
+						  &TTSOpsVirtual,
+						  0);
 
 	/*
 	 * We need another slot, in a format that's suitable for the table AM, for
@@ -554,7 +578,7 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	indexstate->ioss_TableSlot =
 		ExecAllocTableSlot(&estate->es_tupleTable,
 						   RelationGetDescr(currentRelation),
-						   table_slot_callbacks(currentRelation));
+						   table_slot_callbacks(currentRelation), 0);
 
 	/*
 	 * Initialize result type and projection info.  The node's targetlist will
@@ -671,8 +695,7 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 		 * Now create an array to mark the attribute numbers of the keys that
 		 * need to be converted from cstring to name.
 		 */
-		indexstate->ioss_NameCStringAttNums = (AttrNumber *)
-			palloc(sizeof(AttrNumber) * namecount);
+		indexstate->ioss_NameCStringAttNums = palloc_array(AttrNumber, namecount);
 
 		for (int attnum = 0; attnum < indnkeyatts; attnum++)
 		{
@@ -707,11 +730,21 @@ ExecIndexOnlyScanEstimate(IndexOnlyScanState *node,
 						  ParallelContext *pcxt)
 {
 	EState	   *estate = node->ss.ps.state;
+	bool		instrument = (node->ss.ps.instrument != NULL);
+	bool		parallel_aware = node->ss.ps.plan->parallel_aware;
+
+	if (!instrument && !parallel_aware)
+	{
+		/* No DSM required by the scan */
+		return;
+	}
 
 	node->ioss_PscanLen = index_parallelscan_estimate(node->ioss_RelationDesc,
 													  node->ioss_NumScanKeys,
 													  node->ioss_NumOrderByKeys,
-													  estate->es_snapshot);
+													  estate->es_snapshot,
+													  instrument, parallel_aware,
+													  pcxt->nworkers);
 	shm_toc_estimate_chunk(&pcxt->estimator, node->ioss_PscanLen);
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
 }
@@ -728,16 +761,33 @@ ExecIndexOnlyScanInitializeDSM(IndexOnlyScanState *node,
 {
 	EState	   *estate = node->ss.ps.state;
 	ParallelIndexScanDesc piscan;
+	bool		instrument = node->ss.ps.instrument != NULL;
+	bool		parallel_aware = node->ss.ps.plan->parallel_aware;
+
+	if (!instrument && !parallel_aware)
+	{
+		/* No DSM required by the scan */
+		return;
+	}
 
 	piscan = shm_toc_allocate(pcxt->toc, node->ioss_PscanLen);
 	index_parallelscan_initialize(node->ss.ss_currentRelation,
 								  node->ioss_RelationDesc,
 								  estate->es_snapshot,
-								  piscan);
+								  instrument, parallel_aware, pcxt->nworkers,
+								  &node->ioss_SharedInfo, piscan);
 	shm_toc_insert(pcxt->toc, node->ss.ps.plan->plan_node_id, piscan);
+
+	if (!parallel_aware)
+	{
+		/* Only here to initialize SharedInfo in DSM */
+		return;
+	}
+
 	node->ioss_ScanDesc =
 		index_beginscan_parallel(node->ss.ss_currentRelation,
 								 node->ioss_RelationDesc,
+								 &node->ioss_Instrument,
 								 node->ioss_NumScanKeys,
 								 node->ioss_NumOrderByKeys,
 								 piscan);
@@ -764,6 +814,7 @@ void
 ExecIndexOnlyScanReInitializeDSM(IndexOnlyScanState *node,
 								 ParallelContext *pcxt)
 {
+	Assert(node->ss.ps.plan->parallel_aware);
 	index_parallelrescan(node->ioss_ScanDesc);
 }
 
@@ -778,11 +829,31 @@ ExecIndexOnlyScanInitializeWorker(IndexOnlyScanState *node,
 								  ParallelWorkerContext *pwcxt)
 {
 	ParallelIndexScanDesc piscan;
+	bool		instrument = node->ss.ps.instrument != NULL;
+	bool		parallel_aware = node->ss.ps.plan->parallel_aware;
+
+	if (!instrument && !parallel_aware)
+	{
+		/* No DSM required by the scan */
+		return;
+	}
 
 	piscan = shm_toc_lookup(pwcxt->toc, node->ss.ps.plan->plan_node_id, false);
+
+	if (instrument)
+		node->ioss_SharedInfo = (SharedIndexScanInstrumentation *)
+			OffsetToPointer(piscan, piscan->ps_offset_ins);
+
+	if (!parallel_aware)
+	{
+		/* Only here to set up worker node's SharedInfo */
+		return;
+	}
+
 	node->ioss_ScanDesc =
 		index_beginscan_parallel(node->ss.ss_currentRelation,
 								 node->ioss_RelationDesc,
+								 &node->ioss_Instrument,
 								 node->ioss_NumScanKeys,
 								 node->ioss_NumOrderByKeys,
 								 piscan);
@@ -796,4 +867,26 @@ ExecIndexOnlyScanInitializeWorker(IndexOnlyScanState *node,
 		index_rescan(node->ioss_ScanDesc,
 					 node->ioss_ScanKeys, node->ioss_NumScanKeys,
 					 node->ioss_OrderByKeys, node->ioss_NumOrderByKeys);
+}
+
+/* ----------------------------------------------------------------
+ *		ExecIndexOnlyScanRetrieveInstrumentation
+ *
+ *		Transfer index-only scan statistics from DSM to private memory.
+ * ----------------------------------------------------------------
+ */
+void
+ExecIndexOnlyScanRetrieveInstrumentation(IndexOnlyScanState *node)
+{
+	SharedIndexScanInstrumentation *SharedInfo = node->ioss_SharedInfo;
+	size_t		size;
+
+	if (SharedInfo == NULL)
+		return;
+
+	/* Create a copy of SharedInfo in backend-local memory */
+	size = offsetof(SharedIndexScanInstrumentation, winstrument) +
+		SharedInfo->num_workers * sizeof(IndexScanInstrumentation);
+	node->ioss_SharedInfo = palloc(size);
+	memcpy(node->ioss_SharedInfo, SharedInfo, size);
 }

@@ -8,7 +8,7 @@
  * operations such as pfree() and repalloc() to work correctly on a memory
  * chunk that was allocated by palloc_aligned().
  *
- * Portions Copyright (c) 2022-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2022-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/mmgr/alignedalloc.c
@@ -23,8 +23,8 @@
 
 /*
  * AlignedAllocFree
-*		Frees allocated memory; memory is removed from its owning context.
-*/
+ *		Frees allocated memory; memory is removed from its owning context.
+ */
 void
 AlignedAllocFree(void *pointer)
 {
@@ -45,6 +45,16 @@ AlignedAllocFree(void *pointer)
 			 GetMemoryChunkContext(unaligned)->name, chunk);
 #endif
 
+	/*
+	 * Create a dummy vchunk covering the start of the unaligned chunk, but
+	 * not overlapping the aligned chunk.  This will be freed while pfree'ing
+	 * the unaligned chunk, keeping Valgrind happy.  Then when we return to
+	 * the outer pfree, that will clean up the vchunk for the aligned chunk.
+	 */
+	VALGRIND_MEMPOOL_ALLOC(GetMemoryChunkContext(unaligned), unaligned,
+						   (char *) pointer - (char *) unaligned);
+
+	/* Recursively pfree the unaligned chunk */
 	pfree(unaligned);
 }
 
@@ -96,18 +106,41 @@ AlignedAllocRealloc(void *pointer, Size size, int flags)
 	Assert(old_size >= redirchunk->requested_size);
 #endif
 
+	/*
+	 * To keep things simple, we always allocate a new aligned chunk and copy
+	 * data into it.  Because of the above inaccuracy, this may end in copying
+	 * more data than was in the original allocation request size, but that
+	 * should be OK.
+	 */
 	ctx = GetMemoryChunkContext(unaligned);
 	newptr = MemoryContextAllocAligned(ctx, size, alignto, flags);
 
-	/*
-	 * We may memcpy beyond the end of the original allocation request size,
-	 * so we must mark the entire allocation as defined.
-	 */
-	if (likely(newptr != NULL))
+	/* Cope cleanly with OOM */
+	if (unlikely(newptr == NULL))
 	{
-		VALGRIND_MAKE_MEM_DEFINED(pointer, old_size);
-		memcpy(newptr, pointer, Min(size, old_size));
+		VALGRIND_MAKE_MEM_NOACCESS(redirchunk, sizeof(MemoryChunk));
+		return MemoryContextAllocationFailure(ctx, size, flags);
 	}
+
+	/*
+	 * We may memcpy more than the original allocation request size, which
+	 * would result in trying to copy trailing bytes that the original
+	 * MemoryContextAllocAligned call marked NOACCESS.  So we must mark the
+	 * entire old_size as defined.  That's slightly annoying, but probably not
+	 * worth improving.
+	 */
+	VALGRIND_MAKE_MEM_DEFINED(pointer, old_size);
+	memcpy(newptr, pointer, Min(size, old_size));
+
+	/*
+	 * Create a dummy vchunk covering the start of the old unaligned chunk,
+	 * but not overlapping the aligned chunk.  This will be freed while
+	 * pfree'ing the old unaligned chunk, keeping Valgrind happy.  Then when
+	 * we return to repalloc, it will move the vchunk for the aligned chunk.
+	 */
+	VALGRIND_MEMPOOL_ALLOC(ctx, unaligned,
+						   (char *) pointer - (char *) unaligned);
+
 	pfree(unaligned);
 
 	return newptr;

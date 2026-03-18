@@ -4,7 +4,7 @@
  *	Catalog routines used by pg_dump; long ago these were shared
  *	by another dump tool, but not anymore.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,6 +17,7 @@
 
 #include <ctype.h>
 
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_class_d.h"
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_extension_d.h"
@@ -243,8 +244,8 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 	pg_log_info("reading subscriptions");
 	getSubscriptions(fout);
 
-	pg_log_info("reading subscription membership of tables");
-	getSubscriptionTables(fout);
+	pg_log_info("reading subscription membership of relations");
+	getSubscriptionRelations(fout);
 
 	free(inhinfo);				/* not needed any longer */
 
@@ -352,7 +353,7 @@ flagInhTables(Archive *fout, TableInfo *tblinfo, int numTables,
 						 tblinfo[i].numParents,
 						 tblinfo[i].dobj.name);
 
-			attachinfo = (TableAttachInfo *) palloc(sizeof(TableAttachInfo));
+			attachinfo = palloc_object(TableAttachInfo);
 			attachinfo->dobj.objType = DO_TABLE_ATTACH;
 			attachinfo->dobj.catId.tableoid = 0;
 			attachinfo->dobj.catId.oid = 0;
@@ -453,8 +454,8 @@ flagInhIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
  * What we need to do here is:
  *
  * - Detect child columns that inherit NOT NULL bits from their parents, so
- *   that we needn't specify that again for the child. (Versions >= 18 no
- *   longer need this.)
+ *   that we needn't specify that again for the child.  For versions 18 and
+ *   up, this is needed when the parent is NOT VALID and the child isn't.
  *
  * - Detect child columns that have DEFAULT NULL when their parents had some
  *   non-null default.  In this case, we make up a dummy AttrDefInfo object so
@@ -496,7 +497,8 @@ flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo, int numTables
 		/* Some kinds never have parents */
 		if (tbinfo->relkind == RELKIND_SEQUENCE ||
 			tbinfo->relkind == RELKIND_VIEW ||
-			tbinfo->relkind == RELKIND_MATVIEW)
+			tbinfo->relkind == RELKIND_MATVIEW ||
+			tbinfo->relkind == RELKIND_PROPGRAPH)
 			continue;
 
 		/* Don't bother computing anything for non-target tables, either */
@@ -516,6 +518,8 @@ flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo, int numTables
 			bool		foundDefault;	/* Found a default in a parent */
 			bool		foundSameGenerated; /* Found matching GENERATED */
 			bool		foundDiffGenerated; /* Found non-matching GENERATED */
+			bool		allNotNullsInvalid = true;	/* is NOT NULL NOT VALID
+													 * on all parents? */
 
 			/* no point in examining dropped columns */
 			if (tbinfo->attisdropped[j])
@@ -546,6 +550,18 @@ flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo, int numTables
 						parent->notnull_constrs[inhAttrInd] != NULL)
 						foundNotNull = true;
 
+					/*
+					 * Keep track of whether all the parents that have a
+					 * not-null constraint on this column have it as NOT
+					 * VALID; if they all are, arrange to have it printed for
+					 * this column.  If at least one parent has it as valid,
+					 * there's no need.
+					 */
+					if (fout->remoteVersion >= 180000 &&
+						parent->notnull_constrs[inhAttrInd] &&
+						!parent->notnull_invalid[inhAttrInd])
+						allNotNullsInvalid = false;
+
 					foundDefault |= (parentDef != NULL &&
 									 strcmp(parentDef->adef_expr, "NULL") != 0 &&
 									 !parent->attgenerated[inhAttrInd]);
@@ -570,6 +586,14 @@ flagInhAttrs(Archive *fout, DumpOptions *dopt, TableInfo *tblinfo, int numTables
 			 */
 			if (fout->remoteVersion < 180000 && foundNotNull)
 				tbinfo->notnull_islocal[j] = false;
+
+			/*
+			 * For versions >18, we must print the not-null constraint locally
+			 * for this table even if it isn't really locally defined, but is
+			 * valid for the child and no parent has it as valid.
+			 */
+			if (fout->remoteVersion >= 180000 && allNotNullsInvalid)
+				tbinfo->notnull_islocal[j] = true;
 
 			/*
 			 * Manufacture a DEFAULT NULL clause if necessary.  This breaks
@@ -920,6 +944,24 @@ findOprByOid(Oid oid)
 	dobj = findObjectByCatalogId(catId);
 	Assert(dobj == NULL || dobj->objType == DO_OPERATOR);
 	return (OprInfo *) dobj;
+}
+
+/*
+ * findAccessMethodByOid
+ *	  finds the DumpableObject for the access method with the given oid
+ *	  returns NULL if not found
+ */
+AccessMethodInfo *
+findAccessMethodByOid(Oid oid)
+{
+	CatalogId	catId;
+	DumpableObject *dobj;
+
+	catId.tableoid = AccessMethodRelationId;
+	catId.oid = oid;
+	dobj = findObjectByCatalogId(catId);
+	Assert(dobj == NULL || dobj->objType == DO_ACCESS_METHOD);
+	return (AccessMethodInfo *) dobj;
 }
 
 /*

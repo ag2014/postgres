@@ -3,7 +3,7 @@
  *
  *	main source file
  *
- *	Copyright (c) 2010-2024, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/pg_upgrade.c
  */
 
@@ -29,9 +29,12 @@
  *	We control all assignments of pg_enum.oid because these oids are stored
  *	in user tables as enum values.
  *
- *	We control all assignments of pg_authid.oid for historical reasons (the
- *	oids used to be stored in pg_largeobject_metadata, which is now copied via
- *	SQL commands), that might change at some point in the future.
+ *	We control all assignments of pg_authid.oid because the oids are stored in
+ *	pg_largeobject_metadata, which is copied via file transfer for upgrades
+ *	from v16 and newer.
+ *
+ *	We control all assignments of pg_database.oid because we want the directory
+ *	names to match between the old and new cluster.
  */
 
 
@@ -40,6 +43,7 @@
 
 #include <time.h>
 
+#include "access/multixact.h"
 #include "catalog/pg_class_d.h"
 #include "common/file_perm.h"
 #include "common/logging.h"
@@ -54,6 +58,7 @@
  */
 #define RESTORE_TRANSACTION_SIZE 1000
 
+static void set_new_cluster_char_signedness(void);
 static void set_locale_and_encoding(void);
 static void prepare_new_cluster(void);
 static void prepare_new_globals(void);
@@ -63,6 +68,7 @@ static void set_frozenxids(bool minmxid_only);
 static void make_outputdirs(char *pgdata);
 static void setup(char *argv0);
 static void create_logical_replication_slots(void);
+static void create_conflict_detection_slot(void);
 
 ClusterInfo old_cluster,
 			new_cluster;
@@ -84,6 +90,7 @@ int
 main(int argc, char **argv)
 {
 	char	   *deletion_script_file_name = NULL;
+	bool		migrate_logical_slots;
 
 	/*
 	 * pg_upgrade doesn't currently use common/logging.c, but initialize it
@@ -154,6 +161,7 @@ main(int argc, char **argv)
 	 */
 
 	copy_xact_xlog_xid();
+	set_new_cluster_char_signedness();
 
 	/* New now using xids of the old system */
 
@@ -168,12 +176,14 @@ main(int argc, char **argv)
 
 	/*
 	 * Most failures happen in create_new_objects(), which has completed at
-	 * this point.  We do this here because it is just before linking, which
-	 * will link the old and new cluster data files, preventing the old
-	 * cluster from being safely started once the new cluster is started.
+	 * this point.  We do this here because it is just before file transfer,
+	 * which for --link will make it unsafe to start the old cluster once the
+	 * new cluster is started, and for --swap will make it unsafe to start the
+	 * old cluster at all.
 	 */
-	if (user_opts.transfer_mode == TRANSFER_MODE_LINK)
-		disable_old_cluster();
+	if (user_opts.transfer_mode == TRANSFER_MODE_LINK ||
+		user_opts.transfer_mode == TRANSFER_MODE_SWAP)
+		disable_old_cluster(user_opts.transfer_mode);
 
 	transfer_all_new_tablespaces(&old_cluster.dbarr, &new_cluster.dbarr,
 								 old_cluster.pgdata, new_cluster.pgdata);
@@ -191,18 +201,39 @@ main(int argc, char **argv)
 			  new_cluster.pgdata);
 	check_ok();
 
+	migrate_logical_slots = count_old_cluster_logical_slots();
+
 	/*
-	 * Migrate the logical slots to the new cluster.  Note that we need to do
-	 * this after resetting WAL because otherwise the required WAL would be
-	 * removed and slots would become unusable.  There is a possibility that
-	 * background processes might generate some WAL before we could create the
-	 * slots in the new cluster but we can ignore that WAL as that won't be
-	 * required downstream.
+	 * Migrate replication slots to the new cluster.
+	 *
+	 * Note that we must migrate logical slots after resetting WAL because
+	 * otherwise the required WAL would be removed and slots would become
+	 * unusable.  There is a possibility that background processes might
+	 * generate some WAL before we could create the slots in the new cluster
+	 * but we can ignore that WAL as that won't be required downstream.
+	 *
+	 * The conflict detection slot is not affected by concerns related to WALs
+	 * as it only retains the dead tuples. It is created here for consistency.
+	 * Note that the new conflict detection slot uses the latest transaction
+	 * ID as xmin, so it cannot protect dead tuples that existed before the
+	 * upgrade. Additionally, commit timestamps and origin data are not
+	 * preserved during the upgrade. So, even after creating the slot, the
+	 * upgraded subscriber may be unable to detect conflicts or log relevant
+	 * commit timestamps and origins when applying changes from the publisher
+	 * occurred before the upgrade especially if those changes were not
+	 * replicated. It can only protect tuples that might be deleted after the
+	 * new cluster starts.
 	 */
-	if (count_old_cluster_logical_slots())
+	if (migrate_logical_slots || old_cluster.sub_retain_dead_tuples)
 	{
 		start_postmaster(&new_cluster, true);
-		create_logical_replication_slots();
+
+		if (migrate_logical_slots)
+			create_logical_replication_slots();
+
+		if (old_cluster.sub_retain_dead_tuples)
+			create_conflict_detection_slot();
+
 		stop_postmaster(false);
 	}
 
@@ -210,8 +241,10 @@ main(int argc, char **argv)
 	{
 		prep_status("Sync data directory to disk");
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/initdb\" --sync-only \"%s\" --sync-method %s",
+				  "\"%s/initdb\" --sync-only %s \"%s\" --sync-method %s",
 				  new_cluster.bindir,
+				  (user_opts.transfer_mode == TRANSFER_MODE_SWAP) ?
+				  "--no-sync-data-files" : "",
 				  new_cluster.pgdata,
 				  user_opts.sync_method);
 		check_ok();
@@ -388,6 +421,38 @@ setup(char *argv0)
 	}
 }
 
+/*
+ * Set the new cluster's default char signedness using the old cluster's
+ * value.
+ */
+static void
+set_new_cluster_char_signedness(void)
+{
+	bool		new_char_signedness;
+
+	/*
+	 * Use the specified char signedness if specified. Otherwise we inherit
+	 * the source database's signedness.
+	 */
+	if (user_opts.char_signedness != -1)
+		new_char_signedness = (user_opts.char_signedness == 1);
+	else
+		new_char_signedness = old_cluster.controldata.default_char_signedness;
+
+	/* Change the char signedness of the new cluster, if necessary */
+	if (new_cluster.controldata.default_char_signedness != new_char_signedness)
+	{
+		prep_status("Setting the default char signedness for new cluster");
+
+		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
+				  "\"%s/pg_resetwal\" --char-signedness %s \"%s\"",
+				  new_cluster.bindir,
+				  new_char_signedness ? "signed" : "unsigned",
+				  new_cluster.pgdata);
+
+		check_ok();
+	}
+}
 
 /*
  * Copy locale and encoding information into the new cluster's template0.
@@ -416,12 +481,13 @@ set_locale_and_encoding(void)
 	datctype_literal = PQescapeLiteral(conn_new_template1,
 									   locale->db_ctype,
 									   strlen(locale->db_ctype));
+
 	if (locale->db_locale)
 		datlocale_literal = PQescapeLiteral(conn_new_template1,
 											locale->db_locale,
 											strlen(locale->db_locale));
 	else
-		datlocale_literal = pg_strdup("NULL");
+		datlocale_literal = "NULL";
 
 	/* update template0 in new cluster */
 	if (GET_MAJOR_VERSION(new_cluster.major_version) >= 1700)
@@ -465,7 +531,8 @@ set_locale_and_encoding(void)
 
 	PQfreemem(datcollate_literal);
 	PQfreemem(datctype_literal);
-	PQfreemem(datlocale_literal);
+	if (locale->db_locale)
+		PQfreemem(datlocale_literal);
 
 	PQfinish(conn_new_template1);
 
@@ -741,15 +808,15 @@ copy_xact_xlog_xid(void)
 			  new_cluster.pgdata);
 	check_ok();
 
-	/*
-	 * If the old server is before the MULTIXACT_FORMATCHANGE_CAT_VER change
-	 * (see pg_upgrade.h) and the new server is after, then we don't copy
-	 * pg_multixact files, but we need to reset pg_control so that the new
-	 * server doesn't attempt to read multis older than the cutoff value.
-	 */
-	if (old_cluster.controldata.cat_ver >= MULTIXACT_FORMATCHANGE_CAT_VER &&
-		new_cluster.controldata.cat_ver >= MULTIXACT_FORMATCHANGE_CAT_VER)
+	/* Copy or convert pg_multixact files */
+	Assert(new_cluster.controldata.cat_ver >= MULTIXACT_FORMATCHANGE_CAT_VER);
+	Assert(new_cluster.controldata.cat_ver >= MULTIXACTOFFSET_FORMATCHANGE_CAT_VER);
+	if (old_cluster.controldata.cat_ver >= MULTIXACTOFFSET_FORMATCHANGE_CAT_VER)
 	{
+		/* No change in multixact format, just copy the files */
+		MultiXactId new_nxtmulti = old_cluster.controldata.chkpnt_nxtmulti;
+		MultiXactOffset new_nxtmxoff = old_cluster.controldata.chkpnt_nxtmxoff;
+
 		copy_subdir_files("pg_multixact/offsets", "pg_multixact/offsets");
 		copy_subdir_files("pg_multixact/members", "pg_multixact/members");
 
@@ -760,38 +827,67 @@ copy_xact_xlog_xid(void)
 		 * counters here and the oldest multi present on system.
 		 */
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/pg_resetwal\" -O %u -m %u,%u \"%s\"",
-				  new_cluster.bindir,
-				  old_cluster.controldata.chkpnt_nxtmxoff,
-				  old_cluster.controldata.chkpnt_nxtmulti,
+				  "\"%s/pg_resetwal\" -O %" PRIu64 " -m %u,%u \"%s\"",
+				  new_cluster.bindir, new_nxtmxoff, new_nxtmulti,
 				  old_cluster.controldata.chkpnt_oldstMulti,
 				  new_cluster.pgdata);
 		check_ok();
 	}
-	else if (new_cluster.controldata.cat_ver >= MULTIXACT_FORMATCHANGE_CAT_VER)
+	else
 	{
+		/* Conversion is needed */
+		MultiXactId nxtmulti;
+		MultiXactId oldstMulti;
+		MultiXactOffset nxtmxoff;
+
 		/*
-		 * Remove offsets/0000 file created by initdb that no longer matches
-		 * the new multi-xid value.  "members" starts at zero so no need to
-		 * remove it.
+		 * Determine the range of multixacts to convert.
 		 */
+		nxtmulti = old_cluster.controldata.chkpnt_nxtmulti;
+		if (old_cluster.controldata.cat_ver >= MULTIXACT_FORMATCHANGE_CAT_VER)
+		{
+			/* Versions 9.3 - 18: convert all multixids  */
+			oldstMulti = old_cluster.controldata.chkpnt_oldstMulti;
+		}
+		else
+		{
+			/*
+			 * In PostgreSQL 9.2 and below, multitransactions were only used
+			 * for row locking, and as such don't need to be preserved during
+			 * upgrade.  In that case, we utilize rewrite_multixacts() just to
+			 * initialize new, empty files in the new format.
+			 *
+			 * It's important that the oldest multi is set to the latest value
+			 * used by the old system, so that multixact.c returns the empty
+			 * set for multis that might be present on disk.
+			 */
+			oldstMulti = nxtmulti;
+		}
+		/* handle wraparound */
+		if (nxtmulti < FirstMultiXactId)
+			nxtmulti = FirstMultiXactId;
+		if (oldstMulti < FirstMultiXactId)
+			oldstMulti = FirstMultiXactId;
+
+		/*
+		 * Remove the files created by initdb in the new cluster.
+		 * rewrite_multixacts() will create new ones.
+		 */
+		remove_new_subdir("pg_multixact/members", false);
 		remove_new_subdir("pg_multixact/offsets", false);
 
-		prep_status("Setting oldest multixact ID in new cluster");
-
 		/*
-		 * We don't preserve files in this case, but it's important that the
-		 * oldest multi is set to the latest value used by the old system, so
-		 * that multixact.c returns the empty set for multis that might be
-		 * present on disk.  We set next multi to the value following that; it
-		 * might end up wrapped around (i.e. 0) if the old cluster had
-		 * next=MaxMultiXactId, but multixact.c can cope with that just fine.
+		 * Create new pg_multixact files, converting old ones if needed.
 		 */
+		prep_status("Converting pg_multixact files");
+		nxtmxoff = rewrite_multixacts(oldstMulti, nxtmulti);
+		check_ok();
+
+		prep_status("Setting next multixact ID and offset for new cluster");
 		exec_prog(UTILITY_LOG_FILE, NULL, true, true,
-				  "\"%s/pg_resetwal\" -m %u,%u \"%s\"",
+				  "\"%s/pg_resetwal\" -O %" PRIu64 " -m %u,%u \"%s\"",
 				  new_cluster.bindir,
-				  old_cluster.controldata.chkpnt_nxtmulti + 1,
-				  old_cluster.controldata.chkpnt_nxtmulti,
+				  nxtmxoff, nxtmulti, oldstMulti,
 				  new_cluster.pgdata);
 		check_ok();
 	}
@@ -956,11 +1052,11 @@ create_logical_replication_slots(void)
 			LogicalSlotInfo *slot_info = &slot_arr->slots[slotnum];
 
 			/* Constructs a query for creating logical replication slots */
-			appendPQExpBuffer(query,
-							  "SELECT * FROM "
-							  "pg_catalog.pg_create_logical_replication_slot(");
+			appendPQExpBufferStr(query,
+								 "SELECT * FROM "
+								 "pg_catalog.pg_create_logical_replication_slot(");
 			appendStringLiteralConn(query, slot_info->slotname, conn);
-			appendPQExpBuffer(query, ", ");
+			appendPQExpBufferStr(query, ", ");
 			appendStringLiteralConn(query, slot_info->plugin, conn);
 
 			appendPQExpBuffer(query, ", false, %s, %s);",
@@ -981,4 +1077,25 @@ create_logical_replication_slots(void)
 	check_ok();
 
 	return;
+}
+
+/*
+ * create_conflict_detection_slot()
+ *
+ * Create a replication slot to retain information necessary for conflict
+ * detection such as dead tuples, commit timestamps, and origins, for migrated
+ * subscriptions with retain_dead_tuples enabled.
+ */
+static void
+create_conflict_detection_slot(void)
+{
+	PGconn	   *conn_new_template1;
+
+	prep_status("Creating the replication conflict detection slot");
+
+	conn_new_template1 = connectToServer(&new_cluster, "template1");
+	PQclear(executeQueryOrDie(conn_new_template1, "SELECT pg_catalog.binary_upgrade_create_conflict_detection_slot()"));
+	PQfinish(conn_new_template1);
+
+	check_ok();
 }

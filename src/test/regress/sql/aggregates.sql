@@ -140,6 +140,24 @@ SELECT covar_pop(1::float8,2::float8), covar_samp(3::float8,4::float8);
 SELECT covar_pop(1::float8,'inf'::float8), covar_samp(3::float8,'inf'::float8);
 SELECT covar_pop(1::float8,'nan'::float8), covar_samp(3::float8,'nan'::float8);
 
+-- check some cases that formerly had poor roundoff-error behavior
+SELECT corr(0.09, g), regr_r2(0.09, g)
+  FROM generate_series(1, 30) g;
+SELECT corr(g, 0.09), regr_r2(g, 0.09), regr_slope(g, 0.09), regr_intercept(g, 0.09)
+  FROM generate_series(1, 30) g;
+SELECT corr(1.3 + g * 1e-16, 1.3 + g * 1e-16)
+  FROM generate_series(1, 3) g;
+SELECT corr(1e-100 + g * 1e-105, 1e-100 + g * 1e-105)
+  FROM generate_series(1, 3) g;
+SELECT corr(1e-100 + g * 1e-105, 1e-100 + g * 1e-105)
+  FROM generate_series(1, 30) g;
+
+-- these examples pose definitional questions for NaN inputs,
+-- which we resolve by saying that an all-NaN input column is not all equal
+SELECT corr(g, 'NaN') FROM generate_series(1, 30) g;
+SELECT corr(0.1, 'NaN') FROM generate_series(1, 30) g;
+SELECT corr('NaN', 'NaN') FROM generate_series(1, 30) g;
+
 -- test accum and combine functions directly
 CREATE TABLE regr_test (x float8, y float8);
 INSERT INTO regr_test VALUES (10,150),(20,250),(30,350),(80,540),(100,200);
@@ -148,7 +166,7 @@ FROM regr_test WHERE x IN (10,20,30,80);
 SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
 FROM regr_test;
 SELECT float8_accum('{4,140,2900}'::float8[], 100);
-SELECT float8_regr_accum('{4,140,2900,1290,83075,15050}'::float8[], 200, 100);
+SELECT float8_regr_accum('{4,140,2900,1290,83075,15050,100,0}'::float8[], 200, 100);
 SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
 FROM regr_test WHERE x IN (10,20,30);
 SELECT count(*), sum(x), regr_sxx(y,x), sum(y),regr_syy(y,x), regr_sxy(y,x)
@@ -156,12 +174,12 @@ FROM regr_test WHERE x IN (80,100);
 SELECT float8_combine('{3,60,200}'::float8[], '{0,0,0}'::float8[]);
 SELECT float8_combine('{0,0,0}'::float8[], '{2,180,200}'::float8[]);
 SELECT float8_combine('{3,60,200}'::float8[], '{2,180,200}'::float8[]);
-SELECT float8_regr_combine('{3,60,200,750,20000,2000}'::float8[],
-                           '{0,0,0,0,0,0}'::float8[]);
-SELECT float8_regr_combine('{0,0,0,0,0,0}'::float8[],
-                           '{2,180,200,740,57800,-3400}'::float8[]);
-SELECT float8_regr_combine('{3,60,200,750,20000,2000}'::float8[],
-                           '{2,180,200,740,57800,-3400}'::float8[]);
+SELECT float8_regr_combine('{3,60,200,750,20000,2000,1,NaN}'::float8[],
+                           '{0,0,0,0,0,0,0,0}'::float8[]);
+SELECT float8_regr_combine('{0,0,0,0,0,0,0,0}'::float8[],
+                           '{2,180,200,740,57800,-3400,NaN,1}'::float8[]);
+SELECT float8_regr_combine('{3,60,200,750,20000,2000,7,8}'::float8[],
+                           '{2,180,200,740,57800,-3400,7,9}'::float8[]);
 DROP TABLE regr_test;
 
 -- test count, distinct
@@ -181,6 +199,11 @@ SELECT newcnt(four) AS cnt_1000 FROM onek;
 SELECT newcnt(*) AS cnt_1000 FROM onek;
 SELECT oldcnt(*) AS cnt_1000 FROM onek;
 SELECT sum2(q1,q2) FROM int8_tbl;
+
+-- sanity checks
+SELECT sum(q1+q2), sum(q1)+sum(q2) FROM int8_tbl;
+SELECT sum(q1-q2), sum(q2-q1), sum(q1)-sum(q2) FROM int8_tbl;
+SELECT sum(q1*2000), sum(-q1*2000), 2000*sum(q1) FROM int8_tbl;
 
 -- test for outer-level aggregates
 
@@ -222,6 +245,16 @@ select array(select sum(x+y) s
 select array(select sum(x+y) s
             from generate_series(1,3) y group by y order by s)
   from generate_series(1,3) x;
+
+-- Test handling of grouping-expression references within sublinks
+
+select two + four as g, (select f1 from int4_tbl where f1 = (two + four))
+from tenk1 t1
+group by two + four order by 1;
+
+select q1, (select q1) as ss  -- q1 is actually a COALESCE expression here
+from int8_tbl i81 full outer join int8_tbl i82 using (q1)
+group by q1 order by q1;
 
 --
 -- test for bitwise integer aggregates
@@ -411,10 +444,15 @@ explain (costs off)
   select max(unique2), generate_series(1,3) as g from tenk1 order by g desc;
 select max(unique2), generate_series(1,3) as g from tenk1 order by g desc;
 
--- interesting corner case: constant gets optimized into a seqscan
+-- two interesting corner cases: both non-null and null constant gets
+-- optimized into a seqscan
 explain (costs off)
   select max(100) from tenk1;
 select max(100) from tenk1;
+
+explain (costs off)
+  select max(null) from tenk1;
+select max(null) from tenk1;
 
 -- try it on an inheritance tree
 create table minmaxtest(f1 int);
@@ -507,10 +545,96 @@ create temp table p_t1_2 partition of p_t1 for values in(2);
 -- Ensure we can remove non-PK columns for partitioned tables.
 explain (costs off) select * from p_t1 group by a,b,c,d;
 
+create unique index t2_z_uidx on t2(z);
+
+-- Ensure we don't remove any columns from the GROUP BY for a unique
+-- index on a NULLable column.
+explain (costs off) select y,z from t2 group by y,z;
+
+-- Make the column NOT NULL and ensure we remove the redundant column
+alter table t2 alter column z set not null;
+explain (costs off) select y,z from t2 group by y,z;
+
+-- When there are multiple supporting unique indexes and the GROUP BY contains
+-- columns to cover all of those, ensure we pick the index with the least
+-- number of columns so that we can remove more columns from the GROUP BY.
+explain (costs off) select x,y,z from t2 group by x,y,z;
+
+-- As above but try ordering the columns differently to ensure we get the
+-- same result.
+explain (costs off) select x,y,z from t2 group by z,x,y;
+
+-- Ensure we don't use a partial index as proof of functional dependency
+drop index t2_z_uidx;
+create index t2_z_uidx on t2 (z) where z > 0;
+explain (costs off) select y,z from t2 group by y,z;
+
+-- A unique index defined as NULLS NOT DISTINCT does not need a supporting NOT
+-- NULL constraint on the indexed columns.  Ensure the redundant columns are
+-- removed from the GROUP BY for such a table.
+drop index t2_z_uidx;
+alter table t2 alter column z drop not null;
+create unique index t2_z_uidx on t2(z) nulls not distinct;
+explain (costs off) select y,z from t2 group by y,z;
+
 drop table t1 cascade;
 drop table t2;
 drop table t3;
 drop table p_t1;
+
+--
+-- Test GROUP BY ALL
+--
+-- We don't care about the data here, just the proper transformation of the
+-- GROUP BY clause, so test some queries and verify the EXPLAIN plans.
+--
+
+CREATE TEMP TABLE t1 (
+  a int,
+  b int,
+  c int
+);
+
+-- basic example
+EXPLAIN (COSTS OFF) SELECT b, COUNT(*) FROM t1 GROUP BY ALL;
+
+-- multiple columns, non-consecutive order
+EXPLAIN (COSTS OFF) SELECT a, SUM(b), b FROM t1 GROUP BY ALL;
+
+-- multi columns, no aggregate
+EXPLAIN (COSTS OFF) SELECT a + b FROM t1 GROUP BY ALL;
+
+-- check we detect a non-top-level aggregate
+EXPLAIN (COSTS OFF) SELECT a, SUM(b) + 4 FROM t1 GROUP BY ALL;
+
+-- including grouped column is okay
+EXPLAIN (COSTS OFF) SELECT a, SUM(b) + a FROM t1 GROUP BY ALL;
+
+-- including non-grouped column, not so much
+EXPLAIN (COSTS OFF) SELECT a, SUM(b) + c FROM t1 GROUP BY ALL;
+
+-- all aggregates, should reduce to GROUP BY ()
+EXPLAIN (COSTS OFF) SELECT COUNT(a), SUM(b) FROM t1 GROUP BY ALL;
+
+-- likewise with empty target list
+EXPLAIN (COSTS OFF) SELECT FROM t1 GROUP BY ALL;
+
+-- window functions are not to be included in GROUP BY, either
+EXPLAIN (COSTS OFF) SELECT a, COUNT(a) OVER (PARTITION BY a) FROM t1 GROUP BY ALL;
+
+-- all cols
+EXPLAIN (COSTS OFF) SELECT *, count(*) FROM t1 GROUP BY ALL;
+
+-- group by all with grouping element(s) (equivalent to GROUP BY's
+-- default behavior, explicit antithesis to GROUP BY DISTINCT)
+EXPLAIN (COSTS OFF) SELECT a, count(*) FROM t1 GROUP BY ALL a;
+
+-- verify deparsing of GROUP BY ALL
+CREATE TEMP VIEW v1 AS SELECT b, COUNT(*) FROM t1 GROUP BY ALL;
+SELECT pg_get_viewdef('v1'::regclass);
+
+DROP VIEW v1;
+DROP TABLE t1;
 
 --
 -- Test GROUP BY matching of join columns that are type-coerced due to USING
@@ -535,6 +659,12 @@ select f2, count(*) from
 t1 x(x0,x1) left join (t1 left join t2 using(f2)) on (x0 = 0)
 group by f2;
 
+-- check that we preserve join alias in GROUP BY expressions
+create temp view v1 as
+select f1::int from t1 left join t2 using (f1) group by f1;
+select pg_get_viewdef('v1'::regclass);
+
+drop view v1;
 drop table t1, t2;
 
 --
@@ -600,6 +730,25 @@ set enable_presorted_aggregate to off;
 explain (costs off)
 select sum(two order by two) from tenk1;
 reset enable_presorted_aggregate;
+
+--
+-- Test cases with FILTER clause
+--
+
+-- Ensure we presort when the aggregate contains plain Vars
+explain (costs off)
+select sum(two order by two) filter (where two > 1) from tenk1;
+
+-- Ensure we presort for RelabelType'd Vars
+explain (costs off)
+select string_agg(distinct f1, ',') filter (where length(f1) > 1)
+from varchar_tbl;
+
+-- Ensure we don't presort when the aggregate's argument contains an
+-- explicit cast.
+explain (costs off)
+select string_agg(distinct f1::varchar(2), ',') filter (where length(f1) > 1)
+from varchar_tbl;
 
 --
 -- Test combinations of DISTINCT and/or ORDER BY
@@ -820,10 +969,15 @@ select * from v_pagg_test order by y;
 -- Ensure parallel aggregation is actually being used.
 explain (costs off) select * from v_pagg_test order by y;
 
-set max_parallel_workers_per_gather = 0;
-
 -- Ensure results are the same without parallel aggregation.
+set max_parallel_workers_per_gather = 0;
 select * from v_pagg_test order by y;
+
+-- Check that we don't fail on anonymous record types.
+set max_parallel_workers_per_gather = 2;
+explain (costs off)
+select array_dims(array_agg(s)) from (select * from pagg_test) s;
+select array_dims(array_agg(s)) from (select * from pagg_test) s;
 
 -- Clean up
 reset max_parallel_workers_per_gather;
@@ -992,6 +1146,43 @@ select cleast_agg(q1,q2) from int8_tbl;
 select cleast_agg(4.5,f1) from int4_tbl;
 select cleast_agg(variadic array[4.5,f1]) from int4_tbl;
 select pg_typeof(cleast_agg(variadic array[4.5,f1])) from int4_tbl;
+
+--
+-- Test SupportRequestSimplifyAggref code
+--
+begin;
+create table agg_simplify (a int, not_null_col int not null, nullable_col int);
+
+-- Ensure count(not_null_col) uses count(*)
+explain (costs off, verbose)
+select count(not_null_col) from agg_simplify;
+
+-- Ensure count(<not null const>) uses count(*)
+explain (costs off, verbose)
+select count('bananas') from agg_simplify;
+
+-- Ensure count(null) isn't optimized
+explain (costs off, verbose)
+select count(null) from agg_simplify;
+
+-- Ensure count(nullable_col) does not use count(*)
+explain (costs off, verbose)
+select count(nullable_col) from agg_simplify;
+
+-- Ensure there's no optimization with DISTINCT aggs
+explain (costs off, verbose)
+select count(distinct not_null_col) from agg_simplify;
+
+-- Ensure there's no optimization with ORDER BY aggs
+explain (costs off, verbose)
+select count(not_null_col order by not_null_col) from agg_simplify;
+
+-- Ensure we don't optimize to count(*) with agglevelsup > 0
+explain (costs off, verbose)
+select a from agg_simplify a group by a
+having exists (select 1 from onek b where count(a.not_null_col) = b.four);
+
+rollback;
 
 -- test aggregates with common transition functions share the same states
 begin work;
@@ -1448,15 +1639,6 @@ select v||'a', case v||'a' when 'aa' then 1 else 0 end, count(*)
 select v||'a', case when v||'a' = 'aa' then 1 else 0 end, count(*)
   from unnest(array['a','b']) u(v)
  group by v||'a' order by 1;
-
--- Make sure that generation of HashAggregate for uniqification purposes
--- does not lead to array overflow due to unexpected duplicate hash keys
--- see CAFeeJoKKu0u+A_A9R9316djW-YW3-+Gtgvy3ju655qRHR3jtdA@mail.gmail.com
-set enable_memoize to off;
-explain (costs off)
-  select 1 from tenk1
-   where (hundred, thousand) in (select twothousand, twothousand from onek);
-reset enable_memoize;
 
 --
 -- Hash Aggregation Spill tests

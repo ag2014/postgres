@@ -3,7 +3,7 @@
  * visibilitymap.c
  *	  bitmap for tracking visibility of heap tuples
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,7 +14,8 @@
  *		visibilitymap_clear  - clear bits for one page in the visibility map
  *		visibilitymap_pin	 - pin a map page for setting a bit
  *		visibilitymap_pin_ok - check whether correct map page is already pinned
- *		visibilitymap_set	 - set a bit in a previously pinned page
+ *		visibilitymap_set	 - set bit(s) in a previously pinned page and log
+ *		visibilitymap_set_vmbits - set bit(s) in a pinned page
  *		visibilitymap_get_status - get status of bits
  *		visibilitymap_count  - count number of bits set in visibility map
  *		visibilitymap_prepare_truncate -
@@ -115,6 +116,8 @@
 
 /* Mapping from heap block number to the right bit in the visibility map */
 #define HEAPBLK_TO_MAPBLOCK(x) ((x) / HEAPBLOCKS_PER_PAGE)
+#define HEAPBLK_TO_MAPBLOCK_LIMIT(x) \
+	(((x) + HEAPBLOCKS_PER_PAGE - 1) / HEAPBLOCKS_PER_PAGE)
 #define HEAPBLK_TO_MAPBYTE(x) (((x) % HEAPBLOCKS_PER_PAGE) / HEAPBLOCKS_PER_BYTE)
 #define HEAPBLK_TO_OFFSET(x) (((x) % HEAPBLOCKS_PER_BYTE) * BITS_PER_HEAPBLOCK)
 
@@ -250,13 +253,15 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 	uint8		mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
 	Page		page;
 	uint8	   *map;
+	uint8		status;
 
 #ifdef TRACE_VISIBILITYMAP
-	elog(DEBUG1, "vm_set %s %d", RelationGetRelationName(rel), heapBlk);
+	elog(DEBUG1, "vm_set flags 0x%02X for %s %d",
+		 flags, RelationGetRelationName(rel), heapBlk);
 #endif
 
-	Assert(InRecovery || XLogRecPtrIsInvalid(recptr));
-	Assert(InRecovery || PageIsAllVisible((Page) BufferGetPage(heapBuf)));
+	Assert(InRecovery || !XLogRecPtrIsValid(recptr));
+	Assert(InRecovery || PageIsAllVisible(BufferGetPage(heapBuf)));
 	Assert((flags & VISIBILITYMAP_VALID_BITS) == flags);
 
 	/* Must never set all_frozen bit without also setting all_visible bit */
@@ -266,6 +271,9 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 	if (BufferIsValid(heapBuf) && BufferGetBlockNumber(heapBuf) != heapBlk)
 		elog(ERROR, "wrong heap buffer passed to visibilitymap_set");
 
+	Assert(!BufferIsValid(heapBuf) ||
+		   BufferIsLockedByMeInMode(heapBuf, BUFFER_LOCK_EXCLUSIVE));
+
 	/* Check that we have the right VM page pinned */
 	if (!BufferIsValid(vmBuf) || BufferGetBlockNumber(vmBuf) != mapBlock)
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
@@ -274,7 +282,8 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 	map = (uint8 *) PageGetContents(page);
 	LockBuffer(vmBuf, BUFFER_LOCK_EXCLUSIVE);
 
-	if (flags != (map[mapByte] >> mapOffset & VISIBILITYMAP_VALID_BITS))
+	status = (map[mapByte] >> mapOffset) & VISIBILITYMAP_VALID_BITS;
+	if (flags != status)
 	{
 		START_CRIT_SECTION();
 
@@ -283,7 +292,7 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 
 		if (RelationNeedsWAL(rel))
 		{
-			if (XLogRecPtrIsInvalid(recptr))
+			if (!XLogRecPtrIsValid(recptr))
 			{
 				Assert(!InRecovery);
 				recptr = log_heap_visible(rel, heapBuf, vmBuf, cutoff_xid, flags);
@@ -311,6 +320,71 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 	}
 
 	LockBuffer(vmBuf, BUFFER_LOCK_UNLOCK);
+}
+
+/*
+ * Set VM (visibility map) flags in the VM block in vmBuf.
+ *
+ * This function is intended for callers that log VM changes together
+ * with the heap page modifications that rendered the page all-visible.
+ * Callers that log VM changes separately should use visibilitymap_set().
+ *
+ * vmBuf must be pinned and exclusively locked, and it must cover the VM bits
+ * corresponding to heapBlk.
+ *
+ * In normal operation (not recovery), this must be called inside a critical
+ * section that also applies the necessary heap page changes and, if
+ * applicable, emits WAL.
+ *
+ * The caller is responsible for ensuring consistency between the heap page
+ * and the VM page by holding a pin and exclusive lock on the buffer
+ * containing heapBlk.
+ *
+ * rlocator is used only for debugging messages.
+ */
+void
+visibilitymap_set_vmbits(BlockNumber heapBlk,
+						 Buffer vmBuf, uint8 flags,
+						 const RelFileLocator rlocator)
+{
+	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+	uint32		mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
+	uint8		mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
+	Page		page;
+	uint8	   *map;
+	uint8		status;
+
+#ifdef TRACE_VISIBILITYMAP
+	elog(DEBUG1, "vm_set flags 0x%02X for %s %d",
+		 flags,
+		 relpathbackend(rlocator, MyProcNumber, MAIN_FORKNUM).str,
+		 heapBlk);
+#endif
+
+	/* Call in same critical section where WAL is emitted. */
+	Assert(InRecovery || CritSectionCount > 0);
+
+	/* Flags should be valid. Also never clear bits with this function */
+	Assert((flags & VISIBILITYMAP_VALID_BITS) == flags);
+
+	/* Must never set all_frozen bit without also setting all_visible bit */
+	Assert(flags != VISIBILITYMAP_ALL_FROZEN);
+
+	/* Check that we have the right VM page pinned */
+	if (!BufferIsValid(vmBuf) || BufferGetBlockNumber(vmBuf) != mapBlock)
+		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
+
+	Assert(BufferIsLockedByMeInMode(vmBuf, BUFFER_LOCK_EXCLUSIVE));
+
+	page = BufferGetPage(vmBuf);
+	map = (uint8 *) PageGetContents(page);
+
+	status = (map[mapByte] >> mapOffset) & VISIBILITYMAP_VALID_BITS;
+	if (flags != status)
+	{
+		map[mapByte] |= (flags << mapOffset);
+		MarkBufferDirty(vmBuf);
+	}
 }
 
 /*
@@ -359,7 +433,7 @@ visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	{
 		*vmbuf = vm_readbuf(rel, mapBlock, false);
 		if (!BufferIsValid(*vmbuf))
-			return false;
+			return (uint8) 0;
 	}
 
 	map = PageGetContents(BufferGetPage(*vmbuf));
@@ -526,6 +600,21 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 	}
 
 	return newnblocks;
+}
+
+/*
+ *	visibilitymap_truncation_length -
+ *			compute truncation length for visibility map
+ *
+ * Given a proposed truncation length for the main fork, compute the
+ * correct truncation length for the visibility map. Should return the
+ * same answer as visibilitymap_prepare_truncate(), but without modifying
+ * anything.
+ */
+BlockNumber
+visibilitymap_truncation_length(BlockNumber nheapblocks)
+{
+	return HEAPBLK_TO_MAPBLOCK_LIMIT(nheapblocks);
 }
 
 /*

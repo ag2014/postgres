@@ -2,15 +2,17 @@
  * gistfuncs.c
  *		Functions to investigate the content of GiST indexes
  *
- * Copyright (c) 2014-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2014-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		contrib/pageinspect/gistfuncs.c
  */
 #include "postgres.h"
 
+#include "access/genam.h"
 #include "access/gist.h"
 #include "access/htup.h"
+#include "access/htup_details.h"
 #include "access/relation.h"
 #include "catalog/pg_am_d.h"
 #include "funcapi.h"
@@ -23,6 +25,7 @@
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
 #include "utils/ruleutils.h"
+#include "utils/tuplestore.h"
 
 PG_FUNCTION_INFO_V1(gist_page_opaque_info);
 PG_FUNCTION_INFO_V1(gist_page_items);
@@ -174,7 +177,7 @@ gist_page_items_bytea(PG_FUNCTION_ARGS)
 
 		memset(nulls, 0, sizeof(nulls));
 
-		values[0] = DatumGetInt16(offset);
+		values[0] = UInt16GetDatum(offset);
 		values[1] = ItemPointerGetDatum(&itup->t_tid);
 		values[2] = Int32GetDatum((int) IndexTupleSize(itup));
 
@@ -242,8 +245,8 @@ gist_page_items(PG_FUNCTION_ARGS)
 	}
 	else
 	{
-		tupdesc = CreateTupleDescCopy(RelationGetDescr(indexRel));
-		tupdesc->natts = IndexRelationGetNumberOfKeyAttributes(indexRel);
+		tupdesc = CreateTupleDescTruncatedCopy(RelationGetDescr(indexRel),
+											   IndexRelationGetNumberOfKeyAttributes(indexRel));
 		printflags |= RULE_INDEXDEF_KEYS_ONLY;
 	}
 
@@ -281,7 +284,7 @@ gist_page_items(PG_FUNCTION_ARGS)
 
 		memset(nulls, 0, sizeof(nulls));
 
-		values[0] = DatumGetInt16(offset);
+		values[0] = UInt16GetDatum(offset);
 		values[1] = ItemPointerGetDatum(&itup->t_tid);
 		values[2] = Int32GetDatum((int) IndexTupleSize(itup));
 		values[3] = BoolGetDatum(ItemIdIsDead(id));
@@ -360,7 +363,7 @@ gist_page_items(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
 
-	relation_close(indexRel, AccessShareLock);
+	index_close(indexRel, AccessShareLock);
 
 	return (Datum) 0;
 }

@@ -4,7 +4,7 @@
  *	  OpenSSL support
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -57,6 +57,7 @@
  * include <wincrypt.h>, but some other Windows headers do.)
  */
 #include "common/openssl.h"
+#include <openssl/ssl.h>
 #include <openssl/conf.h>
 #ifdef USE_SSL_ENGINE
 #include <openssl/engine.h>
@@ -684,6 +685,50 @@ pgtls_verify_peer_name_matches_certificate_guts(PGconn *conn,
 /* See pqcomm.h comments on OpenSSL implementation of ALPN (RFC 7301) */
 static unsigned char alpn_protos[] = PG_ALPN_PROTOCOL_VECTOR;
 
+#ifdef HAVE_SSL_CTX_SET_KEYLOG_CALLBACK
+/*
+ * SSL Key Logging callback
+ *
+ * This callback lets the user store all key material to a file for debugging
+ * purposes.  The file will be written using the NSS keylog format.  LibreSSL
+ * 3.5 introduced stub function to set the callback for OpenSSL compatibility
+ * but the callback is never invoked.
+ *
+ * Error messages added to the connection object won't be printed anywhere if
+ * the connection is successful.  Errors in processing keylogging are printed
+ * to stderr to overcome this.
+ */
+static void
+SSL_CTX_keylog_cb(const SSL *ssl, const char *line)
+{
+	int			fd;
+	ssize_t		rc;
+	PGconn	   *conn = SSL_get_app_data(ssl);
+
+	if (conn == NULL)
+		return;
+
+	fd = open(conn->sslkeylogfile, O_WRONLY | O_APPEND | O_CREAT, 0600);
+
+	if (fd == -1)
+	{
+		fprintf(stderr, libpq_gettext("WARNING: could not open SSL key logging file \"%s\": %m\n"),
+				conn->sslkeylogfile);
+		return;
+	}
+
+	/* line is guaranteed by OpenSSL to be NUL terminated */
+	rc = write(fd, line, strlen(line));
+	if (rc < 0)
+		fprintf(stderr, libpq_gettext("WARNING: could not write to SSL key logging file \"%s\": %m\n"),
+				conn->sslkeylogfile);
+	else
+		rc = write(fd, "\n", 1);
+	(void) rc;					/* silence compiler warnings */
+	close(fd);
+}
+#endif
+
 /*
  *	Create per-connection SSL object, and load the client certificate,
  *	private key, and trusted CA certs.
@@ -999,6 +1044,23 @@ initialize_SSL(PGconn *conn)
 		return -1;
 	}
 	conn->ssl_in_use = true;
+
+	/*
+	 * If SSL key logging is requested, set up the callback if a compatible
+	 * version of OpenSSL is used and libpq was compiled to support it.
+	 */
+	if (conn->sslkeylogfile && strlen(conn->sslkeylogfile) > 0)
+	{
+#ifdef HAVE_SSL_CTX_SET_KEYLOG_CALLBACK
+		SSL_CTX_set_keylog_callback(SSL_context, SSL_CTX_keylog_cb);
+#else
+#ifdef LIBRESSL_VERSION_NUMBER
+		fprintf(stderr, libpq_gettext("WARNING: sslkeylogfile support requires OpenSSL\n"));
+#else
+		fprintf(stderr, libpq_gettext("WARNING: libpq was not built with sslkeylogfile support\n"));
+#endif
+#endif
+	}
 
 	/*
 	 * SSL contexts are reference counted by OpenSSL. We can free it as soon

@@ -8,7 +8,7 @@
  * objects, created by CREATE STATISTICS, but not the actual statistical data,
  * created by running ANALYZE.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_statistic_ext.h
@@ -23,13 +23,15 @@
 #define PG_STATISTIC_EXT_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_statistic_ext_d.h"
+#include "catalog/pg_statistic_ext_d.h" /* IWYU pragma: export */
 
 /* ----------------
  *		pg_statistic_ext definition.  cpp turns this into
  *		typedef struct FormData_pg_statistic_ext
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_statistic_ext,3381,StatisticExtRelationId)
 {
 	Oid			oid;			/* oid */
@@ -60,6 +62,8 @@ CATALOG(pg_statistic_ext,3381,StatisticExtRelationId)
 #endif
 
 } FormData_pg_statistic_ext;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_statistic_ext corresponds to a pointer to a tuple with

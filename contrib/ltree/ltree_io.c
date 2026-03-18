@@ -54,7 +54,7 @@ parse_ltree(const char *buf, struct Node *escontext)
 	ptr = buf;
 	while (*ptr)
 	{
-		charlen = pg_mblen(ptr);
+		charlen = pg_mblen_cstr(ptr);
 		if (t_iseq(ptr, '.'))
 			num++;
 		ptr += charlen;
@@ -65,11 +65,11 @@ parse_ltree(const char *buf, struct Node *escontext)
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("number of ltree labels (%d) exceeds the maximum allowed (%d)",
 						num + 1, LTREE_MAX_LEVELS)));
-	list = lptr = (nodeitem *) palloc(sizeof(nodeitem) * (num + 1));
+	list = lptr = palloc_array(nodeitem, num + 1);
 	ptr = buf;
 	while (*ptr)
 	{
-		charlen = pg_mblen(ptr);
+		charlen = pg_mblen_cstr(ptr);
 
 		switch (state)
 		{
@@ -291,7 +291,7 @@ parse_lquery(const char *buf, struct Node *escontext)
 	ptr = buf;
 	while (*ptr)
 	{
-		charlen = pg_mblen(ptr);
+		charlen = pg_mblen_cstr(ptr);
 
 		if (t_iseq(ptr, '.'))
 			num++;
@@ -311,21 +311,21 @@ parse_lquery(const char *buf, struct Node *escontext)
 	ptr = buf;
 	while (*ptr)
 	{
-		charlen = pg_mblen(ptr);
+		charlen = pg_mblen_cstr(ptr);
 
 		switch (state)
 		{
 			case LQPRS_WAITLEVEL:
 				if (ISLABEL(ptr))
 				{
-					GETVAR(curqlevel) = lptr = (nodeitem *) palloc0(sizeof(nodeitem) * (numOR + 1));
+					GETVAR(curqlevel) = lptr = palloc0_array(nodeitem, numOR + 1);
 					lptr->start = ptr;
 					state = LQPRS_WAITDELIM;
 					curqlevel->numvar = 1;
 				}
 				else if (t_iseq(ptr, '!'))
 				{
-					GETVAR(curqlevel) = lptr = (nodeitem *) palloc0(sizeof(nodeitem) * (numOR + 1));
+					GETVAR(curqlevel) = lptr = palloc0_array(nodeitem, numOR + 1);
 					lptr->start = ptr + 1;
 					lptr->wlen = -1;	/* compensate for counting ! below */
 					state = LQPRS_WAITDELIM;
@@ -411,7 +411,7 @@ parse_lquery(const char *buf, struct Node *escontext)
 			case LQPRS_WAITFNUM:
 				if (t_iseq(ptr, ','))
 					state = LQPRS_WAITSNUM;
-				else if (t_isdigit(ptr))
+				else if (isdigit((unsigned char) *ptr))
 				{
 					int			low = atoi(ptr);
 
@@ -429,7 +429,7 @@ parse_lquery(const char *buf, struct Node *escontext)
 					UNCHAR;
 				break;
 			case LQPRS_WAITSNUM:
-				if (t_isdigit(ptr))
+				if (isdigit((unsigned char) *ptr))
 				{
 					int			high = atoi(ptr);
 
@@ -460,7 +460,7 @@ parse_lquery(const char *buf, struct Node *escontext)
 			case LQPRS_WAITCLOSE:
 				if (t_iseq(ptr, '}'))
 					state = LQPRS_WAITEND;
-				else if (!t_isdigit(ptr))
+				else if (!isdigit((unsigned char) *ptr))
 					UNCHAR;
 				break;
 			case LQPRS_WAITND:
@@ -471,7 +471,7 @@ parse_lquery(const char *buf, struct Node *escontext)
 				}
 				else if (t_iseq(ptr, ','))
 					state = LQPRS_WAITSNUM;
-				else if (!t_isdigit(ptr))
+				else if (!isdigit((unsigned char) *ptr))
 					UNCHAR;
 				break;
 			case LQPRS_WAITEND:

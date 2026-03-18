@@ -4,7 +4,7 @@
  *	  BTree-specific page management code for the Postgres btree access
  *	  method.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -33,6 +33,7 @@
 #include "storage/indexfsm.h"
 #include "storage/predicate.h"
 #include "storage/procarray.h"
+#include "utils/injection_point.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -234,6 +235,7 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
 	Buffer		metabuf;
 	Page		metapg;
 	BTMetaPageData *metad;
+	XLogRecPtr	recptr;
 
 	/*
 	 * On-disk compatibility note: The btm_last_cleanup_num_delpages metapage
@@ -285,7 +287,6 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
 	if (RelationNeedsWAL(rel))
 	{
 		xl_btree_metadata md;
-		XLogRecPtr	recptr;
 
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, metabuf, REGBUF_WILL_INIT | REGBUF_STANDARD);
@@ -299,12 +300,14 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
 		md.last_cleanup_num_delpages = num_delpages;
 		md.allequalimage = metad->btm_allequalimage;
 
-		XLogRegisterBufData(0, (char *) &md, sizeof(xl_btree_metadata));
+		XLogRegisterBufData(0, &md, sizeof(xl_btree_metadata));
 
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_META_CLEANUP);
-
-		PageSetLSN(metapg, recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(metapg, recptr);
 
 	END_CRIT_SECTION();
 
@@ -350,6 +353,7 @@ _bt_getroot(Relation rel, Relation heaprel, int access)
 	BlockNumber rootblkno;
 	uint32		rootlevel;
 	BTMetaPageData *metad;
+	XLogRecPtr	recptr;
 
 	Assert(access == BT_READ || heaprel != NULL);
 
@@ -472,7 +476,6 @@ _bt_getroot(Relation rel, Relation heaprel, int access)
 		if (RelationNeedsWAL(rel))
 		{
 			xl_btree_newroot xlrec;
-			XLogRecPtr	recptr;
 			xl_btree_metadata md;
 
 			XLogBeginInsert();
@@ -488,18 +491,20 @@ _bt_getroot(Relation rel, Relation heaprel, int access)
 			md.last_cleanup_num_delpages = 0;
 			md.allequalimage = metad->btm_allequalimage;
 
-			XLogRegisterBufData(2, (char *) &md, sizeof(xl_btree_metadata));
+			XLogRegisterBufData(2, &md, sizeof(xl_btree_metadata));
 
 			xlrec.rootblk = rootblkno;
 			xlrec.level = 0;
 
-			XLogRegisterData((char *) &xlrec, SizeOfBtreeNewroot);
+			XLogRegisterData(&xlrec, SizeOfBtreeNewroot);
 
 			recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_NEWROOT);
-
-			PageSetLSN(rootpage, recptr);
-			PageSetLSN(metapg, recptr);
 		}
+		else
+			recptr = XLogGetFakeLSN(rel);
+
+		PageSetLSN(rootpage, recptr);
+		PageSetLSN(metapg, recptr);
 
 		END_CRIT_SECTION();
 
@@ -948,7 +953,7 @@ _bt_allocbuf(Relation rel, Relation heaprel)
 						RelationIsAccessibleInLogicalDecoding(heaprel);
 
 					XLogBeginInsert();
-					XLogRegisterData((char *) &xlrec_reuse, SizeOfBtreeReusePage);
+					XLogRegisterData(&xlrec_reuse, SizeOfBtreeReusePage);
 
 					XLogInsert(RM_BTREE_ID, XLOG_BTREE_REUSE_PAGE);
 				}
@@ -1161,6 +1166,7 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 	char	   *updatedbuf = NULL;
 	Size		updatedbuflen = 0;
 	OffsetNumber updatedoffsets[MaxIndexTuplesPerPage];
+	XLogRecPtr	recptr;
 
 	/* Shouldn't be called unless there's something to do */
 	Assert(ndeletable > 0 || nupdatable > 0);
@@ -1194,8 +1200,7 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 
 		itup = updatable[i]->itup;
 		itemsz = MAXALIGN(IndexTupleSize(itup));
-		if (!PageIndexTupleOverwrite(page, updatedoffset, (Item) itup,
-									 itemsz))
+		if (!PageIndexTupleOverwrite(page, updatedoffset, itup, itemsz))
 			elog(PANIC, "failed to update partially dead item in block %u of index \"%s\"",
 				 BufferGetBlockNumber(buf), RelationGetRelationName(rel));
 	}
@@ -1226,7 +1231,6 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 	/* XLOG stuff */
 	if (needswal)
 	{
-		XLogRecPtr	recptr;
 		xl_btree_vacuum xlrec_vacuum;
 
 		xlrec_vacuum.ndeleted = ndeletable;
@@ -1234,23 +1238,25 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
-		XLogRegisterData((char *) &xlrec_vacuum, SizeOfBtreeVacuum);
+		XLogRegisterData(&xlrec_vacuum, SizeOfBtreeVacuum);
 
 		if (ndeletable > 0)
-			XLogRegisterBufData(0, (char *) deletable,
+			XLogRegisterBufData(0, deletable,
 								ndeletable * sizeof(OffsetNumber));
 
 		if (nupdatable > 0)
 		{
-			XLogRegisterBufData(0, (char *) updatedoffsets,
+			XLogRegisterBufData(0, updatedoffsets,
 								nupdatable * sizeof(OffsetNumber));
 			XLogRegisterBufData(0, updatedbuf, updatedbuflen);
 		}
 
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_VACUUM);
-
-		PageSetLSN(page, recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(page, recptr);
 
 	END_CRIT_SECTION();
 
@@ -1292,6 +1298,7 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 	char	   *updatedbuf = NULL;
 	Size		updatedbuflen = 0;
 	OffsetNumber updatedoffsets[MaxIndexTuplesPerPage];
+	XLogRecPtr	recptr;
 
 	/* Shouldn't be called unless there's something to do */
 	Assert(ndeletable > 0 || nupdatable > 0);
@@ -1314,8 +1321,7 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 
 		itup = updatable[i]->itup;
 		itemsz = MAXALIGN(IndexTupleSize(itup));
-		if (!PageIndexTupleOverwrite(page, updatedoffset, (Item) itup,
-									 itemsz))
+		if (!PageIndexTupleOverwrite(page, updatedoffset, itup, itemsz))
 			elog(PANIC, "failed to update partially dead item in block %u of index \"%s\"",
 				 BufferGetBlockNumber(buf), RelationGetRelationName(rel));
 	}
@@ -1343,7 +1349,6 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 	/* XLOG stuff */
 	if (needswal)
 	{
-		XLogRecPtr	recptr;
 		xl_btree_delete xlrec_delete;
 
 		xlrec_delete.snapshotConflictHorizon = snapshotConflictHorizon;
@@ -1353,23 +1358,25 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
-		XLogRegisterData((char *) &xlrec_delete, SizeOfBtreeDelete);
+		XLogRegisterData(&xlrec_delete, SizeOfBtreeDelete);
 
 		if (ndeletable > 0)
-			XLogRegisterBufData(0, (char *) deletable,
+			XLogRegisterBufData(0, deletable,
 								ndeletable * sizeof(OffsetNumber));
 
 		if (nupdatable > 0)
 		{
-			XLogRegisterBufData(0, (char *) updatedoffsets,
+			XLogRegisterBufData(0, updatedoffsets,
 								nupdatable * sizeof(OffsetNumber));
 			XLogRegisterBufData(0, updatedbuf, updatedbuflen);
 		}
 
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_DELETE);
-
-		PageSetLSN(page, recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(page, recptr);
 
 	END_CRIT_SECTION();
 
@@ -1463,8 +1470,8 @@ _bt_delitems_update(BTVacuumPosting *updatable, int nupdatable,
 static int
 _bt_delitems_cmp(const void *a, const void *b)
 {
-	TM_IndexDelete *indexdelete1 = (TM_IndexDelete *) a;
-	TM_IndexDelete *indexdelete2 = (TM_IndexDelete *) b;
+	const TM_IndexDelete *indexdelete1 = a;
+	const TM_IndexDelete *indexdelete2 = b;
 
 	Assert(indexdelete1->id != indexdelete2->id);
 
@@ -1967,7 +1974,7 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
 				/* Set up a BTLessStrategyNumber-like insertion scan key */
 				itup_key->nextkey = false;
 				itup_key->backward = true;
-				stack = _bt_search(rel, NULL, itup_key, &sleafbuf, BT_READ);
+				stack = _bt_search(rel, NULL, itup_key, &sleafbuf, BT_READ, true);
 				/* won't need a second lock or pin on leafbuf */
 				_bt_relbuf(rel, sleafbuf);
 
@@ -2004,6 +2011,10 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
 				_bt_relbuf(rel, leafbuf);
 				return;
 			}
+		}
+		else
+		{
+			INJECTION_POINT("nbtree-finish-half-dead-page-vacuum", NULL);
 		}
 
 		/*
@@ -2100,6 +2111,7 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	OffsetNumber nextoffset;
 	IndexTuple	itup;
 	IndexTupleData trunctuple;
+	XLogRecPtr	recptr;
 
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
@@ -2239,8 +2251,7 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	else
 		BTreeTupleSetTopParent(&trunctuple, InvalidBlockNumber);
 
-	if (!PageIndexTupleOverwrite(page, P_HIKEY, (Item) &trunctuple,
-								 IndexTupleSize(&trunctuple)))
+	if (!PageIndexTupleOverwrite(page, P_HIKEY, &trunctuple, IndexTupleSize(&trunctuple)))
 		elog(ERROR, "could not overwrite high key in half-dead page");
 
 	/* Must mark buffers dirty before XLogInsert */
@@ -2251,7 +2262,6 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	if (RelationNeedsWAL(rel))
 	{
 		xl_btree_mark_page_halfdead xlrec;
-		XLogRecPtr	recptr;
 
 		xlrec.poffset = poffset;
 		xlrec.leafblk = leafblkno;
@@ -2269,15 +2279,17 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 		xlrec.leftblk = opaque->btpo_prev;
 		xlrec.rightblk = opaque->btpo_next;
 
-		XLogRegisterData((char *) &xlrec, SizeOfBtreeMarkPageHalfDead);
+		XLogRegisterData(&xlrec, SizeOfBtreeMarkPageHalfDead);
 
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MARK_PAGE_HALFDEAD);
-
-		page = BufferGetPage(subtreeparent);
-		PageSetLSN(page, recptr);
-		page = BufferGetPage(leafbuf);
-		PageSetLSN(page, recptr);
 	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	page = BufferGetPage(subtreeparent);
+	PageSetLSN(page, recptr);
+	page = BufferGetPage(leafbuf);
+	PageSetLSN(page, recptr);
 
 	END_CRIT_SECTION();
 
@@ -2335,6 +2347,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	uint32		targetlevel;
 	IndexTuple	leafhikey;
 	BlockNumber leaftopparent;
+	XLogRecPtr	recptr;
 
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
@@ -2351,6 +2364,8 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	leafrightsib = opaque->btpo_next;
 
 	_bt_unlockbuf(rel, leafbuf);
+
+	INJECTION_POINT("nbtree-leave-page-half-dead", NULL);
 
 	/*
 	 * Check here, as calling loops will have locks held, preventing
@@ -2672,7 +2687,6 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 		xl_btree_unlink_page xlrec;
 		xl_btree_metadata xlmeta;
 		uint8		xlinfo;
-		XLogRecPtr	recptr;
 
 		XLogBeginInsert();
 
@@ -2694,7 +2708,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 		xlrec.leafrightsib = leafrightsib;
 		xlrec.leaftopparent = leaftopparent;
 
-		XLogRegisterData((char *) &xlrec, SizeOfBtreeUnlinkPage);
+		XLogRegisterData(&xlrec, SizeOfBtreeUnlinkPage);
 
 		if (BufferIsValid(metabuf))
 		{
@@ -2709,32 +2723,32 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 			xlmeta.last_cleanup_num_delpages = metad->btm_last_cleanup_num_delpages;
 			xlmeta.allequalimage = metad->btm_allequalimage;
 
-			XLogRegisterBufData(4, (char *) &xlmeta, sizeof(xl_btree_metadata));
+			XLogRegisterBufData(4, &xlmeta, sizeof(xl_btree_metadata));
 			xlinfo = XLOG_BTREE_UNLINK_PAGE_META;
 		}
 		else
 			xlinfo = XLOG_BTREE_UNLINK_PAGE;
 
 		recptr = XLogInsert(RM_BTREE_ID, xlinfo);
+	}
+	else
+		recptr = XLogGetFakeLSN(rel);
 
-		if (BufferIsValid(metabuf))
-		{
-			PageSetLSN(metapg, recptr);
-		}
-		page = BufferGetPage(rbuf);
+	if (BufferIsValid(metabuf))
+		PageSetLSN(metapg, recptr);
+	page = BufferGetPage(rbuf);
+	PageSetLSN(page, recptr);
+	page = BufferGetPage(buf);
+	PageSetLSN(page, recptr);
+	if (BufferIsValid(lbuf))
+	{
+		page = BufferGetPage(lbuf);
 		PageSetLSN(page, recptr);
-		page = BufferGetPage(buf);
+	}
+	if (target != leafblkno)
+	{
+		page = BufferGetPage(leafbuf);
 		PageSetLSN(page, recptr);
-		if (BufferIsValid(lbuf))
-		{
-			page = BufferGetPage(lbuf);
-			PageSetLSN(page, recptr);
-		}
-		if (target != leafblkno)
-		{
-			page = BufferGetPage(leafbuf);
-			PageSetLSN(page, recptr);
-		}
 	}
 
 	END_CRIT_SECTION();
@@ -2953,7 +2967,7 @@ _bt_lock_subtree_parent(Relation rel, Relation heaprel, BlockNumber child,
 void
 _bt_pendingfsm_init(Relation rel, BTVacState *vstate, bool cleanuponly)
 {
-	int64		maxbufsize;
+	Size		maxbufsize;
 
 	/*
 	 * Don't bother with optimization in cleanup-only case -- we don't expect
@@ -2969,15 +2983,16 @@ _bt_pendingfsm_init(Relation rel, BTVacState *vstate, bool cleanuponly)
 	 * int overflow here.
 	 */
 	vstate->bufsize = 256;
-	maxbufsize = (work_mem * 1024L) / sizeof(BTPendingFSM);
-	maxbufsize = Min(maxbufsize, INT_MAX);
+	maxbufsize = (work_mem * (Size) 1024) / sizeof(BTPendingFSM);
 	maxbufsize = Min(maxbufsize, MaxAllocSize / sizeof(BTPendingFSM));
+	/* BTVacState.maxbufsize has type int */
+	maxbufsize = Min(maxbufsize, INT_MAX);
 	/* Stay sane with small work_mem */
 	maxbufsize = Max(maxbufsize, vstate->bufsize);
-	vstate->maxbufsize = maxbufsize;
+	vstate->maxbufsize = (int) maxbufsize;
 
 	/* Allocate buffer, indicate that there are currently 0 pending pages */
-	vstate->pendingpages = palloc(sizeof(BTPendingFSM) * vstate->bufsize);
+	vstate->pendingpages = palloc_array(BTPendingFSM, vstate->bufsize);
 	vstate->npendingpages = 0;
 }
 

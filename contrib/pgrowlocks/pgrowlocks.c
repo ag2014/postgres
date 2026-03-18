@@ -40,9 +40,13 @@
 #include "utils/fmgrprotos.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/tuplestore.h"
 #include "utils/varlena.h"
 
-PG_MODULE_MAGIC;
+PG_MODULE_MAGIC_EXT(
+					.name = "pgrowlocks",
+					.version = PG_VERSION
+);
 
 PG_FUNCTION_INFO_V1(pgrowlocks);
 
@@ -138,8 +142,8 @@ pgrowlocks(PG_FUNCTION_ARGS)
 		 */
 		if (htsu == TM_BeingModified)
 		{
-			values[Atnum_tid] = (char *) DirectFunctionCall1(tidout,
-															 PointerGetDatum(&tuple->t_self));
+			values[Atnum_tid] = DatumGetCString(DirectFunctionCall1(tidout,
+																	PointerGetDatum(&tuple->t_self)));
 
 			values[Atnum_xmax] = palloc(NCHARS * sizeof(char));
 			snprintf(values[Atnum_xmax], NCHARS, "%u", xmax);

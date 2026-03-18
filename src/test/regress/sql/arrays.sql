@@ -528,6 +528,10 @@ select '[2147483646:2147483646]={1}'::int[];
 select '[-2147483648:-2147483647]={1,2}'::int[];
 -- all of the above should be accepted
 
+-- some day we might allow these cases, but for now they're errors:
+select array[]::oidvector;
+select array[]::int2vector;
+
 -- tests for array aggregates
 CREATE TEMP TABLE arraggtest ( f1 INT[], f2 TEXT[][], f3 FLOAT[]);
 
@@ -555,19 +559,22 @@ SELECT max(f1), min(f1), max(f2), min(f2), max(f3), min(f3) FROM arraggtest;
 
 -- A few simple tests for arrays of composite types
 
-create type comptype as (f1 int, f2 text);
+create type comptype as (f1 int, f2 text, f3 int[]);
 
 create table comptable (c1 comptype, c2 comptype[]);
 
 -- XXX would like to not have to specify row() construct types here ...
 insert into comptable
-  values (row(1,'foo'), array[row(2,'bar')::comptype, row(3,'baz')::comptype]);
+  values (row(1,'foo',array[10,20]), array[row(2,'bar',array[30,40])::comptype, row(3,'baz',array[50,60])::comptype]);
 
 -- check that implicitly named array type _comptype isn't a problem
 create type _comptype as enum('fooey');
 
 select * from comptable;
 select c2[2].f2 from comptable;
+select c2[2].f3 from comptable;
+select c2[2].f3[1:2] from comptable;
+select c2[1:2].f3[1:2] from comptable;
 
 drop type _comptype;
 drop table comptable;
@@ -713,6 +720,28 @@ select array_replace(array['AB',NULL,'CDE'],NULL,'12');
 select array(select array[i,i/2] from generate_series(1,5) i);
 select array(select array['Hello', i::text] from generate_series(9,11) i);
 
+-- int2vector and oidvector should be treated as scalar types for this purpose
+select pg_typeof(array(select '11 22 33'::int2vector from generate_series(1,5)));
+select array(select '11 22 33'::int2vector from generate_series(1,5));
+select unnest(array(select '11 22 33'::int2vector from generate_series(1,5)));
+select pg_typeof(array(select '11 22 33'::oidvector from generate_series(1,5)));
+select array(select '11 22 33'::oidvector from generate_series(1,5));
+select unnest(array(select '11 22 33'::oidvector from generate_series(1,5)));
+
+-- array[] should do the same
+select pg_typeof(array['11 22 33'::int2vector]);
+select array['11 22 33'::int2vector];
+select pg_typeof(unnest(array['11 22 33'::int2vector]));
+select unnest(array['11 22 33'::int2vector]);
+select pg_typeof(unnest('11 22 33'::int2vector));
+select unnest('11 22 33'::int2vector);
+select pg_typeof(array['11 22 33'::oidvector]);
+select array['11 22 33'::oidvector];
+select pg_typeof(unnest(array['11 22 33'::oidvector]));
+select unnest(array['11 22 33'::oidvector]);
+select pg_typeof(unnest('11 22 33'::oidvector));
+select unnest('11 22 33'::oidvector);
+
 -- Insert/update on a column that is array of composite
 
 create temp table t1 (f1 int8_tbl[]);
@@ -834,3 +863,39 @@ SELECT array_reverse('{1}'::int[]);
 SELECT array_reverse('{1,2}'::int[]);
 SELECT array_reverse('{1,2,3,NULL,4,5,6}'::int[]);
 SELECT array_reverse('{{1,2},{3,4},{5,6},{7,8}}'::int[]);
+
+-- array_sort
+SELECT array_sort('{}'::int[]);
+SELECT array_sort('{1}'::int[]);
+SELECT array_sort('{1,3,5,2,4,6}'::int[]);
+SELECT array_sort('{1.1,3.3,5.5,2.2,4.4,6.6}'::numeric[]);
+SELECT array_sort('{foo,bar,CCC,Abc,bbc}'::text[] COLLATE "C");
+SELECT array_sort('{foo,bar,null,CCC,Abc,bbc}'::text[] COLLATE "C");
+SELECT array_sort(ARRAY(SELECT '1 4'::int2vector UNION ALL SELECT '1 2'::int2vector));
+
+-- array_sort with order specified
+SELECT array_sort('{1.1,3.3,5.5,2.2,null,4.4,6.6}'::float8[], true);
+SELECT array_sort('{1.1,3.3,5.5,2.2,null,4.4,6.6}'::float8[], false);
+
+-- array_sort with order and nullsfirst flag specified
+SELECT array_sort('{1.1,3.3,5.5,2.2,null,4.4,6.6}'::float8[], true, true);
+SELECT array_sort('{1.1,3.3,5.5,2.2,null,4.4,6.6}'::float8[], true, false);
+SELECT array_sort('{1.1,3.3,5.5,2.2,null,4.4,6.6}'::float8[], false, true);
+SELECT array_sort('{1.1,3.3,5.5,2.2,null,4.4,6.6}'::float8[], false, false);
+
+-- multidimensional array tests
+SELECT array_sort('{{1}}'::int[]);
+SELECT array_sort(ARRAY[[2,4],[2,1],[6,5]]);
+SELECT array_sort('{{"1 2","3 4"}, {"1 -2","-1 4"}}'::int2vector[]);
+
+-- no ordering operator tests
+SELECT array_sort('{1}'::xid[]);  -- no error because no sort is required
+SELECT array_sort('{1,2,3}'::xid[]);
+SELECT array_sort('{{1,2,3},{2,3,4}}'::xid[]);
+
+-- bounds preservation tests
+SELECT array_sort(a) FROM (VALUES ('[10:12][20:21]={{1,2},{10,20},{3,4}}'::int[])) v(a);
+SELECT array_sort(a) FROM (VALUES ('[-1:0]={7,1}'::int[])) v(a);
+SELECT array_sort(a) FROM (VALUES ('[-2:0][20:21]={{1,2},{10,20},{1,-4}}'::int[])) v(a);
+SELECT array_sort(a [-1:0]) FROM (VALUES ('[-2:0][20:21]={{1,2},{10,20},{1,-4}}'::int[])) v(a);
+SELECT array_sort(a [-1:0][20:20]) FROM (VALUES ('[-2:0][20:21]={{1,2},{10,20},{1,-4}}'::int[])) v(a);

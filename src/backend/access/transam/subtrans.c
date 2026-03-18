@@ -19,7 +19,7 @@
  * data across crashes.  During database startup, we simply force the
  * currently-active page of SUBTRANS to zeroes.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/subtrans.c
@@ -74,8 +74,8 @@ static SlruCtlData SubTransCtlData;
 #define SubTransCtl  (&SubTransCtlData)
 
 
-static int	ZeroSUBTRANSPage(int64 pageno);
 static bool SubTransPagePrecedes(int64 page1, int64 page2);
+static int	subtrans_errdetail_for_io_error(const void *opaque_data);
 
 
 /*
@@ -96,7 +96,7 @@ SubTransSetParent(TransactionId xid, TransactionId parent)
 	lock = SimpleLruGetBankLock(SubTransCtl, pageno);
 	LWLockAcquire(lock, LW_EXCLUSIVE);
 
-	slotno = SimpleLruReadPage(SubTransCtl, pageno, true, xid);
+	slotno = SimpleLruReadPage(SubTransCtl, pageno, true, &xid);
 	ptr = (TransactionId *) SubTransCtl->shared->page_buffer[slotno];
 	ptr += entryno;
 
@@ -136,7 +136,7 @@ SubTransGetParent(TransactionId xid)
 
 	/* lock is acquired by SimpleLruReadPage_ReadOnly */
 
-	slotno = SimpleLruReadPage_ReadOnly(SubTransCtl, pageno, xid);
+	slotno = SimpleLruReadPage_ReadOnly(SubTransCtl, pageno, &xid);
 	ptr = (TransactionId *) SubTransCtl->shared->page_buffer[slotno];
 	ptr += entryno;
 
@@ -241,6 +241,7 @@ SUBTRANSShmemInit(void)
 	Assert(subtransaction_buffers != 0);
 
 	SubTransCtl->PagePrecedes = SubTransPagePrecedes;
+	SubTransCtl->errdetail_for_io_error = subtrans_errdetail_for_io_error;
 	SimpleLruInit(SubTransCtl, "subtransaction", SUBTRANSShmemBuffers(), 0,
 				  "pg_subtrans", LWTRANCHE_SUBTRANS_BUFFER,
 				  LWTRANCHE_SUBTRANS_SLRU, SYNC_HANDLER_NONE, false);
@@ -269,33 +270,8 @@ check_subtrans_buffers(int *newval, void **extra, GucSource source)
 void
 BootStrapSUBTRANS(void)
 {
-	int			slotno;
-	LWLock	   *lock = SimpleLruGetBankLock(SubTransCtl, 0);
-
-	LWLockAcquire(lock, LW_EXCLUSIVE);
-
-	/* Create and zero the first page of the subtrans log */
-	slotno = ZeroSUBTRANSPage(0);
-
-	/* Make sure it's written out */
-	SimpleLruWritePage(SubTransCtl, slotno);
-	Assert(!SubTransCtl->shared->page_dirty[slotno]);
-
-	LWLockRelease(lock);
-}
-
-/*
- * Initialize (or reinitialize) a page of SUBTRANS to zeroes.
- *
- * The page is not actually written, just set up in shared memory.
- * The slot number of the new page is returned.
- *
- * Control lock must be held at entry, and will be held at exit.
- */
-static int
-ZeroSUBTRANSPage(int64 pageno)
-{
-	return SimpleLruZeroPage(SubTransCtl, pageno);
+	/* Zero the initial page and flush it to disk */
+	SimpleLruZeroAndWritePage(SubTransCtl, 0);
 }
 
 /*
@@ -335,7 +311,7 @@ StartupSUBTRANS(TransactionId oldestActiveXID)
 			prevlock = lock;
 		}
 
-		(void) ZeroSUBTRANSPage(startPage);
+		(void) SimpleLruZeroPage(SubTransCtl, startPage);
 		if (startPage == endPage)
 			break;
 
@@ -395,7 +371,7 @@ ExtendSUBTRANS(TransactionId newestXact)
 	LWLockAcquire(lock, LW_EXCLUSIVE);
 
 	/* Zero the page */
-	ZeroSUBTRANSPage(pageno);
+	SimpleLruZeroPage(SubTransCtl, pageno);
 
 	LWLockRelease(lock);
 }
@@ -444,4 +420,12 @@ SubTransPagePrecedes(int64 page1, int64 page2)
 
 	return (TransactionIdPrecedes(xid1, xid2) &&
 			TransactionIdPrecedes(xid1, xid2 + SUBTRANS_XACTS_PER_PAGE - 1));
+}
+
+static int
+subtrans_errdetail_for_io_error(const void *opaque_data)
+{
+	TransactionId xid = *(const TransactionId *) opaque_data;
+
+	return errdetail("Could not access subtransaction status of transaction %u.", xid);
 }

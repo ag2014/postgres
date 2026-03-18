@@ -1,5 +1,5 @@
 
-# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 =pod
 
@@ -200,7 +200,7 @@ sub configure_test_server_for_ssl
 	$node->append_conf(
 		'postgresql.conf', <<EOF
 fsync=off
-log_connections=on
+log_connections=all
 log_hostname=on
 listen_addresses='$serverhost'
 log_statement=all
@@ -244,6 +244,23 @@ sub ssl_library
 
 =pod
 
+=item $server->is_libressl()
+
+Detect whether the currently used SSL backend is LibreSSL.
+(Ideally we'd not need this hack, but presently we do.)
+
+=cut
+
+sub is_libressl
+{
+	my $self = shift;
+	my $backend = $self->{backend};
+
+	return $backend->library_is_libressl();
+}
+
+=pod
+
 =item switch_server_cert(params)
 
 Change the configuration to use the given set of certificate, key, ca and
@@ -279,6 +296,11 @@ The CRL directory to use. Implementation is SSL backend specific.
 The passphrase command to use. If not set, an empty passphrase command will
 be set.
 
+=item passphrase_cmd_reload => B<value>
+
+Whether or not to allow passphrase command reloading. If set the passphrase
+command reload configuration setting will be set to the value.
+
 =item restart => B<value>
 
 If set to 'no', the server won't be restarted after updating the settings.
@@ -298,15 +320,22 @@ sub switch_server_cert
 	my $pgdata = $node->data_dir;
 
 	ok(unlink($node->data_dir . '/sslconfig.conf'));
-	$node->append_conf('sslconfig.conf', "ssl=on");
+	$node->append_conf('sslconfig.conf', 'ssl=on');
 	$node->append_conf('sslconfig.conf', $backend->set_server_cert(\%params));
 	# use lists of ECDH curves and cipher suites for syntax testing
-	$node->append_conf('sslconfig.conf', 'ssl_groups=prime256v1:secp521r1');
-	$node->append_conf('sslconfig.conf', 'ssl_tls13_ciphers=TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256');
+	$node->append_conf('sslconfig.conf',
+		'ssl_groups=prime256v1:secp521r1');
+	$node->append_conf('sslconfig.conf',
+		'ssl_tls13_ciphers=TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256');
 
 	$node->append_conf('sslconfig.conf',
-		"ssl_passphrase_command='" . $params{passphrase_cmd} . "'")
+		'ssl_passphrase_command=\'' . $params{passphrase_cmd} . '\'')
 	  if defined $params{passphrase_cmd};
+
+	$node->append_conf('sslconfig.conf',
+		'ssl_passphrase_command_supports_reload=\''
+		  . $params{passphrase_cmd_reload} . '\'')
+	  if defined $params{passphrase_cmd_reload};
 
 	return if (defined($params{restart}) && $params{restart} eq 'no');
 

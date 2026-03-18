@@ -3,7 +3,7 @@
  * pg_proc.h
  *	  definition of the "procedure" system catalog (pg_proc)
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_proc.h
@@ -19,7 +19,7 @@
 
 #include "catalog/genbki.h"
 #include "catalog/objectaddress.h"
-#include "catalog/pg_proc_d.h"
+#include "catalog/pg_proc_d.h"	/* IWYU pragma: export */
 #include "nodes/pg_list.h"
 
 /* ----------------
@@ -27,6 +27,8 @@
  *		typedef struct FormData_pg_proc
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_proc,1255,ProcedureRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(81,ProcedureRelation_Rowtype_Id) BKI_SCHEMA_MACRO
 {
 	Oid			oid;			/* oid */
@@ -61,7 +63,7 @@ CATALOG(pg_proc,1255,ProcedureRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(81,Proce
 	/* security definer */
 	bool		prosecdef BKI_DEFAULT(f);
 
-	/* is it a leak-proof function? */
+	/* is it a leakproof function? */
 	bool		proleakproof BKI_DEFAULT(f);
 
 	/* strict with respect to NULLs? */
@@ -127,6 +129,8 @@ CATALOG(pg_proc,1255,ProcedureRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(81,Proce
 	aclitem		proacl[1] BKI_DEFAULT(_null_);
 #endif
 } FormData_pg_proc;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_proc corresponds to a pointer to a tuple with
@@ -211,6 +215,7 @@ extern ObjectAddress ProcedureCreate(const char *procedureName,
 									 Datum parameterNames,
 									 List *parameterDefaults,
 									 Datum trftypes,
+									 List *trfoids,
 									 Datum proconfig,
 									 Oid prosupport,
 									 float4 procost,

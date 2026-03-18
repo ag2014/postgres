@@ -68,11 +68,11 @@ SELECT $1, $2 \parse stmt3
 -- Multiple \g calls mean multiple executions
 \bind_named stmt2 'foo3' \g \bind_named stmt3 'foo4' 'bar4' \g
 
--- \close (extended query protocol)
-\close
-\close ''
-\close stmt2
-\close stmt2
+-- \close_prepared (extended query protocol)
+\close_prepared
+\close_prepared ''
+\close_prepared stmt2
+\close_prepared stmt2
 SELECT name, statement FROM pg_prepared_statements ORDER BY name;
 
 -- \bind (extended query protocol)
@@ -218,6 +218,22 @@ select 'drop table gexec_test', 'select ''2000-01-01''::date as party_over'
 
 -- show all pset options
 \pset
+
+-- test the simple display substitution settings
+prepare q as select null as n, true as t, false as f;
+\pset null '(null)'
+\pset display_true 'true'
+\pset display_false 'false'
+execute q;
+\pset null
+\pset display_true
+\pset display_false
+execute q;
+\pset null ''
+\pset display_true 't'
+\pset display_false 'f'
+execute q;
+deallocate q;
 
 -- test multi-line headers, wrapping, and newline indicators
 -- in aligned, unaligned, and wrapped formats
@@ -498,6 +514,7 @@ create table psql_serial_tab (id serial);
 \d psql_serial_tab_id_seq
 \pset tuples_only true
 \df exp
+\dfx exp
 \pset tuples_only false
 \pset expanded on
 \d psql_serial_tab_id_seq
@@ -560,6 +577,9 @@ CREATE MATERIALIZED VIEW mat_view_heap_psql USING heap_psql AS SELECT f1 from tb
 \dv+
 \set HIDE_TABLEAM on
 \d+
+-- \d with 'x' enables expanded mode, but only without a pattern
+\d+x tbl_heap
+\d+x
 RESET ROLE;
 RESET search_path;
 DROP SCHEMA tableam_display CASCADE;
@@ -1031,7 +1051,7 @@ select \if false \\ (bogus \else \\ 42 \endif \\ forty_two;
 	\C arg1
 	\c arg1 arg2 arg3 arg4
 	\cd arg1
-	\close stmt1
+	\close_prepared stmt1
 	\conninfo
 	\copy arg1 arg2 arg3 arg4 arg5 arg6
 	\copyright
@@ -1043,11 +1063,15 @@ select \if false \\ (bogus \else \\ 42 \endif \\ forty_two;
 	\echo arg1 arg2 arg3 arg4 arg5
 	\echo arg1
 	\encoding arg1
+	\endpipeline
 	\errverbose
 	\f arg1
+	\flush
+	\flushrequest
 	\g arg1
 	\gx arg1
 	\gexec
+	\getresults
 	SELECT 1 AS one \gset
 	\h
 	\?
@@ -1065,14 +1089,19 @@ select \if false \\ (bogus \else \\ 42 \endif \\ forty_two;
 	\pset arg1 arg2
 	\q
 	\reset
+	\restrict test
 	\s arg1
+	\sendpipeline
 	\set arg1 arg2 arg3 arg4 arg5 arg6 arg7
 	\setenv arg1 arg2
 	\sf whole_line
 	\sv whole_line
+	\startpipeline
+	\syncpipeline
 	\t arg1
 	\T arg1
 	\timing arg1
+	\unrestrict not_valid
 	\unset arg1
 	\w arg1
 	\watch arg1 arg2
@@ -1306,9 +1335,10 @@ drop role regress_partitioning_role;
 \dAc brin pg*.oid*
 \dAf spgist
 \dAf btree int4
-\dAo+ btree float_ops
+\dAo+ btree array_ops|float_ops
 \dAo * pg_catalog.jsonb_path_ops
 \dAp+ btree float_ops
+\dApx+ btree time_ops
 \dAp * pg_catalog.uuid_ops
 
 -- check \dconfig
@@ -1927,5 +1957,6 @@ ROLLBACK;
 CREATE TABLE defprivs (a int);
 \pset null '(default)'
 \z defprivs
+\zx defprivs
 \pset null ''
 DROP TABLE defprivs;

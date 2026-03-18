@@ -3,7 +3,7 @@
  * foreigncmds.c
  *	  foreign-data wrapper/server creation/manipulation commands
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -71,15 +71,26 @@ optionListToArray(List *options)
 	foreach(cell, options)
 	{
 		DefElem    *def = lfirst(cell);
+		const char *name;
 		const char *value;
 		Size		len;
 		text	   *t;
 
+		name = def->defname;
 		value = defGetString(def);
-		len = VARHDRSZ + strlen(def->defname) + 1 + strlen(value);
+
+		/* Insist that name not contain "=", else "a=b=c" is ambiguous */
+		if (strchr(name, '=') != NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid option name \"%s\": must not contain \"=\"",
+							name)));
+
+		len = VARHDRSZ + strlen(name) + 1 + strlen(value);
+		/* +1 leaves room for sprintf's trailing null */
 		t = palloc(len + 1);
 		SET_VARSIZE(t, len);
-		sprintf(VARDATA(t), "%s=%s", def->defname, value);
+		sprintf(VARDATA(t), "%s=%s", name, value);
 
 		astate = accumArrayResult(astate, PointerGetDatum(t),
 								  false, TEXTOID,
@@ -512,20 +523,52 @@ lookup_fdw_validator_func(DefElem *validator)
 }
 
 /*
+ * Convert a connection string function name passed from the parser to an Oid.
+ */
+static Oid
+lookup_fdw_connection_func(DefElem *connection)
+{
+	Oid			connectionOid;
+	Oid			funcargtypes[3];
+
+	if (connection == NULL || connection->arg == NULL)
+		return InvalidOid;
+
+	/* connection string functions take user oid, server oid */
+	funcargtypes[0] = OIDOID;
+	funcargtypes[1] = OIDOID;
+	funcargtypes[2] = INTERNALOID;
+
+	connectionOid = LookupFuncName((List *) connection->arg, 3, funcargtypes, false);
+
+	/* check that connection string function has correct return type */
+	if (get_func_rettype(connectionOid) != TEXTOID)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("function %s must return type %s",
+						NameListToString((List *) connection->arg), "text")));
+
+	return connectionOid;
+}
+
+/*
  * Process function options of CREATE/ALTER FDW
  */
 static void
 parse_func_options(ParseState *pstate, List *func_options,
 				   bool *handler_given, Oid *fdwhandler,
-				   bool *validator_given, Oid *fdwvalidator)
+				   bool *validator_given, Oid *fdwvalidator,
+				   bool *connection_given, Oid *fdwconnection)
 {
 	ListCell   *cell;
 
 	*handler_given = false;
 	*validator_given = false;
+	*connection_given = false;
 	/* return InvalidOid if not given */
 	*fdwhandler = InvalidOid;
 	*fdwvalidator = InvalidOid;
+	*fdwconnection = InvalidOid;
 
 	foreach(cell, func_options)
 	{
@@ -544,6 +587,13 @@ parse_func_options(ParseState *pstate, List *func_options,
 				errorConflictingDefElem(def, pstate);
 			*validator_given = true;
 			*fdwvalidator = lookup_fdw_validator_func(def);
+		}
+		else if (strcmp(def->defname, "connection") == 0)
+		{
+			if (*connection_given)
+				errorConflictingDefElem(def, pstate);
+			*connection_given = true;
+			*fdwconnection = lookup_fdw_connection_func(def);
 		}
 		else
 			elog(ERROR, "option \"%s\" not recognized",
@@ -564,8 +614,10 @@ CreateForeignDataWrapper(ParseState *pstate, CreateFdwStmt *stmt)
 	Oid			fdwId;
 	bool		handler_given;
 	bool		validator_given;
+	bool		connection_given;
 	Oid			fdwhandler;
 	Oid			fdwvalidator;
+	Oid			fdwconnection;
 	Datum		fdwoptions;
 	Oid			ownerId;
 	ObjectAddress myself;
@@ -609,10 +661,12 @@ CreateForeignDataWrapper(ParseState *pstate, CreateFdwStmt *stmt)
 	/* Lookup handler and validator functions, if given */
 	parse_func_options(pstate, stmt->func_options,
 					   &handler_given, &fdwhandler,
-					   &validator_given, &fdwvalidator);
+					   &validator_given, &fdwvalidator,
+					   &connection_given, &fdwconnection);
 
 	values[Anum_pg_foreign_data_wrapper_fdwhandler - 1] = ObjectIdGetDatum(fdwhandler);
 	values[Anum_pg_foreign_data_wrapper_fdwvalidator - 1] = ObjectIdGetDatum(fdwvalidator);
+	values[Anum_pg_foreign_data_wrapper_fdwconnection - 1] = ObjectIdGetDatum(fdwconnection);
 
 	nulls[Anum_pg_foreign_data_wrapper_fdwacl - 1] = true;
 
@@ -621,7 +675,7 @@ CreateForeignDataWrapper(ParseState *pstate, CreateFdwStmt *stmt)
 										 stmt->options,
 										 fdwvalidator);
 
-	if (PointerIsValid(DatumGetPointer(fdwoptions)))
+	if (DatumGetPointer(fdwoptions) != NULL)
 		values[Anum_pg_foreign_data_wrapper_fdwoptions - 1] = fdwoptions;
 	else
 		nulls[Anum_pg_foreign_data_wrapper_fdwoptions - 1] = true;
@@ -684,8 +738,10 @@ AlterForeignDataWrapper(ParseState *pstate, AlterFdwStmt *stmt)
 	Datum		datum;
 	bool		handler_given;
 	bool		validator_given;
+	bool		connection_given;
 	Oid			fdwhandler;
 	Oid			fdwvalidator;
+	Oid			fdwconnection;
 	ObjectAddress myself;
 
 	rel = table_open(ForeignDataWrapperRelationId, RowExclusiveLock);
@@ -715,7 +771,8 @@ AlterForeignDataWrapper(ParseState *pstate, AlterFdwStmt *stmt)
 
 	parse_func_options(pstate, stmt->func_options,
 					   &handler_given, &fdwhandler,
-					   &validator_given, &fdwvalidator);
+					   &validator_given, &fdwvalidator,
+					   &connection_given, &fdwconnection);
 
 	if (handler_given)
 	{
@@ -753,6 +810,12 @@ AlterForeignDataWrapper(ParseState *pstate, AlterFdwStmt *stmt)
 		fdwvalidator = fdwForm->fdwvalidator;
 	}
 
+	if (connection_given)
+	{
+		repl_val[Anum_pg_foreign_data_wrapper_fdwconnection - 1] = ObjectIdGetDatum(fdwconnection);
+		repl_repl[Anum_pg_foreign_data_wrapper_fdwconnection - 1] = true;
+	}
+
 	/*
 	 * If options specified, validate and update.
 	 */
@@ -772,7 +835,7 @@ AlterForeignDataWrapper(ParseState *pstate, AlterFdwStmt *stmt)
 										stmt->options,
 										fdwvalidator);
 
-		if (PointerIsValid(DatumGetPointer(datum)))
+		if (DatumGetPointer(datum) != NULL)
 			repl_val[Anum_pg_foreign_data_wrapper_fdwoptions - 1] = datum;
 		else
 			repl_null[Anum_pg_foreign_data_wrapper_fdwoptions - 1] = true;
@@ -932,7 +995,7 @@ CreateForeignServer(CreateForeignServerStmt *stmt)
 										 stmt->options,
 										 fdw->fdwvalidator);
 
-	if (PointerIsValid(DatumGetPointer(srvoptions)))
+	if (DatumGetPointer(srvoptions) != NULL)
 		values[Anum_pg_foreign_server_srvoptions - 1] = srvoptions;
 	else
 		nulls[Anum_pg_foreign_server_srvoptions - 1] = true;
@@ -1040,7 +1103,7 @@ AlterForeignServer(AlterForeignServerStmt *stmt)
 										stmt->options,
 										fdw->fdwvalidator);
 
-		if (PointerIsValid(DatumGetPointer(datum)))
+		if (DatumGetPointer(datum) != NULL)
 			repl_val[Anum_pg_foreign_server_srvoptions - 1] = datum;
 		else
 			repl_null[Anum_pg_foreign_server_srvoptions - 1] = true;
@@ -1176,7 +1239,7 @@ CreateUserMapping(CreateUserMappingStmt *stmt)
 										 stmt->options,
 										 fdw->fdwvalidator);
 
-	if (PointerIsValid(DatumGetPointer(useoptions)))
+	if (DatumGetPointer(useoptions) != NULL)
 		values[Anum_pg_user_mapping_umoptions - 1] = useoptions;
 	else
 		nulls[Anum_pg_user_mapping_umoptions - 1] = true;
@@ -1290,7 +1353,7 @@ AlterUserMapping(AlterUserMappingStmt *stmt)
 										stmt->options,
 										fdw->fdwvalidator);
 
-		if (PointerIsValid(DatumGetPointer(datum)))
+		if (DatumGetPointer(datum) != NULL)
 			repl_val[Anum_pg_user_mapping_umoptions - 1] = datum;
 		else
 			repl_null[Anum_pg_user_mapping_umoptions - 1] = true;
@@ -1453,7 +1516,7 @@ CreateForeignTable(CreateForeignTableStmt *stmt, Oid relid)
 										stmt->options,
 										fdw->fdwvalidator);
 
-	if (PointerIsValid(DatumGetPointer(ftoptions)))
+	if (DatumGetPointer(ftoptions) != NULL)
 		values[Anum_pg_foreign_table_ftoptions - 1] = ftoptions;
 	else
 		nulls[Anum_pg_foreign_table_ftoptions - 1] = true;
@@ -1577,6 +1640,7 @@ ImportForeignSchema(ImportForeignSchemaStmt *stmt)
 			pstmt->utilityStmt = (Node *) cstmt;
 			pstmt->stmt_location = rs->stmt_location;
 			pstmt->stmt_len = rs->stmt_len;
+			pstmt->planOrigin = PLAN_STMT_INTERNAL;
 
 			/* Execute statement */
 			ProcessUtility(pstmt, cmd, false,

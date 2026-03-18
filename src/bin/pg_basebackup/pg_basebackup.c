@@ -4,7 +4,7 @@
  *
  * Author: Magnus Hagander <magnus@hagander.net>
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/pg_basebackup.c
@@ -35,6 +35,7 @@
 #include "fe_utils/option_utils.h"
 #include "fe_utils/recovery_gen.h"
 #include "getopt_long.h"
+#include "libpq/protocol.h"
 #include "receivelog.h"
 #include "streamutil.h"
 
@@ -319,7 +320,7 @@ kill_bgchild_atexit(void)
 static void
 tablespace_list_append(const char *arg)
 {
-	TablespaceListCell *cell = (TablespaceListCell *) pg_malloc0(sizeof(TablespaceListCell));
+	TablespaceListCell *cell = pg_malloc0_object(TablespaceListCell);
 	char	   *dst;
 	char	   *dst_ptr;
 	const char *arg_ptr;
@@ -487,7 +488,7 @@ reached_end_position(XLogRecPtr segendpos, uint32 timeline,
 			if (r < 0)
 				pg_fatal("could not read from ready pipe: %m");
 
-			if (sscanf(xlogend, "%X/%X", &hi, &lo) != 2)
+			if (sscanf(xlogend, "%X/%08X", &hi, &lo) != 2)
 				pg_fatal("could not parse write-ahead log location \"%s\"",
 						 xlogend);
 			xlogendptr = ((uint64) hi) << 32 | lo;
@@ -622,14 +623,14 @@ StartLogStreamer(char *startpos, uint32 timeline, char *sysidentifier,
 				lo;
 	char		statusdir[MAXPGPATH];
 
-	param = pg_malloc0(sizeof(logstreamer_param));
+	param = pg_malloc0_object(logstreamer_param);
 	param->timeline = timeline;
 	param->sysidentifier = sysidentifier;
 	param->wal_compress_algorithm = wal_compress_algorithm;
 	param->wal_compress_level = wal_compress_level;
 
 	/* Convert the starting position */
-	if (sscanf(startpos, "%X/%X", &hi, &lo) != 2)
+	if (sscanf(startpos, "%X/%08X", &hi, &lo) != 2)
 		pg_fatal("could not parse write-ahead log location \"%s\"",
 				 startpos);
 	param->startptr = ((uint64) hi) << 32 | lo;
@@ -667,7 +668,8 @@ StartLogStreamer(char *startpos, uint32 timeline, char *sysidentifier,
 	if (temp_replication_slot || create_slot)
 	{
 		if (!CreateReplicationSlot(param->bgconn, replication_slot, NULL,
-								   temp_replication_slot, true, true, false, false))
+								   temp_replication_slot, true, true, false,
+								   false, false))
 			exit(1);
 
 		if (verbose)
@@ -1337,7 +1339,7 @@ ReceiveArchiveStreamChunk(size_t r, char *copybuf, void *callback_data)
 	/* Each CopyData message begins with a type byte. */
 	switch (GetCopyDataByte(r, copybuf, &cursor))
 	{
-		case 'n':
+		case PqBackupMsg_NewArchive:
 			{
 				/* New archive. */
 				char	   *archive_name;
@@ -1409,7 +1411,7 @@ ReceiveArchiveStreamChunk(size_t r, char *copybuf, void *callback_data)
 				break;
 			}
 
-		case 'd':
+		case PqMsg_CopyData:
 			{
 				/* Archive or manifest data. */
 				if (state->manifest_buffer != NULL)
@@ -1445,7 +1447,7 @@ ReceiveArchiveStreamChunk(size_t r, char *copybuf, void *callback_data)
 				break;
 			}
 
-		case 'p':
+		case PqBackupMsg_ProgressReport:
 			{
 				/*
 				 * Progress report.
@@ -1464,7 +1466,7 @@ ReceiveArchiveStreamChunk(size_t r, char *copybuf, void *callback_data)
 				break;
 			}
 
-		case 'm':
+		case PqBackupMsg_Manifest:
 			{
 				/*
 				 * Manifest data will be sent next. This message is not
@@ -1818,7 +1820,7 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 	if (writerecoveryconf)
 		recoveryconfcontents = GenerateRecoveryConfig(conn,
 													  replication_slot,
-													  GetDbnameFromConnectionOptions());
+													  GetDbnameFromConnectionOptions(connection_string));
 
 	/*
 	 * Run IDENTIFY_SYSTEM so we can get the timeline
@@ -2254,7 +2256,7 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 		 * value directly in the variable, and then set the flag that says
 		 * it's there.
 		 */
-		if (sscanf(xlogend, "%X/%X", &hi, &lo) != 2)
+		if (sscanf(xlogend, "%X/%08X", &hi, &lo) != 2)
 			pg_fatal("could not parse write-ahead log location \"%s\"",
 					 xlogend);
 		xlogendptr = ((uint64) hi) << 32 | lo;
@@ -2310,7 +2312,7 @@ BaseBackup(char *compression_algorithm, char *compression_detail,
 		}
 		else
 		{
-			(void) sync_pgdata(basedir, serverVersion, sync_method);
+			(void) sync_pgdata(basedir, serverVersion, sync_method, true);
 		}
 	}
 

@@ -3,7 +3,7 @@
  * storage.c
  *	  code to create and destroy physical storage for relations
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -27,6 +27,7 @@
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "storage/bulk_write.h"
 #include "storage/freespace.h"
 #include "storage/proc.h"
@@ -194,7 +195,7 @@ log_smgrcreate(const RelFileLocator *rlocator, ForkNumber forkNum)
 	xlrec.forkNum = forkNum;
 
 	XLogBeginInsert();
-	XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+	XLogRegisterData(&xlrec, sizeof(xlrec));
 	XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);
 }
 
@@ -291,6 +292,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	bool		vm;
 	bool		need_fsm_vacuum = false;
 	ForkNumber	forks[MAX_FORKNUM];
+	BlockNumber old_blocks[MAX_FORKNUM];
 	BlockNumber blocks[MAX_FORKNUM];
 	int			nforks = 0;
 	SMgrRelation reln;
@@ -306,6 +308,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 
 	/* Prepare for truncation of MAIN fork of the relation */
 	forks[nforks] = MAIN_FORKNUM;
+	old_blocks[nforks] = smgrnblocks(reln, MAIN_FORKNUM);
 	blocks[nforks] = nblocks;
 	nforks++;
 
@@ -317,6 +320,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		if (BlockNumberIsValid(blocks[nforks]))
 		{
 			forks[nforks] = FSM_FORKNUM;
+			old_blocks[nforks] = smgrnblocks(reln, FSM_FORKNUM);
 			nforks++;
 			need_fsm_vacuum = true;
 		}
@@ -330,6 +334,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		if (BlockNumberIsValid(blocks[nforks]))
 		{
 			forks[nforks] = VISIBILITYMAP_FORKNUM;
+			old_blocks[nforks] = smgrnblocks(reln, VISIBILITYMAP_FORKNUM);
 			nforks++;
 		}
 	}
@@ -366,14 +371,20 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	MyProc->delayChkptFlags |= DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE;
 
 	/*
-	 * We WAL-log the truncation before actually truncating, which means
-	 * trouble if the truncation fails. If we then crash, the WAL replay
-	 * likely isn't going to succeed in the truncation either, and cause a
-	 * PANIC. It's tempting to put a critical section here, but that cure
-	 * would be worse than the disease. It would turn a usually harmless
-	 * failure to truncate, that might spell trouble at WAL replay, into a
-	 * certain PANIC.
+	 * We WAL-log the truncation first and then truncate in a critical
+	 * section. Truncation drops buffers, even if dirty, and then truncates
+	 * disk files. All of that work needs to complete before the lock is
+	 * released, or else old versions of pages on disk that are missing recent
+	 * changes would become accessible again.  We'll try the whole operation
+	 * again in crash recovery if we panic, but even then we can't give up
+	 * because we don't want standbys' relation sizes to diverge and break
+	 * replay or visibility invariants downstream.  The critical section also
+	 * suppresses interrupts.
+	 *
+	 * (See also visibilitymap.c if changing this code.)
 	 */
+	START_CRIT_SECTION();
+
 	if (RelationNeedsWAL(rel))
 	{
 		/*
@@ -387,7 +398,7 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		xlrec.flags = SMGR_TRUNCATE_ALL;
 
 		XLogBeginInsert();
-		XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+		XLogRegisterData(&xlrec, sizeof(xlrec));
 
 		lsn = XLogInsert(RM_SMGR_ID,
 						 XLOG_SMGR_TRUNCATE | XLR_SPECIAL_REL_UPDATE);
@@ -397,10 +408,10 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 		 * hit the disk before the WAL record, and the truncation of the FSM
 		 * or visibility map. If we crashed during that window, we'd be left
 		 * with a truncated heap, but the FSM or visibility map would still
-		 * contain entries for the non-existent heap pages.
+		 * contain entries for the non-existent heap pages, and standbys would
+		 * also never replay the truncation.
 		 */
-		if (fsm || vm)
-			XLogFlush(lsn);
+		XLogFlush(lsn);
 	}
 
 	/*
@@ -408,7 +419,9 @@ RelationTruncate(Relation rel, BlockNumber nblocks)
 	 * longer exist after truncation is complete, and then truncate the
 	 * corresponding files on disk.
 	 */
-	smgrtruncate(RelationGetSmgr(rel), forks, nforks, blocks);
+	smgrtruncate(RelationGetSmgr(rel), forks, nforks, old_blocks, blocks);
+
+	END_CRIT_SECTION();
 
 	/* We've done all the critical work, so checkpoints are OK now. */
 	MyProc->delayChkptFlags &= ~(DELAY_CHKPT_START | DELAY_CHKPT_COMPLETE);
@@ -495,6 +508,9 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 	for (blkno = 0; blkno < nblocks; blkno++)
 	{
 		BulkWriteBuffer buf;
+		int			piv_flags;
+		bool		checksum_failure;
+		bool		verified;
 
 		/* If we got a cancel signal during the copy of the data, quit */
 		CHECK_FOR_INTERRUPTS();
@@ -502,8 +518,20 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 		buf = smgr_bulk_get_buf(bulkstate);
 		smgrread(src, forkNum, blkno, (Page) buf);
 
-		if (!PageIsVerifiedExtended((Page) buf, blkno,
-									PIV_LOG_WARNING | PIV_REPORT_STAT))
+		piv_flags = PIV_LOG_WARNING;
+		if (ignore_checksum_failure)
+			piv_flags |= PIV_IGNORE_CHECKSUM_FAILURE;
+		verified = PageIsVerified((Page) buf, blkno, piv_flags,
+								  &checksum_failure);
+		if (checksum_failure)
+		{
+			RelFileLocatorBackend rloc = src->smgr_rlocator;
+
+			pgstat_prepare_report_checksum_failure(rloc.locator.dbOid);
+			pgstat_report_checksum_failures_in_db(rloc.locator.dbOid, 1);
+		}
+
+		if (!verified)
 		{
 			/*
 			 * For paranoia's sake, capture the file path before invoking the
@@ -512,14 +540,14 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 			 * (errcontext callbacks shouldn't be risking any such thing, but
 			 * people have been known to forget that rule.)
 			 */
-			char	   *relpath = relpathbackend(src->smgr_rlocator.locator,
+			RelPathStr	relpath = relpathbackend(src->smgr_rlocator.locator,
 												 src->smgr_rlocator.backend,
 												 forkNum);
 
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("invalid page in block %u of relation %s",
-							blkno, relpath)));
+					 errmsg("invalid page in block %u of relation \"%s\"",
+							blkno, relpath.str)));
 		}
 
 		/*
@@ -558,7 +586,7 @@ RelFileLocatorSkippingWAL(RelFileLocator rlocator)
 Size
 EstimatePendingSyncsSpace(void)
 {
-	long		entries;
+	int64		entries;
 
 	entries = pendingSyncHash ? hash_get_num_entries(pendingSyncHash) : 0;
 	return mul_size(1 + entries, sizeof(RelFileLocator));
@@ -679,12 +707,12 @@ smgrDoPendingDeletes(bool isCommit)
 				if (maxrels == 0)
 				{
 					maxrels = 8;
-					srels = palloc(sizeof(SMgrRelation) * maxrels);
+					srels = palloc_array(SMgrRelation, maxrels);
 				}
 				else if (maxrels <= nrels)
 				{
 					maxrels *= 2;
-					srels = repalloc(srels, sizeof(SMgrRelation) * maxrels);
+					srels = repalloc_array(srels, SMgrRelation, maxrels);
 				}
 
 				srels[nrels++] = srel;
@@ -751,7 +779,7 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 	{
 		ForkNumber	fork;
 		BlockNumber nblocks[MAX_FORKNUM + 1];
-		BlockNumber total_blocks = 0;
+		uint64		total_blocks = 0;
 		SMgrRelation srel;
 
 		srel = smgropen(pendingsync->rlocator, INVALID_PROC_NUMBER);
@@ -795,18 +823,18 @@ smgrDoPendingSyncs(bool isCommit, bool isParallelWorker)
 		 * main fork is longer than ever but FSM fork gets shorter.
 		 */
 		if (pendingsync->is_truncated ||
-			total_blocks * BLCKSZ / 1024 >= wal_skip_threshold)
+			total_blocks >= wal_skip_threshold * (uint64) 1024 / BLCKSZ)
 		{
 			/* allocate the initial array, or extend it, if needed */
 			if (maxrels == 0)
 			{
 				maxrels = 8;
-				srels = palloc(sizeof(SMgrRelation) * maxrels);
+				srels = palloc_array(SMgrRelation, maxrels);
 			}
 			else if (maxrels <= nrels)
 			{
 				maxrels *= 2;
-				srels = repalloc(srels, sizeof(SMgrRelation) * maxrels);
+				srels = repalloc_array(srels, SMgrRelation, maxrels);
 			}
 
 			srels[nrels++] = srel;
@@ -881,7 +909,7 @@ smgrGetPendingDeletes(bool forCommit, RelFileLocator **ptr)
 		*ptr = NULL;
 		return 0;
 	}
-	rptr = (RelFileLocator *) palloc(nrels * sizeof(RelFileLocator));
+	rptr = palloc_array(RelFileLocator, nrels);
 	*ptr = rptr;
 	for (pending = pendingDeletes; pending != NULL; pending = pending->next)
 	{
@@ -973,6 +1001,7 @@ smgr_redo(XLogReaderState *record)
 		Relation	rel;
 		ForkNumber	forks[MAX_FORKNUM];
 		BlockNumber blocks[MAX_FORKNUM];
+		BlockNumber old_blocks[MAX_FORKNUM];
 		int			nforks = 0;
 		bool		need_fsm_vacuum = false;
 
@@ -1007,6 +1036,7 @@ smgr_redo(XLogReaderState *record)
 		if ((xlrec->flags & SMGR_TRUNCATE_HEAP) != 0)
 		{
 			forks[nforks] = MAIN_FORKNUM;
+			old_blocks[nforks] = smgrnblocks(reln, MAIN_FORKNUM);
 			blocks[nforks] = xlrec->blkno;
 			nforks++;
 
@@ -1024,6 +1054,7 @@ smgr_redo(XLogReaderState *record)
 			if (BlockNumberIsValid(blocks[nforks]))
 			{
 				forks[nforks] = FSM_FORKNUM;
+				old_blocks[nforks] = smgrnblocks(reln, FSM_FORKNUM);
 				nforks++;
 				need_fsm_vacuum = true;
 			}
@@ -1035,13 +1066,18 @@ smgr_redo(XLogReaderState *record)
 			if (BlockNumberIsValid(blocks[nforks]))
 			{
 				forks[nforks] = VISIBILITYMAP_FORKNUM;
+				old_blocks[nforks] = smgrnblocks(reln, VISIBILITYMAP_FORKNUM);
 				nforks++;
 			}
 		}
 
 		/* Do the real work to truncate relation forks */
 		if (nforks > 0)
-			smgrtruncate(reln, forks, nforks, blocks);
+		{
+			START_CRIT_SECTION();
+			smgrtruncate(reln, forks, nforks, old_blocks, blocks);
+			END_CRIT_SECTION();
+		}
 
 		/*
 		 * Update upper-level FSM pages to account for the truncation. This is

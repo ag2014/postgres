@@ -3,7 +3,7 @@
  * test_slru.c
  *		Test correctness of SLRU functions.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -93,14 +93,14 @@ test_slru_page_read(PG_FUNCTION_ARGS)
 {
 	int64		pageno = PG_GETARG_INT64(0);
 	bool		write_ok = PG_GETARG_BOOL(1);
+	TransactionId xid = PG_GETARG_TRANSACTIONID(2);
 	char	   *data = NULL;
 	int			slotno;
 	LWLock	   *lock = SimpleLruGetBankLock(TestSlruCtl, pageno);
 
 	/* find page in buffers, reading it if necessary */
 	LWLockAcquire(lock, LW_EXCLUSIVE);
-	slotno = SimpleLruReadPage(TestSlruCtl, pageno,
-							   write_ok, InvalidTransactionId);
+	slotno = SimpleLruReadPage(TestSlruCtl, pageno, write_ok, &xid);
 	data = (char *) TestSlruCtl->shared->page_buffer[slotno];
 	LWLockRelease(lock);
 
@@ -118,7 +118,7 @@ test_slru_page_readonly(PG_FUNCTION_ARGS)
 	/* find page in buffers, reading it if necessary */
 	slotno = SimpleLruReadPage_ReadOnly(TestSlruCtl,
 										pageno,
-										InvalidTransactionId);
+										NULL);
 	Assert(LWLockHeldByMe(lock));
 	data = (char *) TestSlruCtl->shared->page_buffer[slotno];
 	LWLockRelease(lock);
@@ -151,8 +151,8 @@ test_slru_page_sync(PG_FUNCTION_ARGS)
 	ftag.segno = pageno / SLRU_PAGES_PER_SEGMENT;
 	SlruSyncFileTag(TestSlruCtl, &ftag, path);
 
-	elog(NOTICE, "Called SlruSyncFileTag() for segment %lld on path %s",
-		 (long long) ftag.segno, path);
+	elog(NOTICE, "Called SlruSyncFileTag() for segment %" PRIu64 " on path %s",
+		 ftag.segno, path);
 
 	PG_RETURN_VOID();
 }
@@ -166,8 +166,8 @@ test_slru_page_delete(PG_FUNCTION_ARGS)
 	ftag.segno = pageno / SLRU_PAGES_PER_SEGMENT;
 	SlruDeleteSegment(TestSlruCtl, ftag.segno);
 
-	elog(NOTICE, "Called SlruDeleteSegment() for segment %lld",
-		 (long long) ftag.segno);
+	elog(NOTICE, "Called SlruDeleteSegment() for segment %" PRIu64,
+		 ftag.segno);
 
 	PG_RETURN_VOID();
 }
@@ -210,6 +210,14 @@ test_slru_page_precedes_logically(int64 page1, int64 page2)
 	return page1 < page2;
 }
 
+static int
+test_slru_errdetail_for_io_error(const void *opaque_data)
+{
+	TransactionId xid = *(const TransactionId *) opaque_data;
+
+	return errdetail("Could not access test_slru entry %u.", xid);
+}
+
 static void
 test_slru_shmem_startup(void)
 {
@@ -219,8 +227,8 @@ test_slru_shmem_startup(void)
 	 */
 	const bool	long_segment_names = true;
 	const char	slru_dir_name[] = "pg_test_slru";
-	int			test_tranche_id;
-	int			test_buffer_tranche_id;
+	int			test_tranche_id = -1;
+	int			test_buffer_tranche_id = -1;
 
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
@@ -231,14 +239,21 @@ test_slru_shmem_startup(void)
 	 */
 	(void) MakePGDirectory(slru_dir_name);
 
-	/* initialize the SLRU facility */
-	test_tranche_id = LWLockNewTrancheId();
-	LWLockRegisterTranche(test_tranche_id, "test_slru_tranche");
-
-	test_buffer_tranche_id = LWLockNewTrancheId();
-	LWLockRegisterTranche(test_tranche_id, "test_buffer_tranche");
+	/*
+	 * Initialize the SLRU facility.  In EXEC_BACKEND builds, the
+	 * shmem_startup_hook is called in the postmaster and in each backend, but
+	 * we only need to generate the LWLock tranches once.  Note that these
+	 * tranche ID variables are not used by SimpleLruInit() when
+	 * IsUnderPostmaster is true.
+	 */
+	if (!IsUnderPostmaster)
+	{
+		test_tranche_id = LWLockNewTrancheId("test_slru_tranche");
+		test_buffer_tranche_id = LWLockNewTrancheId("test_buffer_tranche");
+	}
 
 	TestSlruCtl->PagePrecedes = test_slru_page_precedes_logically;
+	TestSlruCtl->errdetail_for_io_error = test_slru_errdetail_for_io_error;
 	SimpleLruInit(TestSlruCtl, "TestSLRU",
 				  NUM_TEST_BUFFERS, 0, slru_dir_name,
 				  test_buffer_tranche_id, test_tranche_id, SYNC_HANDLER_NONE,

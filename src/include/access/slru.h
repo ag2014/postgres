@@ -3,7 +3,7 @@
  * slru.h
  *		Simple LRU buffering for transaction status logfiles
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/slru.h
@@ -13,6 +13,7 @@
 #ifndef SLRU_H
 #define SLRU_H
 
+#include "access/transam.h"
 #include "access/xlogdefs.h"
 #include "storage/lwlock.h"
 #include "storage/sync.h"
@@ -22,21 +23,6 @@
  * number of buffers must not exceed this number.
  */
 #define SLRU_MAX_ALLOWED_BUFFERS ((1024 * 1024 * 1024) / BLCKSZ)
-
-/*
- * Define SLRU segment size.  A page is the same BLCKSZ as is used everywhere
- * else in Postgres.  The segment size can be chosen somewhat arbitrarily;
- * we make it 32 pages by default, or 256Kb, i.e. 1M transactions for CLOG
- * or 64K transactions for SUBTRANS.
- *
- * Note: because TransactionIds are 32 bits and wrap around at 0xFFFFFFFF,
- * page numbering also wraps around at 0xFFFFFFFF/xxxx_XACTS_PER_PAGE (where
- * xxxx is CLOG or SUBTRANS, respectively), and segment numbering at
- * 0xFFFFFFFF/xxxx_XACTS_PER_PAGE/SLRU_PAGES_PER_SEGMENT.  We need
- * take no explicit notice of that fact in slru.c, except when comparing
- * segment and page numbers in SimpleLruTruncate (see PagePrecedes()).
- */
-#define SLRU_PAGES_PER_SEGMENT	32
 
 /*
  * Page status codes.  Note that these do not include the "dirty" bit.
@@ -55,7 +41,7 @@ typedef enum
 /*
  * Shared-memory state
  *
- * ControlLock is used to protect access to the other fields, except
+ * SLRU bank locks are used to protect access to the other fields, except
  * latest_page_number, which uses atomics; see comment in slru.c.
  */
 typedef struct SlruSharedData
@@ -128,10 +114,8 @@ typedef struct SlruCtlData
 {
 	SlruShared	shared;
 
-	/*
-	 * Bitmask to determine bank number from page number.
-	 */
-	bits16		bank_mask;
+	/* Number of banks in this SLRU. */
+	uint16		nbanks;
 
 	/*
 	 * If true, use long segment file names.  Otherwise, use short file names.
@@ -159,11 +143,20 @@ typedef struct SlruCtlData
 	bool		(*PagePrecedes) (int64, int64);
 
 	/*
+	 * Callback to provide more details on an I/O error.  This is called as
+	 * part of ereport(), and the callback function is expected to call
+	 * errdetail() to provide more context on the SLRU access.
+	 *
+	 * The opaque_data argument here is the argument that was passed to the
+	 * SimpleLruReadPage() function.
+	 */
+	int			(*errdetail_for_io_error) (const void *opaque_data);
+
+	/*
 	 * Dir is set during SimpleLruInit and does not change thereafter. Since
 	 * it's always the same, it doesn't need to be in shared memory.
 	 */
 	char		Dir[64];
-
 } SlruCtlData;
 
 typedef SlruCtlData *SlruCtl;
@@ -179,7 +172,7 @@ SimpleLruGetBankLock(SlruCtl ctl, int64 pageno)
 {
 	int			bankno;
 
-	bankno = pageno & ctl->bank_mask;
+	bankno = pageno % ctl->nbanks;
 	return &(ctl->shared->bank_locks[bankno].lock);
 }
 
@@ -190,10 +183,11 @@ extern void SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 						  int bank_tranche_id, SyncRequestHandler sync_handler,
 						  bool long_segment_names);
 extern int	SimpleLruZeroPage(SlruCtl ctl, int64 pageno);
+extern void SimpleLruZeroAndWritePage(SlruCtl ctl, int64 pageno);
 extern int	SimpleLruReadPage(SlruCtl ctl, int64 pageno, bool write_ok,
-							  TransactionId xid);
+							  const void *opaque_data);
 extern int	SimpleLruReadPage_ReadOnly(SlruCtl ctl, int64 pageno,
-									   TransactionId xid);
+									   const void *opaque_data);
 extern void SimpleLruWritePage(SlruCtl ctl, int slotno);
 extern void SimpleLruWriteAll(SlruCtl ctl, bool allow_redirtied);
 #ifdef USE_ASSERT_CHECKING

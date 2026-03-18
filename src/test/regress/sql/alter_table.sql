@@ -387,10 +387,12 @@ ALTER TABLE attmp3 validate constraint attmpconstr;
 -- Try a non-verified CHECK constraint
 ALTER TABLE attmp3 ADD CONSTRAINT b_greater_than_ten CHECK (b > 10); -- fail
 ALTER TABLE attmp3 ADD CONSTRAINT b_greater_than_ten CHECK (b > 10) NOT VALID; -- succeeds
+ALTER TABLE attmp3 ADD CONSTRAINT b_greater_than_ten_not_enforced CHECK (b > 10) NOT ENFORCED; -- succeeds
 ALTER TABLE attmp3 VALIDATE CONSTRAINT b_greater_than_ten; -- fails
 DELETE FROM attmp3 WHERE NOT b > 10;
 ALTER TABLE attmp3 VALIDATE CONSTRAINT b_greater_than_ten; -- succeeds
 ALTER TABLE attmp3 VALIDATE CONSTRAINT b_greater_than_ten; -- succeeds
+ALTER TABLE attmp3 VALIDATE CONSTRAINT b_greater_than_ten_not_enforced; -- fail
 
 -- Test inherited NOT VALID CHECK constraints
 select * from attmp3;
@@ -908,6 +910,20 @@ alter table atacc1 add constraint atacc1_constr_b_valid check(test_b is not null
 alter table atacc1 alter test_b set not null, alter test_a set not null;
 drop table atacc1;
 
+-- not null not valid with partitions
+CREATE TABLE atnnparted (id int, col1 int) PARTITION BY LIST (id);
+ALTER TABLE atnnparted ADD CONSTRAINT dummy_constr NOT NULL id NOT VALID;
+CREATE TABLE atnnpart1 (col1 int, id int);
+ALTER TABLE atnnpart1 ADD CONSTRAINT another_constr NOT NULL id;
+ALTER TABLE atnnpart1 ADD PRIMARY KEY (id);
+ALTER TABLE atnnparted ATTACH PARTITION atnnpart1 FOR VALUES IN ('1');
+\d+ atnnpart*
+BEGIN;
+ALTER TABLE atnnparted VALIDATE CONSTRAINT dummy_constr;
+\d+ atnnpart*
+ROLLBACK;
+-- leave a table in this state for the pg_upgrade test
+
 -- test inheritance
 create table parent (a int);
 create table child (b varchar(255)) inherits (parent);
@@ -1188,6 +1204,11 @@ alter table renameColumn add column w int;
 -- this should fail
 alter table only renameColumn add column x int;
 
+-- this should work
+alter table renameColumn add column x int check (x > 0) not enforced;
+
+-- this should fail
+alter table renameColumn add column y int check (x > 0) not enforced enforced;
 
 -- Test corner cases in dropping of inherited columns
 
@@ -1789,6 +1810,8 @@ select * from my_locks order by 1;
 rollback;
 
 begin;
+create function ttdummy () returns trigger language plpgsql as
+$$ begin return new; end $$;
 create trigger ttdummy
 	before delete or update on alterlock
 	for each row
@@ -2145,6 +2168,11 @@ ALTER TABLE comment_test ALTER COLUMN id SET DATA TYPE text;
 ALTER TABLE comment_test ALTER COLUMN positive_col SET DATA TYPE int;
 ALTER TABLE comment_test ALTER COLUMN positive_col SET DATA TYPE bigint;
 
+-- Some error cases.
+ALTER TABLE comment_test ALTER COLUMN xmin SET DATA TYPE x;
+ALTER TABLE comment_test ALTER COLUMN id SET DATA TYPE x;
+ALTER TABLE comment_test ALTER COLUMN id SET DATA TYPE int COLLATE "C";
+
 -- Check that the comments are intact.
 SELECT col_description('comment_test'::regclass, 1) as comment;
 SELECT indexrelid::regclass::text as index, obj_description(indexrelid, 'pg_class') as comment FROM pg_index where indrelid = 'comment_test'::regclass ORDER BY 1, 2;
@@ -2174,13 +2202,15 @@ SELECT conname as constraint, obj_description(oid, 'pg_constraint') as comment F
 -- filenode function call can return NULL for a relation dropped concurrently
 -- with the call's surrounding query, so ignore a NULL mapped_oid for
 -- relations that no longer exist after all calls finish.
+-- Temporary relations are ignored, as not supported by pg_filenode_relation().
 CREATE TEMP TABLE filenode_mapping AS
 SELECT
     oid, mapped_oid, reltablespace, relfilenode, relname
 FROM pg_class,
     pg_filenode_relation(reltablespace, pg_relation_filenode(oid)) AS mapped_oid
-WHERE relkind IN ('r', 'i', 'S', 't', 'm') AND mapped_oid IS DISTINCT FROM oid;
-
+WHERE relkind IN ('r', 'i', 'S', 't', 'm')
+  AND relpersistence != 't'
+  AND mapped_oid IS DISTINCT FROM oid;
 SELECT m.* FROM filenode_mapping m LEFT JOIN pg_class c ON c.oid = m.oid
 WHERE c.oid IS NOT NULL OR m.mapped_oid IS NOT NULL;
 
@@ -2301,6 +2331,14 @@ ALTER TABLE test_add_column
 \d test_add_column
 ALTER TABLE test_add_column
 	ADD COLUMN IF NOT EXISTS c5 SERIAL CHECK (c5 > 10);
+ALTER TABLE test_add_column
+	ADD c6 integer; -- omit COLUMN
+ALTER TABLE test_add_column
+	ADD IF NOT EXISTS c6 integer;
+ALTER TABLE test_add_column
+	DROP c6; -- omit COLUMN
+ALTER TABLE test_add_column
+	DROP IF EXISTS c6;
 \d test_add_column*
 DROP TABLE test_add_column;
 \d test_add_column*
@@ -2367,8 +2405,12 @@ CREATE TABLE nonpartitioned (
 	a int,
 	b int
 );
-ALTER TABLE partitioned INHERIT nonpartitioned;
-ALTER TABLE nonpartitioned INHERIT partitioned;
+ALTER TABLE partitioned INHERIT nonpartitioned; -- fail
+ALTER TABLE partitioned NO INHERIT nonpartitioned; -- fail
+ALTER TABLE nonpartitioned INHERIT partitioned; -- fail
+CREATE TABLE partitioned_p1 PARTITION OF partitioned FOR VALUES FROM (0, 0) TO (10, 100);
+ALTER TABLE partitioned_p1 INHERIT nonpartitioned; -- fail
+ALTER TABLE partitioned_p1 NO INHERIT nonpartitioned; -- fail
 
 -- cannot add NO INHERIT constraint to partitioned tables
 ALTER TABLE partitioned ADD CONSTRAINT chk_a CHECK (a > 0) NO INHERIT;
@@ -2796,13 +2838,16 @@ DROP TABLE part_rpd;
 -- works fine
 ALTER TABLE range_parted2 DETACH PARTITION part_rp CONCURRENTLY;
 \d+ range_parted2
--- constraint should be created
-\d part_rp
-CREATE TABLE part_rp100 PARTITION OF range_parted2 (CHECK (a>=123 AND a<133 AND a IS NOT NULL)) FOR VALUES FROM (100) to (200);
-ALTER TABLE range_parted2 DETACH PARTITION part_rp100 CONCURRENTLY;
--- redundant constraint should not be created
-\d part_rp100
 DROP TABLE range_parted2;
+
+-- Test that hash partitions continue to work after they're concurrently
+-- detached (bugs #18371, #19070)
+CREATE TABLE hash_parted2 (a int) PARTITION BY HASH(a);
+CREATE TABLE part_hp PARTITION OF hash_parted2 FOR VALUES WITH (MODULUS 2, REMAINDER 0);
+ALTER TABLE hash_parted2 DETACH PARTITION part_hp CONCURRENTLY;
+DROP TABLE hash_parted2;
+INSERT INTO part_hp VALUES (1);
+DROP TABLE part_hp;
 
 -- Check ALTER TABLE commands for partitioned tables and partitions
 
@@ -3040,6 +3085,23 @@ alter table atref alter column c1 set data type bigint;
 drop table attbl, atref;
 
 /* End test case for bug #17409 */
+
+/* Test case for bug #18970 */
+
+create table attbl(a int);
+create table atref(b attbl check ((b).a is not null));
+alter table attbl alter column a type numeric;  -- someday this should work
+alter table atref drop constraint atref_b_check;
+
+create statistics atref_stat on ((b).a is not null) from atref;
+alter table attbl alter column a type numeric;  -- someday this should work
+drop statistics atref_stat;
+
+create index atref_idx on atref (((b).a));
+alter table attbl alter column a type numeric;  -- someday this should work
+drop table attbl, atref;
+
+/* End test case for bug #18970 */
 
 -- Test that ALTER TABLE rewrite preserves a clustered index
 -- for normal indexes and indexes on constraints.

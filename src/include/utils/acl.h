@@ -4,7 +4,7 @@
  *	  Definition of (and support for) access control list data structures.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/acl.h
@@ -166,6 +166,7 @@ typedef struct ArrayType Acl;
 #define ACL_ALL_RIGHTS_LANGUAGE		(ACL_USAGE)
 #define ACL_ALL_RIGHTS_LARGEOBJECT	(ACL_SELECT|ACL_UPDATE)
 #define ACL_ALL_RIGHTS_PARAMETER_ACL (ACL_SET|ACL_ALTER_SYSTEM)
+#define ACL_ALL_RIGHTS_PROPGRAPH	(ACL_SELECT)
 #define ACL_ALL_RIGHTS_SCHEMA		(ACL_USAGE|ACL_CREATE)
 #define ACL_ALL_RIGHTS_TABLESPACE	(ACL_CREATE)
 #define ACL_ALL_RIGHTS_TYPE			(ACL_USAGE)

@@ -4,7 +4,7 @@
  *	  POSTGRES generalized index access method definitions.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/genam.h
@@ -17,14 +17,20 @@
 #include "access/htup.h"
 #include "access/sdir.h"
 #include "access/skey.h"
-#include "nodes/tidbitmap.h"
+#include "executor/instrument_node.h"
 #include "storage/buf.h"
 #include "storage/lockdefs.h"
-#include "utils/relcache.h"
 #include "utils/snapshot.h"
 
-/* We don't want this file to depend on execnodes.h. */
-struct IndexInfo;
+
+/*
+ * forward references in this file
+ */
+typedef struct IndexInfo IndexInfo;
+typedef struct RelationData *Relation;
+typedef struct TIDBitmap TIDBitmap;
+typedef struct TupleTableSlot TupleTableSlot;
+
 
 /*
  * Struct for statistics returned by ambuild
@@ -134,12 +140,6 @@ typedef struct IndexOrderByDistance
  * generalized index_ interface routines (in indexam.c)
  */
 
-/*
- * IndexScanIsValid
- *		True iff the index scan is valid.
- */
-#define IndexScanIsValid(scan) PointerIsValid(scan)
-
 extern Relation index_open(Oid relationId, LOCKMODE lockmode);
 extern Relation try_index_open(Oid relationId, LOCKMODE lockmode);
 extern void index_close(Relation relation, LOCKMODE lockmode);
@@ -150,16 +150,18 @@ extern bool index_insert(Relation indexRelation,
 						 Relation heapRelation,
 						 IndexUniqueCheck checkUnique,
 						 bool indexUnchanged,
-						 struct IndexInfo *indexInfo);
+						 IndexInfo *indexInfo);
 extern void index_insert_cleanup(Relation indexRelation,
-								 struct IndexInfo *indexInfo);
+								 IndexInfo *indexInfo);
 
 extern IndexScanDesc index_beginscan(Relation heapRelation,
 									 Relation indexRelation,
 									 Snapshot snapshot,
+									 IndexScanInstrumentation *instrument,
 									 int nkeys, int norderbys);
 extern IndexScanDesc index_beginscan_bitmap(Relation indexRelation,
 											Snapshot snapshot,
+											IndexScanInstrumentation *instrument,
 											int nkeys);
 extern void index_rescan(IndexScanDesc scan,
 						 ScanKey keys, int nkeys,
@@ -168,20 +170,26 @@ extern void index_endscan(IndexScanDesc scan);
 extern void index_markpos(IndexScanDesc scan);
 extern void index_restrpos(IndexScanDesc scan);
 extern Size index_parallelscan_estimate(Relation indexRelation,
-										int nkeys, int norderbys, Snapshot snapshot);
+										int nkeys, int norderbys, Snapshot snapshot,
+										bool instrument, bool parallel_aware,
+										int nworkers);
 extern void index_parallelscan_initialize(Relation heapRelation,
 										  Relation indexRelation, Snapshot snapshot,
+										  bool instrument, bool parallel_aware,
+										  int nworkers,
+										  SharedIndexScanInstrumentation **sharedinfo,
 										  ParallelIndexScanDesc target);
 extern void index_parallelrescan(IndexScanDesc scan);
 extern IndexScanDesc index_beginscan_parallel(Relation heaprel,
-											  Relation indexrel, int nkeys, int norderbys,
+											  Relation indexrel,
+											  IndexScanInstrumentation *instrument,
+											  int nkeys, int norderbys,
 											  ParallelIndexScanDesc pscan);
 extern ItemPointer index_getnext_tid(IndexScanDesc scan,
 									 ScanDirection direction);
-struct TupleTableSlot;
-extern bool index_fetch_heap(IndexScanDesc scan, struct TupleTableSlot *slot);
+extern bool index_fetch_heap(IndexScanDesc scan, TupleTableSlot *slot);
 extern bool index_getnext_slot(IndexScanDesc scan, ScanDirection direction,
-							   struct TupleTableSlot *slot);
+							   TupleTableSlot *slot);
 extern int64 index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap);
 
 extern IndexBulkDeleteResult *index_bulk_delete(IndexVacuumInfo *info,

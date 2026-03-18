@@ -19,6 +19,7 @@
  *
  *-------------------------------------------------------------------------
  */
+/* IWYU pragma: always_keep */
 
 #ifndef POSTGRES_EXT_H
 #define POSTGRES_EXT_H
@@ -43,7 +44,7 @@ typedef unsigned int Oid;
 /* the above needs <stdlib.h> */
 
 
-/* Define a signed 64-bit integer type for use in client API declarations. */
+/* deprecated name for int64_t, formerly used in client API declarations */
 typedef int64_t pg_int64;
 
 /*

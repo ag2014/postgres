@@ -4,7 +4,7 @@
  *	  header file for postgres vacuum cleaner and statistics analyzer
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/vacuum.h
@@ -224,12 +224,24 @@ typedef struct VacuumParams
 	int			multixact_freeze_table_age; /* multixact age at which to scan
 											 * whole table */
 	bool		is_wraparound;	/* force a for-wraparound vacuum */
-	int			log_min_duration;	/* minimum execution threshold in ms at
-									 * which autovacuum is logged, -1 to use
-									 * default */
+	int			log_vacuum_min_duration;	/* minimum execution threshold in
+											 * ms at which vacuum by
+											 * autovacuum is logged, -1 to use
+											 * default */
+	int			log_analyze_min_duration;	/* minimum execution threshold in
+											 * ms at which analyze by
+											 * autovacuum is logged, -1 to use
+											 * default */
 	VacOptValue index_cleanup;	/* Do index vacuum and cleanup */
 	VacOptValue truncate;		/* Truncate empty pages at the end */
 	Oid			toast_parent;	/* for privilege checks when recursing */
+
+	/*
+	 * Fraction of pages in a relation that vacuum can eagerly scan and fail
+	 * to freeze. Only applicable for table AMs using visibility maps. Derived
+	 * from GUC or table storage parameter. 0 if disabled.
+	 */
+	double		max_eager_freeze_failure_rate;
 
 	/*
 	 * The number of parallel vacuum workers.  0 by default which means choose
@@ -296,6 +308,18 @@ extern PGDLLIMPORT int vacuum_multixact_freeze_min_age;
 extern PGDLLIMPORT int vacuum_multixact_freeze_table_age;
 extern PGDLLIMPORT int vacuum_failsafe_age;
 extern PGDLLIMPORT int vacuum_multixact_failsafe_age;
+extern PGDLLIMPORT bool track_cost_delay_timing;
+extern PGDLLIMPORT bool vacuum_truncate;
+
+/*
+ * Relevant for vacuums implementing eager scanning. Normal vacuums may
+ * eagerly scan some all-visible but not all-frozen pages. Since the goal
+ * is to freeze these pages, an eager scan that fails to set the page
+ * all-frozen in the VM is considered to have "failed". This is the
+ * fraction of pages in the relation vacuum may scan and fail to freeze
+ * before disabling eager scanning.
+ */
+extern PGDLLIMPORT double vacuum_max_eager_freeze_failure_rate;
 
 /*
  * Maximum value for default_statistics_target and per-column statistics
@@ -313,9 +337,11 @@ extern PGDLLIMPORT bool VacuumFailsafeActive;
 extern PGDLLIMPORT double vacuum_cost_delay;
 extern PGDLLIMPORT int vacuum_cost_limit;
 
+extern PGDLLIMPORT int64 parallel_vacuum_worker_delay_ns;
+
 /* in commands/vacuum.c */
 extern void ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel);
-extern void vacuum(List *relations, VacuumParams *params,
+extern void vacuum(List *relations, const VacuumParams params,
 				   BufferAccessStrategy bstrategy, MemoryContext vac_context,
 				   bool isTopLevel);
 extern void vac_open_indexes(Relation relation, LOCKMODE lockmode,
@@ -329,17 +355,18 @@ extern void vac_update_relstats(Relation relation,
 								BlockNumber num_pages,
 								double num_tuples,
 								BlockNumber num_all_visible_pages,
+								BlockNumber num_all_frozen_pages,
 								bool hasindex,
 								TransactionId frozenxid,
 								MultiXactId minmulti,
 								bool *frozenxid_updated,
 								bool *minmulti_updated,
 								bool in_outer_xact);
-extern bool vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
+extern bool vacuum_get_cutoffs(Relation rel, const VacuumParams params,
 							   struct VacuumCutoffs *cutoffs);
 extern bool vacuum_xid_failsafe_check(const struct VacuumCutoffs *cutoffs);
 extern void vac_update_datfrozenxid(void);
-extern void vacuum_delay_point(void);
+extern void vacuum_delay_point(bool is_analyze);
 extern bool vacuum_is_permitted_for_relation(Oid relid, Form_pg_class reltuple,
 											 bits32 options);
 extern Relation vacuum_open_relation(Oid relid, RangeVar *relation,
@@ -376,7 +403,7 @@ extern void parallel_vacuum_main(dsm_segment *seg, shm_toc *toc);
 
 /* in commands/analyze.c */
 extern void analyze_rel(Oid relid, RangeVar *relation,
-						VacuumParams *params, List *va_cols, bool in_outer_xact,
+						const VacuumParams params, List *va_cols, bool in_outer_xact,
 						BufferAccessStrategy bstrategy);
 extern bool std_typanalyze(VacAttrStats *stats);
 

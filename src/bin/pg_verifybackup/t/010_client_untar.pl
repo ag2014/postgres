@@ -1,4 +1,4 @@
-# Copyright (c) 2021-2024, PostgreSQL Global Development Group
+# Copyright (c) 2021-2026, PostgreSQL Global Development Group
 
 # This test case aims to verify that client-side backup compression work
 # properly, and it also aims to verify that pg_verifybackup can verify a base
@@ -14,6 +14,22 @@ use Test::More;
 my $primary = PostgreSQL::Test::Cluster->new('primary');
 $primary->init(allows_streaming => 1);
 $primary->start;
+
+# Create file with some random data and an arbitrary size, useful to check
+# the solidity of the compression and decompression logic.  The size of the
+# file is chosen to be around 640kB.  This has proven to be large enough to
+# detect some issues related to LZ4, and low enough to not impact the runtime
+# of the test significantly.
+my $junk_data = $primary->safe_psql(
+	'postgres', qq(
+		SELECT string_agg(encode(sha256(i::bytea), 'hex'), '')
+		FROM generate_series(1, 10240) s(i);));
+my $data_dir = $primary->data_dir;
+my $junk_file = "$data_dir/junk";
+open my $jf, '>', $junk_file
+  or die "Could not create junk file: $!";
+print $jf $junk_data;
+close $jf;
 
 my $backup_path = $primary->backup_dir . '/client-backup';
 my $extract_path = $primary->backup_dir . '/extracted-backup';
@@ -34,6 +50,12 @@ my @test_configuration = (
 	{
 		'compression_method' => 'lz4',
 		'backup_flags' => [ '--compress', 'client-lz4:5' ],
+		'backup_archive' => 'base.tar.lz4',
+		'enabled' => check_pg_config("#define USE_LZ4 1")
+	},
+	{
+		'compression_method' => 'lz4',
+		'backup_flags' => [ '--compress', 'client-lz4:1' ],
 		'backup_archive' => 'base.tar.lz4',
 		'enabled' => check_pg_config("#define USE_LZ4 1")
 	},
@@ -72,14 +94,19 @@ for my $tc (@test_configuration)
 			|| $tc->{'decompress_program'} eq '');
 
 		# Take a client-side backup.
-		my @backup = (
-			'pg_basebackup', '-D', $backup_path,
-			'-Xfetch', '--no-sync', '-cfast', '-Ft');
-		push @backup, @{ $tc->{'backup_flags'} };
 		my $backup_stdout = '';
 		my $backup_stderr = '';
-		my $backup_result = $primary->run_log(\@backup, '>', \$backup_stdout,
-			'2>', \$backup_stderr);
+		my $backup_result = $primary->run_log(
+			[
+				'pg_basebackup', '--no-sync',
+				'--pgdata' => $backup_path,
+				'--wal-method' => 'fetch',
+				'--checkpoint' => 'fast',
+				'--format' => 'tar',
+				@{ $tc->{'backup_flags'} }
+			],
+			'>' => \$backup_stdout,
+			'2>' => \$backup_stderr);
 		if ($backup_stdout ne '')
 		{
 			print "# standard output was:\n$backup_stdout";
@@ -108,7 +135,11 @@ for my $tc (@test_configuration)
 			"found expected backup files, compression $method");
 
 		# Verify tar backup.
-		$primary->command_ok( [ 'pg_verifybackup', '-n', '-e', $backup_path ],
+		$primary->command_ok(
+			[
+				'pg_verifybackup', '--no-parse-wal',
+				'--exit-on-error', $backup_path,
+			],
 			"verify backup, compression $method");
 
 		# Cleanup.

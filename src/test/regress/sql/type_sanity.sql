@@ -12,6 +12,12 @@
 -- row in the linked-to table.  However, if we want to enforce that a link
 -- field can't be 0, we have to check it here.
 
+-- directory paths and dlsuffix are passed to us in environment variables
+\getenv libdir PG_LIBDIR
+\getenv dlsuffix PG_DLSUFFIX
+
+\set regresslib :libdir '/regress' :dlsuffix
+
 -- **************** pg_type ****************
 
 -- Look for illegal values in pg_type fields.
@@ -397,8 +403,7 @@ WHERE pc.relkind IN ('r', 't', 'm') and
 SELECT a1.attrelid, a1.attname
 FROM pg_attribute as a1
 WHERE a1.attrelid = 0 OR a1.atttypid = 0 OR a1.attnum = 0 OR
-    a1.attcacheoff != -1 OR a1.attinhcount < 0 OR
-    (a1.attinhcount = 0 AND NOT a1.attislocal);
+    a1.attinhcount < 0 OR (a1.attinhcount = 0 AND NOT a1.attislocal);
 
 -- Cross-check attnum against parent relation
 
@@ -426,13 +431,29 @@ WHERE a1.atttypid = t1.oid AND
      a1.attbyval != t1.typbyval OR
      (a1.attstorage != t1.typstorage AND a1.attstorage != 'p'));
 
+-- Look for IsCatalogTextUniqueIndexOid() omissions.
+
+CREATE FUNCTION is_catalog_text_unique_index_oid(oid) RETURNS bool
+    AS :'regresslib', 'is_catalog_text_unique_index_oid'
+    LANGUAGE C STRICT;
+
+SELECT indexrelid::regclass
+FROM pg_index
+WHERE (is_catalog_text_unique_index_oid(indexrelid) <>
+       (indisunique AND
+        indexrelid < 16384 AND
+        EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = indexrelid AND atttypid = 'text'::regtype)));
+
 -- **************** pg_range ****************
 
 -- Look for illegal values in pg_range fields.
 
 SELECT r.rngtypid, r.rngsubtype
 FROM pg_range as r
-WHERE r.rngtypid = 0 OR r.rngsubtype = 0 OR r.rngsubopc = 0;
+WHERE r.rngtypid = 0 OR r.rngsubtype = 0 OR r.rngsubopc = 0
+    OR r.rngconstruct2 = 0 OR r.rngconstruct3 = 0
+    OR r.rngmltconstruct0 = 0 OR r.rngmltconstruct1 = 0 OR r.rngmltconstruct2 = 0;
 
 -- rngcollation should be specified iff subtype is collatable
 
@@ -471,6 +492,49 @@ WHERE pronargs != 2
 SELECT r.rngtypid, r.rngsubtype, r.rngmultitypid
 FROM pg_range r
 WHERE r.rngmultitypid IS NULL OR r.rngmultitypid = 0;
+
+-- check constructor function arguments and return types
+--
+-- proname and prosrc are not required to have these particular
+-- values, but this matches what DefineRange() produces and serves to
+-- sanity-check the catalog entries for built-in types.
+
+SELECT r.rngtypid, r.rngsubtype, p.proname
+FROM pg_range r JOIN pg_proc p ON p.oid = r.rngconstruct2 JOIN pg_type t ON r.rngtypid = t.oid
+WHERE p.pronargs != 2
+    OR p.proargtypes[0] != r.rngsubtype OR p.proargtypes[1] != r.rngsubtype
+    OR p.prorettype != r.rngtypid
+    OR p.proname != t.typname OR p.prosrc != 'range_constructor2';
+
+SELECT r.rngtypid, r.rngsubtype, p.proname
+FROM pg_range r JOIN pg_proc p ON p.oid = r.rngconstruct3 JOIN pg_type t ON r.rngtypid = t.oid
+WHERE p.pronargs != 3
+    OR p.proargtypes[0] != r.rngsubtype OR p.proargtypes[1] != r.rngsubtype OR p.proargtypes[2] != 'pg_catalog.text'::regtype
+    OR p.prorettype != r.rngtypid
+    OR p.proname != t.typname OR p.prosrc != 'range_constructor3';
+
+SELECT r.rngtypid, r.rngsubtype, p.proname
+FROM pg_range r JOIN pg_proc p ON p.oid = r.rngmltconstruct0 JOIN pg_type t ON r.rngmultitypid = t.oid
+WHERE p.pronargs != 0
+    OR p.prorettype != r.rngmultitypid
+    OR p.proname != t.typname OR p.prosrc != 'multirange_constructor0';
+
+SELECT r.rngtypid, r.rngsubtype, p.proname
+FROM pg_range r JOIN pg_proc p ON p.oid = r.rngmltconstruct1 JOIN pg_type t ON r.rngmultitypid = t.oid
+WHERE p.pronargs != 1
+    OR p.proargtypes[0] != r.rngtypid
+    OR p.prorettype != r.rngmultitypid
+    OR p.proname != t.typname OR p.prosrc != 'multirange_constructor1';
+
+SELECT r.rngtypid, r.rngsubtype, p.proname
+FROM pg_range r JOIN pg_proc p ON p.oid = r.rngmltconstruct2 JOIN pg_type t ON r.rngmultitypid = t.oid JOIN pg_type t2 ON r.rngtypid = t2.oid
+WHERE p.pronargs != 1
+    OR p.proargtypes[0] != t2.typarray
+    OR p.prorettype != r.rngmultitypid
+    OR p.proname != t.typname OR p.prosrc != 'multirange_constructor2';
+
+
+-- ******************************************
 
 -- Create a table that holds all the known in-core data types and leave it
 -- around so as pg_upgrade is able to test their binary compatibility.
@@ -511,6 +575,7 @@ CREATE TABLE tab_core_types AS SELECT
   'abc'::refcursor,
   '1 2'::int2vector,
   '1 2'::oidvector,
+  '1234'::oid8,
   format('%I=UC/%I', USER, USER)::aclitem AS aclitem,
   'a fat cat sat on a mat and ate a fat rat'::tsvector,
   'fat & rat'::tsquery,
@@ -520,6 +585,7 @@ CREATE TABLE tab_core_types AS SELECT
   'regtype'::regtype type,
   'pg_monitor'::regrole,
   'pg_class'::regclass::oid,
+  'template1'::regdatabase,
   '(1,1)'::tid, '2'::xid, '3'::cid,
   '10:20:10,14,15'::txid_snapshot,
   '10:20:10,14,15'::pg_snapshot,

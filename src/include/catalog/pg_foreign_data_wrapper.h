@@ -4,7 +4,7 @@
  *	  definition of the "foreign-data wrapper" system catalog (pg_foreign_data_wrapper)
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_foreign_data_wrapper.h
@@ -19,13 +19,15 @@
 #define PG_FOREIGN_DATA_WRAPPER_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_foreign_data_wrapper_d.h"
+#include "catalog/pg_foreign_data_wrapper_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_foreign_data_wrapper definition.  cpp turns this into
  *		typedef struct FormData_pg_foreign_data_wrapper
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_foreign_data_wrapper,2328,ForeignDataWrapperRelationId)
 {
 	Oid			oid;			/* oid */
@@ -36,12 +38,17 @@ CATALOG(pg_foreign_data_wrapper,2328,ForeignDataWrapperRelationId)
 	Oid			fdwvalidator BKI_LOOKUP_OPT(pg_proc);	/* option validation
 														 * function, or 0 if
 														 * none */
+	Oid			fdwconnection BKI_LOOKUP_OPT(pg_proc);	/* connection string
+														 * function, or 0 if
+														 * none */
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	aclitem		fdwacl[1];		/* access permissions */
 	text		fdwoptions[1];	/* FDW options */
 #endif
 } FormData_pg_foreign_data_wrapper;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_foreign_data_wrapper corresponds to a pointer to a tuple with

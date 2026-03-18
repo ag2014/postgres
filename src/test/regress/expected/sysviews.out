@@ -29,7 +29,7 @@ select type, name, ident, level, total_bytes >= free_bytes
 (1 row)
 
 -- We can exercise some MemoryContext type stats functions.  Most of the
--- column values are too platform-dependant to display.
+-- column values are too platform-dependent to display.
 -- Ensure stats from the bump allocator look sane.  Bump isn't a commonly
 -- used context, but it is used in tuplesort.c, so open a cursor to keep
 -- the tuplesort alive long enough for us to query the context stats.
@@ -143,6 +143,13 @@ select count(*) = 0 as ok from pg_stat_wal_receiver;
  t
 (1 row)
 
+-- We expect no recovery state in this test (running on primary)
+select count(*) = 0 as ok from pg_stat_recovery;
+ ok 
+----
+ t
+(1 row)
+
 -- This is to record the prevailing planner enable_foo settings during
 -- a regression test run.
 select name, setting from pg_settings where name like 'enable%';
@@ -151,6 +158,7 @@ select name, setting from pg_settings where name like 'enable%';
  enable_async_append            | on
  enable_bitmapscan              | on
  enable_distinct_reordering     | on
+ enable_eager_aggregate         | on
  enable_gathermerge             | on
  enable_group_by_reordering     | on
  enable_hashagg                 | on
@@ -168,10 +176,11 @@ select name, setting from pg_settings where name like 'enable%';
  enable_partitionwise_aggregate | off
  enable_partitionwise_join      | off
  enable_presorted_aggregate     | on
+ enable_self_join_elimination   | on
  enable_seqscan                 | on
  enable_sort                    | on
  enable_tidscan                 | on
-(23 rows)
+(25 rows)
 
 -- There are always wait event descriptions for various types.  InjectionPoint
 -- may be present or absent, depending on history since last postmaster start.
@@ -180,7 +189,7 @@ select type, count(*) > 0 as ok FROM pg_wait_events
    type    | ok 
 -----------+----
  Activity  | t
- BufferPin | t
+ Buffer    | t
  Client    | t
  Extension | t
  IO        | t
@@ -221,5 +230,13 @@ select count(distinct utc_offset) >= 24 as ok from pg_timezone_abbrevs;
  ok 
 ----
  t
+(1 row)
+
+-- One specific case we can check without much fear of breakage
+-- is the historical local-mean-time value used for America/Los_Angeles.
+select * from pg_timezone_abbrevs where abbrev = 'LMT';
+ abbrev |          utc_offset           | is_dst 
+--------+-------------------------------+--------
+ LMT    | @ 7 hours 52 mins 58 secs ago | f
 (1 row)
 

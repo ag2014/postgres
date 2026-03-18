@@ -3,7 +3,7 @@
  * xactdesc.c
  *	  rmgr descriptor routines for access/transam/xact.c
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -252,6 +252,8 @@ ParsePrepareRecord(uint8 info, xl_xact_prepare *xlrec, xl_xact_parsed_prepare *p
 	parsed->nsubxacts = xlrec->nsubxacts;
 	parsed->nrels = xlrec->ncommitrels;
 	parsed->nabortrels = xlrec->nabortrels;
+	parsed->nstats = xlrec->ncommitstats;
+	parsed->nabortstats = xlrec->nabortstats;
 	parsed->nmsgs = xlrec->ninvalmsgs;
 
 	strncpy(parsed->twophase_gid, bufptr, xlrec->gidlen);
@@ -287,10 +289,8 @@ xact_desc_relations(StringInfo buf, char *label, int nrels,
 		appendStringInfo(buf, "; %s:", label);
 		for (i = 0; i < nrels; i++)
 		{
-			char	   *path = relpathperm(xlocators[i], MAIN_FORKNUM);
-
-			appendStringInfo(buf, " %s", path);
-			pfree(path);
+			appendStringInfo(buf, " %s",
+							 relpathperm(xlocators[i], MAIN_FORKNUM).str);
 		}
 	}
 }
@@ -322,16 +322,16 @@ xact_desc_stats(StringInfo buf, const char *label,
 			uint64		objid =
 				((uint64) dropped_stats[i].objid_hi) << 32 | dropped_stats[i].objid_lo;
 
-			appendStringInfo(buf, " %d/%u/%llu",
+			appendStringInfo(buf, " %d/%u/%" PRIu64,
 							 dropped_stats[i].kind,
 							 dropped_stats[i].dboid,
-							 (unsigned long long) objid);
+							 objid);
 		}
 	}
 }
 
 static void
-xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, RepOriginId origin_id)
+xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, ReplOriginId origin_id)
 {
 	xl_xact_parsed_commit parsed;
 
@@ -359,7 +359,7 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, RepOriginId 
 
 	if (parsed.xinfo & XACT_XINFO_HAS_ORIGIN)
 	{
-		appendStringInfo(buf, "; origin: node %u, lsn %X/%X, at %s",
+		appendStringInfo(buf, "; origin: node %u, lsn %X/%08X, at %s",
 						 origin_id,
 						 LSN_FORMAT_ARGS(parsed.origin_lsn),
 						 timestamptz_to_str(parsed.origin_timestamp));
@@ -367,7 +367,7 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, RepOriginId 
 }
 
 static void
-xact_desc_abort(StringInfo buf, uint8 info, xl_xact_abort *xlrec, RepOriginId origin_id)
+xact_desc_abort(StringInfo buf, uint8 info, xl_xact_abort *xlrec, ReplOriginId origin_id)
 {
 	xl_xact_parsed_abort parsed;
 
@@ -384,7 +384,7 @@ xact_desc_abort(StringInfo buf, uint8 info, xl_xact_abort *xlrec, RepOriginId or
 
 	if (parsed.xinfo & XACT_XINFO_HAS_ORIGIN)
 	{
-		appendStringInfo(buf, "; origin: node %u, lsn %X/%X, at %s",
+		appendStringInfo(buf, "; origin: node %u, lsn %X/%08X, at %s",
 						 origin_id,
 						 LSN_FORMAT_ARGS(parsed.origin_lsn),
 						 timestamptz_to_str(parsed.origin_timestamp));
@@ -394,7 +394,7 @@ xact_desc_abort(StringInfo buf, uint8 info, xl_xact_abort *xlrec, RepOriginId or
 }
 
 static void
-xact_desc_prepare(StringInfo buf, uint8 info, xl_xact_prepare *xlrec, RepOriginId origin_id)
+xact_desc_prepare(StringInfo buf, uint8 info, xl_xact_prepare *xlrec, ReplOriginId origin_id)
 {
 	xl_xact_parsed_prepare parsed;
 
@@ -417,8 +417,8 @@ xact_desc_prepare(StringInfo buf, uint8 info, xl_xact_prepare *xlrec, RepOriginI
 	 * Check if the replication origin has been set in this record in the same
 	 * way as PrepareRedoAdd().
 	 */
-	if (origin_id != InvalidRepOriginId)
-		appendStringInfo(buf, "; origin: node %u, lsn %X/%X, at %s",
+	if (origin_id != InvalidReplOriginId)
+		appendStringInfo(buf, "; origin: node %u, lsn %X/%08X, at %s",
 						 origin_id,
 						 LSN_FORMAT_ARGS(parsed.origin_lsn),
 						 timestamptz_to_str(parsed.origin_timestamp));

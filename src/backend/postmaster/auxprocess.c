@@ -3,7 +3,7 @@
  *	  functions related to auxiliary processes.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -24,6 +24,7 @@
 #include "storage/procsignal.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
+#include "utils/wait_event.h"
 
 
 static void ShutdownAuxiliaryProcess(int code, Datum arg);
@@ -66,7 +67,7 @@ AuxiliaryProcessMainCommon(void)
 
 	BaseInit();
 
-	ProcSignalInit(false, 0);
+	ProcSignalInit(NULL, 0);
 
 	/*
 	 * Auxiliary processes don't run transactions, but they may need a
@@ -78,7 +79,8 @@ AuxiliaryProcessMainCommon(void)
 
 	/* Initialize backend status information */
 	pgstat_beinit();
-	pgstat_bestart();
+	pgstat_bestart_initial();
+	pgstat_bestart_final();
 
 	/* register a before-shutdown callback for LWLock cleanup */
 	before_shmem_exit(ShutdownAuxiliaryProcess, 0);

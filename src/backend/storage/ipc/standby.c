@@ -7,7 +7,7 @@
  *	AccessExclusiveLocks and starting snapshots for Hot Standby mode.
  *	Plus conflict recovery processing.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -31,9 +31,11 @@
 #include "storage/sinvaladt.h"
 #include "storage/standby.h"
 #include "utils/hsearch.h"
+#include "utils/injection_point.h"
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 /* User-settable GUC parameters */
 int			max_standby_archive_delay = 30 * 1000;
@@ -70,13 +72,13 @@ static volatile sig_atomic_t got_standby_delay_timeout = false;
 static volatile sig_atomic_t got_standby_lock_timeout = false;
 
 static void ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
-												   ProcSignalReason reason,
+												   RecoveryConflictReason reason,
 												   uint32 wait_event_info,
 												   bool report_waiting);
-static void SendRecoveryConflictWithBufferPin(ProcSignalReason reason);
+static void SendRecoveryConflictWithBufferPin(RecoveryConflictReason reason);
 static XLogRecPtr LogCurrentRunningXacts(RunningTransactions CurrRunningXacts);
 static void LogAccessExclusiveLocks(int nlocks, xl_standby_lock *locks);
-static const char *get_recovery_conflict_desc(ProcSignalReason reason);
+static const char *get_recovery_conflict_desc(RecoveryConflictReason reason);
 
 /*
  * InitRecoveryTransactionEnvironment
@@ -270,7 +272,7 @@ WaitExceedsMaxStandbyDelay(uint32 wait_event_info)
  * to be resolved or not.
  */
 void
-LogRecoveryConflict(ProcSignalReason reason, TimestampTz wait_start,
+LogRecoveryConflict(RecoveryConflictReason reason, TimestampTz wait_start,
 					TimestampTz now, VirtualTransactionId *wait_list,
 					bool still_waiting)
 {
@@ -357,7 +359,8 @@ LogRecoveryConflict(ProcSignalReason reason, TimestampTz wait_start,
  */
 static void
 ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
-									   ProcSignalReason reason, uint32 wait_event_info,
+									   RecoveryConflictReason reason,
+									   uint32 wait_event_info,
 									   bool report_waiting)
 {
 	TimestampTz waitStart = 0;
@@ -383,19 +386,19 @@ ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
 			/* Is it time to kill it? */
 			if (WaitExceedsMaxStandbyDelay(wait_event_info))
 			{
-				pid_t		pid;
+				bool		signaled;
 
 				/*
 				 * Now find out who to throw out of the balloon.
 				 */
 				Assert(VirtualTransactionIdIsValid(*waitlist));
-				pid = CancelVirtualTransaction(*waitlist, reason);
+				signaled = SignalRecoveryConflictWithVirtualXID(*waitlist, reason);
 
 				/*
 				 * Wait a little bit for it to die so that we avoid flooding
 				 * an unresponsive backend when system is heavily loaded.
 				 */
-				if (pid != 0)
+				if (signaled)
 					pg_usleep(5000L);
 			}
 
@@ -488,7 +491,7 @@ ResolveRecoveryConflictWithSnapshot(TransactionId snapshotConflictHorizon,
 	backends = GetConflictingVirtualXIDs(snapshotConflictHorizon,
 										 locator.dbOid);
 	ResolveRecoveryConflictWithVirtualXIDs(backends,
-										   PROCSIG_RECOVERY_CONFLICT_SNAPSHOT,
+										   RECOVERY_CONFLICT_SNAPSHOT,
 										   WAIT_EVENT_RECOVERY_CONFLICT_SNAPSHOT,
 										   true);
 
@@ -498,7 +501,7 @@ ResolveRecoveryConflictWithSnapshot(TransactionId snapshotConflictHorizon,
 	 * seems OK, given that this kind of conflict should not normally be
 	 * reached, e.g. due to using a physical replication slot.
 	 */
-	if (wal_level >= WAL_LEVEL_LOGICAL && isCatalogRel)
+	if (IsLogicalDecodingEnabled() && isCatalogRel)
 		InvalidateObsoleteReplicationSlots(RS_INVAL_HORIZON, 0, locator.dbOid,
 										   snapshotConflictHorizon);
 }
@@ -559,7 +562,7 @@ ResolveRecoveryConflictWithTablespace(Oid tsid)
 	temp_file_users = GetConflictingVirtualXIDs(InvalidTransactionId,
 												InvalidOid);
 	ResolveRecoveryConflictWithVirtualXIDs(temp_file_users,
-										   PROCSIG_RECOVERY_CONFLICT_TABLESPACE,
+										   RECOVERY_CONFLICT_TABLESPACE,
 										   WAIT_EVENT_RECOVERY_CONFLICT_TABLESPACE,
 										   true);
 }
@@ -580,7 +583,7 @@ ResolveRecoveryConflictWithDatabase(Oid dbid)
 	 */
 	while (CountDBBackends(dbid) > 0)
 	{
-		CancelDBBackends(dbid, PROCSIG_RECOVERY_CONFLICT_DATABASE, true);
+		SignalRecoveryConflictWithDatabase(dbid, RECOVERY_CONFLICT_DATABASE);
 
 		/*
 		 * Wait awhile for them to die so that we avoid flooding an
@@ -664,7 +667,7 @@ ResolveRecoveryConflictWithLock(LOCKTAG locktag, bool logging_conflict)
 		 * because the caller, WaitOnLock(), has already reported that.
 		 */
 		ResolveRecoveryConflictWithVirtualXIDs(backends,
-											   PROCSIG_RECOVERY_CONFLICT_LOCK,
+											   RECOVERY_CONFLICT_LOCK,
 											   PG_WAIT_LOCK | locktag.locktag_type,
 											   false);
 	}
@@ -722,9 +725,8 @@ ResolveRecoveryConflictWithLock(LOCKTAG locktag, bool logging_conflict)
 		 */
 		while (VirtualTransactionIdIsValid(*backends))
 		{
-			SignalVirtualTransaction(*backends,
-									 PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK,
-									 false);
+			(void) SignalRecoveryConflictWithVirtualXID(*backends,
+														RECOVERY_CONFLICT_STARTUP_DEADLOCK);
 			backends++;
 		}
 
@@ -802,7 +804,7 @@ ResolveRecoveryConflictWithBufferPin(void)
 		/*
 		 * We're already behind, so clear a path as quickly as possible.
 		 */
-		SendRecoveryConflictWithBufferPin(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
+		SendRecoveryConflictWithBufferPin(RECOVERY_CONFLICT_BUFFERPIN);
 	}
 	else
 	{
@@ -839,10 +841,10 @@ ResolveRecoveryConflictWithBufferPin(void)
 	 * SIGHUP signal handler, etc cannot do that because it uses the different
 	 * latch from that ProcWaitForSignal() waits on.
 	 */
-	ProcWaitForSignal(WAIT_EVENT_BUFFER_PIN);
+	ProcWaitForSignal(WAIT_EVENT_BUFFER_CLEANUP);
 
 	if (got_standby_delay_timeout)
-		SendRecoveryConflictWithBufferPin(PROCSIG_RECOVERY_CONFLICT_BUFFERPIN);
+		SendRecoveryConflictWithBufferPin(RECOVERY_CONFLICT_BUFFERPIN);
 	else if (got_standby_deadlock_timeout)
 	{
 		/*
@@ -858,7 +860,7 @@ ResolveRecoveryConflictWithBufferPin(void)
 		 * not be so harmful because the period that the buffer is kept pinned
 		 * is basically no so long. But we should fix this?
 		 */
-		SendRecoveryConflictWithBufferPin(PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK);
+		SendRecoveryConflictWithBufferPin(RECOVERY_CONFLICT_BUFFERPIN_DEADLOCK);
 	}
 
 	/*
@@ -873,18 +875,18 @@ ResolveRecoveryConflictWithBufferPin(void)
 }
 
 static void
-SendRecoveryConflictWithBufferPin(ProcSignalReason reason)
+SendRecoveryConflictWithBufferPin(RecoveryConflictReason reason)
 {
-	Assert(reason == PROCSIG_RECOVERY_CONFLICT_BUFFERPIN ||
-		   reason == PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK);
+	Assert(reason == RECOVERY_CONFLICT_BUFFERPIN ||
+		   reason == RECOVERY_CONFLICT_BUFFERPIN_DEADLOCK);
 
 	/*
 	 * We send signal to all backends to ask them if they are holding the
-	 * buffer pin which is delaying the Startup process. We must not set the
-	 * conflict flag yet, since most backends will be innocent. Let the
-	 * SIGUSR1 handling in each backend decide their own fate.
+	 * buffer pin which is delaying the Startup process. Most of them will be
+	 * innocent, but we let the SIGUSR1 handling in each backend decide their
+	 * own fate.
 	 */
-	CancelDBBackends(InvalidOid, reason, false);
+	SignalRecoveryConflictWithDatabase(InvalidOid, reason);
 }
 
 /*
@@ -1284,8 +1286,20 @@ LogStandbySnapshot(void)
 	RunningTransactions running;
 	xl_standby_lock *locks;
 	int			nlocks;
+	bool		logical_decoding_enabled = IsLogicalDecodingEnabled();
 
 	Assert(XLogStandbyInfoActive());
+
+#ifdef USE_INJECTION_POINTS
+	if (IS_INJECTION_POINT_ATTACHED("skip-log-running-xacts"))
+	{
+		/*
+		 * This record could move slot's xmin forward during decoding, leading
+		 * to unpredictable results, so skip it when requested by the test.
+		 */
+		return GetInsertRecPtr();
+	}
+#endif
 
 	/*
 	 * Get details of any AccessExclusiveLocks being held at the moment.
@@ -1313,13 +1327,13 @@ LogStandbySnapshot(void)
 	 * record. Fortunately this routine isn't executed frequently, and it's
 	 * only a shared lock.
 	 */
-	if (wal_level < WAL_LEVEL_LOGICAL)
+	if (!logical_decoding_enabled)
 		LWLockRelease(ProcArrayLock);
 
 	recptr = LogCurrentRunningXacts(running);
 
 	/* Release lock if we kept it longer ... */
-	if (wal_level >= WAL_LEVEL_LOGICAL)
+	if (logical_decoding_enabled)
 		LWLockRelease(ProcArrayLock);
 
 	/* GetRunningTransactionData() acquired XidGenLock, we must release it */
@@ -1353,18 +1367,18 @@ LogCurrentRunningXacts(RunningTransactions CurrRunningXacts)
 	/* Header */
 	XLogBeginInsert();
 	XLogSetRecordFlags(XLOG_MARK_UNIMPORTANT);
-	XLogRegisterData((char *) (&xlrec), MinSizeOfXactRunningXacts);
+	XLogRegisterData(&xlrec, MinSizeOfXactRunningXacts);
 
 	/* array of TransactionIds */
 	if (xlrec.xcnt > 0)
-		XLogRegisterData((char *) CurrRunningXacts->xids,
+		XLogRegisterData(CurrRunningXacts->xids,
 						 (xlrec.xcnt + xlrec.subxcnt) * sizeof(TransactionId));
 
 	recptr = XLogInsert(RM_STANDBY_ID, XLOG_RUNNING_XACTS);
 
 	if (xlrec.subxid_overflow)
 		elog(DEBUG2,
-			 "snapshot of %d running transactions overflowed (lsn %X/%X oldest xid %u latest complete %u next xid %u)",
+			 "snapshot of %d running transactions overflowed (lsn %X/%08X oldest xid %u latest complete %u next xid %u)",
 			 CurrRunningXacts->xcnt,
 			 LSN_FORMAT_ARGS(recptr),
 			 CurrRunningXacts->oldestRunningXid,
@@ -1372,7 +1386,7 @@ LogCurrentRunningXacts(RunningTransactions CurrRunningXacts)
 			 CurrRunningXacts->nextXid);
 	else
 		elog(DEBUG2,
-			 "snapshot of %d+%d running transaction ids (lsn %X/%X oldest xid %u latest complete %u next xid %u)",
+			 "snapshot of %d+%d running transaction ids (lsn %X/%08X oldest xid %u latest complete %u next xid %u)",
 			 CurrRunningXacts->xcnt, CurrRunningXacts->subxcnt,
 			 LSN_FORMAT_ARGS(recptr),
 			 CurrRunningXacts->oldestRunningXid,
@@ -1405,8 +1419,8 @@ LogAccessExclusiveLocks(int nlocks, xl_standby_lock *locks)
 	xlrec.nlocks = nlocks;
 
 	XLogBeginInsert();
-	XLogRegisterData((char *) &xlrec, offsetof(xl_standby_locks, locks));
-	XLogRegisterData((char *) locks, nlocks * sizeof(xl_standby_lock));
+	XLogRegisterData(&xlrec, offsetof(xl_standby_locks, locks));
+	XLogRegisterData(locks, nlocks * sizeof(xl_standby_lock));
 	XLogSetRecordFlags(XLOG_MARK_UNIMPORTANT);
 
 	(void) XLogInsert(RM_STANDBY_ID, XLOG_STANDBY_LOCK);
@@ -1469,42 +1483,43 @@ LogStandbyInvalidations(int nmsgs, SharedInvalidationMessage *msgs,
 
 	/* perform insertion */
 	XLogBeginInsert();
-	XLogRegisterData((char *) (&xlrec), MinSizeOfInvalidations);
-	XLogRegisterData((char *) msgs,
+	XLogRegisterData(&xlrec, MinSizeOfInvalidations);
+	XLogRegisterData(msgs,
 					 nmsgs * sizeof(SharedInvalidationMessage));
 	XLogInsert(RM_STANDBY_ID, XLOG_INVALIDATIONS);
 }
 
 /* Return the description of recovery conflict */
 static const char *
-get_recovery_conflict_desc(ProcSignalReason reason)
+get_recovery_conflict_desc(RecoveryConflictReason reason)
 {
 	const char *reasonDesc = _("unknown reason");
 
 	switch (reason)
 	{
-		case PROCSIG_RECOVERY_CONFLICT_BUFFERPIN:
+		case RECOVERY_CONFLICT_BUFFERPIN:
 			reasonDesc = _("recovery conflict on buffer pin");
 			break;
-		case PROCSIG_RECOVERY_CONFLICT_LOCK:
+		case RECOVERY_CONFLICT_LOCK:
 			reasonDesc = _("recovery conflict on lock");
 			break;
-		case PROCSIG_RECOVERY_CONFLICT_TABLESPACE:
+		case RECOVERY_CONFLICT_TABLESPACE:
 			reasonDesc = _("recovery conflict on tablespace");
 			break;
-		case PROCSIG_RECOVERY_CONFLICT_SNAPSHOT:
+		case RECOVERY_CONFLICT_SNAPSHOT:
 			reasonDesc = _("recovery conflict on snapshot");
 			break;
-		case PROCSIG_RECOVERY_CONFLICT_LOGICALSLOT:
+		case RECOVERY_CONFLICT_LOGICALSLOT:
 			reasonDesc = _("recovery conflict on replication slot");
 			break;
-		case PROCSIG_RECOVERY_CONFLICT_STARTUP_DEADLOCK:
+		case RECOVERY_CONFLICT_STARTUP_DEADLOCK:
+			reasonDesc = _("recovery conflict on deadlock");
+			break;
+		case RECOVERY_CONFLICT_BUFFERPIN_DEADLOCK:
 			reasonDesc = _("recovery conflict on buffer deadlock");
 			break;
-		case PROCSIG_RECOVERY_CONFLICT_DATABASE:
+		case RECOVERY_CONFLICT_DATABASE:
 			reasonDesc = _("recovery conflict on database");
-			break;
-		default:
 			break;
 	}
 

@@ -4,7 +4,7 @@
  *	  Definitions for tagged nodes.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/nodes.h
@@ -54,6 +54,7 @@ typedef enum NodeTag
  *   readfuncs.c.
  *
  * - custom_query_jumble: Has custom implementation in queryjumblefuncs.c.
+ *   Also available as a node field attribute.
  *
  * - no_copy: Does not support copyObject() at all.
  *
@@ -101,9 +102,14 @@ typedef enum NodeTag
  * - equal_ignore_if_zero: Ignore the field for equality if it is zero.
  *   (Otherwise, compare normally.)
  *
+ * - custom_query_jumble: Has custom implementation in queryjumblefuncs.c
+ *   for the field of a node.  Also available as a node attribute.
+ *
  * - query_jumble_ignore: Ignore the field for the query jumbling.  Note
  *   that typmod and collation information are usually irrelevant for the
  *   query jumbling.
+ *
+ * - query_jumble_squash: Squash multiple values during query jumbling.
  *
  * - query_jumble_location: Mark the field as a location to track.  This is
  *   only allowed for integer fields that include "location" in their name.
@@ -182,6 +188,8 @@ castNodeImpl(NodeTag type, void *ptr)
  * ----------------------------------------------------------------
  */
 
+#ifndef FRONTEND
+
 /*
  * nodes/{outfuncs.c,print.c}
  */
@@ -192,7 +200,7 @@ extern void outNode(struct StringInfoData *str, const void *obj);
 extern void outToken(struct StringInfoData *str, const char *s);
 extern void outBitmapset(struct StringInfoData *str,
 						 const struct Bitmapset *bms);
-extern void outDatum(struct StringInfoData *str, uintptr_t value,
+extern void outDatum(struct StringInfoData *str, Datum value,
 					 int typlen, bool typbyval);
 extern char *nodeToString(const void *obj);
 extern char *nodeToStringWithLocations(const void *obj);
@@ -206,7 +214,7 @@ extern void *stringToNode(const char *str);
 extern void *stringToNodeWithLocations(const char *str);
 #endif
 extern struct Bitmapset *readBitmapset(void);
-extern uintptr_t readDatum(bool typbyval);
+extern Datum readDatum(bool typbyval);
 extern bool *readBoolCols(int numCols);
 extern int *readIntCols(int numCols);
 extern Oid *readOidCols(int numCols);
@@ -218,8 +226,8 @@ extern int16 *readAttrNumberCols(int numCols);
 extern void *copyObjectImpl(const void *from);
 
 /* cast result back to argument type, if supported by compiler */
-#ifdef HAVE_TYPEOF
-#define copyObject(obj) ((typeof(obj)) copyObjectImpl(obj))
+#ifdef HAVE_TYPEOF_UNQUAL
+#define copyObject(obj) ((typeof_unqual(*(obj)) *) copyObjectImpl(obj))
 #else
 #define copyObject(obj) copyObjectImpl(obj)
 #endif
@@ -228,6 +236,8 @@ extern void *copyObjectImpl(const void *from);
  * nodes/equalfuncs.c
  */
 extern bool equal(const void *a, const void *b);
+
+#endif							/* !FRONTEND */
 
 
 /*
@@ -313,8 +323,8 @@ typedef enum JoinType
 	 * These codes are used internally in the planner, but are not supported
 	 * by the executor (nor, indeed, by most of the planner).
 	 */
-	JOIN_UNIQUE_OUTER,			/* LHS path must be made unique */
-	JOIN_UNIQUE_INNER,			/* RHS path must be made unique */
+	JOIN_UNIQUE_OUTER,			/* LHS has be made unique */
+	JOIN_UNIQUE_INNER,			/* RHS has be made unique */
 
 	/*
 	 * We might need additional join types someday.
@@ -418,6 +428,7 @@ typedef enum OnConflictAction
 	ONCONFLICT_NONE,			/* No "ON CONFLICT" clause */
 	ONCONFLICT_NOTHING,			/* ON CONFLICT ... DO NOTHING */
 	ONCONFLICT_UPDATE,			/* ON CONFLICT ... DO UPDATE */
+	ONCONFLICT_SELECT,			/* ON CONFLICT ... DO SELECT */
 } OnConflictAction;
 
 /*

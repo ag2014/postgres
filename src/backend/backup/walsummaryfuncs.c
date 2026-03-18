@@ -3,7 +3,7 @@
  * walsummaryfuncs.c
  *	  SQL-callable functions for accessing WAL summary data.
  *
- * Portions Copyright (c) 2010-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2026, PostgreSQL Global Development Group
  *
  * src/backend/backup/walsummaryfuncs.c
  *
@@ -12,6 +12,7 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "backup/walsummary.h"
 #include "common/blkreftable.h"
 #include "funcapi.h"
@@ -19,6 +20,7 @@
 #include "postmaster/walsummarizer.h"
 #include "utils/fmgrprotos.h"
 #include "utils/pg_lsn.h"
+#include "utils/tuplestore.h"
 
 #define NUM_WS_ATTS			3
 #define NUM_SUMMARY_ATTS	6
@@ -92,7 +94,7 @@ pg_wal_summary_contents(PG_FUNCTION_ARGS)
 	if (raw_tli < 1 || raw_tli > PG_INT32_MAX)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				errmsg("invalid timeline %lld", (long long) raw_tli));
+				errmsg("invalid timeline %" PRId64, raw_tli));
 
 	/* Prepare to read the specified WAL summary file. */
 	ws.tli = (TimeLineID) raw_tli;

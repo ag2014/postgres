@@ -13,7 +13,7 @@
  *
  * Author: Andreas Pflug <pgadmin@pse-consulting.de>
  *
- * Copyright (c) 2004-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2004-2026, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -51,6 +51,7 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
+#include "utils/wait_event.h"
 
 /*
  * We read() into a temp buffer twice as big as a chunk, so that any fragment
@@ -162,7 +163,7 @@ typedef struct
  * argc/argv parameters are valid only in EXEC_BACKEND case.
  */
 void
-SysLoggerMain(char *startup_data, size_t startup_data_len)
+SysLoggerMain(const void *startup_data, size_t startup_data_len)
 {
 #ifndef WIN32
 	char		logbuffer[READ_BUF_SIZE];
@@ -183,7 +184,7 @@ SysLoggerMain(char *startup_data, size_t startup_data_len)
 	 */
 #ifdef EXEC_BACKEND
 	{
-		SysloggerStartupData *slsdata = (SysloggerStartupData *) startup_data;
+		const SysloggerStartupData *slsdata = startup_data;
 
 		Assert(startup_data_len == sizeof(*slsdata));
 		syslogFile = syslogger_fdopen(slsdata->syslogFile);
@@ -206,7 +207,6 @@ SysLoggerMain(char *startup_data, size_t startup_data_len)
 
 	now = MyStartTime;
 
-	MyBackendType = B_LOGGER;
 	init_ps_display(NULL);
 
 	/*
@@ -444,19 +444,19 @@ SysLoggerMain(char *startup_data, size_t startup_data_len)
 		if (!rotation_requested && Log_RotationSize > 0 && !rotation_disabled)
 		{
 			/* Do a rotation if file is too big */
-			if (ftell(syslogFile) >= Log_RotationSize * 1024L)
+			if (ftello(syslogFile) >= Log_RotationSize * (pgoff_t) 1024)
 			{
 				rotation_requested = true;
 				size_rotation_for |= LOG_DESTINATION_STDERR;
 			}
 			if (csvlogFile != NULL &&
-				ftell(csvlogFile) >= Log_RotationSize * 1024L)
+				ftello(csvlogFile) >= Log_RotationSize * (pgoff_t) 1024)
 			{
 				rotation_requested = true;
 				size_rotation_for |= LOG_DESTINATION_CSVLOG;
 			}
 			if (jsonlogFile != NULL &&
-				ftell(jsonlogFile) >= Log_RotationSize * 1024L)
+				ftello(jsonlogFile) >= Log_RotationSize * (pgoff_t) 1024)
 			{
 				rotation_requested = true;
 				size_rotation_for |= LOG_DESTINATION_JSONLOG;
@@ -699,7 +699,7 @@ SysLogger_Start(int child_slot)
 	startup_data.csvlogFile = syslogger_fdget(csvlogFile);
 	startup_data.jsonlogFile = syslogger_fdget(jsonlogFile);
 	sysloggerPid = postmaster_child_launch(B_LOGGER, child_slot,
-										   (char *) &startup_data, sizeof(startup_data), NULL);
+										   &startup_data, sizeof(startup_data), NULL);
 #else
 	sysloggerPid = postmaster_child_launch(B_LOGGER, child_slot,
 										   NULL, 0, NULL);
@@ -960,7 +960,7 @@ process_pipe_input(char *logbuffer, int *bytes_in_logbuffer)
 						 * Need a free slot, but there isn't one in the list,
 						 * so create a new one and extend the list with it.
 						 */
-						free_slot = palloc(sizeof(save_buffer));
+						free_slot = palloc_object(save_buffer);
 						buffer_list = lappend(buffer_list, free_slot);
 						buffer_lists[p.pid % NBUFFER_LISTS] = buffer_list;
 					}
@@ -1183,9 +1183,11 @@ pipeThread(void *arg)
 		 */
 		if (Log_RotationSize > 0)
 		{
-			if (ftell(syslogFile) >= Log_RotationSize * 1024L ||
-				(csvlogFile != NULL && ftell(csvlogFile) >= Log_RotationSize * 1024L) ||
-				(jsonlogFile != NULL && ftell(jsonlogFile) >= Log_RotationSize * 1024L))
+			if (ftello(syslogFile) >= Log_RotationSize * (pgoff_t) 1024 ||
+				(csvlogFile != NULL &&
+				 ftello(csvlogFile) >= Log_RotationSize * (pgoff_t) 1024) ||
+				(jsonlogFile != NULL &&
+				 ftello(jsonlogFile) >= Log_RotationSize * (pgoff_t) 1024))
 				SetLatch(MyLatch);
 		}
 		LeaveCriticalSection(&sysloggerSection);

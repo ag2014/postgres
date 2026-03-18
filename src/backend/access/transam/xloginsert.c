@@ -9,7 +9,7 @@
  * of XLogRecData structs by a call to XLogRecordAssemble(). See
  * access/transam/README for details.
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xloginsert.c
@@ -33,12 +33,15 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_control.h"
 #include "common/pg_lzcompress.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "replication/origin.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
 #include "utils/memutils.h"
+#include "utils/pgstat_internal.h"
+#include "utils/rel.h"
 
 /*
  * Guess the maximum buffer size required to store a compressed version of
@@ -72,7 +75,7 @@ typedef struct
 	RelFileLocator rlocator;	/* identifies the relation and block */
 	ForkNumber	forkno;
 	BlockNumber block;
-	const char *page;			/* page content */
+	const PageData *page;		/* page content */
 	uint32		rdata_len;		/* total length of data in rdata chain */
 	XLogRecData *rdata_head;	/* head of the chain of data registered with
 								 * this block */
@@ -113,7 +116,7 @@ static uint8 curinsert_flags = 0;
 static XLogRecData hdr_rdt;
 static char *hdr_scratch = NULL;
 
-#define SizeOfXlogOrigin	(sizeof(RepOriginId) + sizeof(char))
+#define SizeOfXlogOrigin	(sizeof(ReplOriginId) + sizeof(char))
 #define SizeOfXLogTransactionId	(sizeof(TransactionId) + sizeof(char))
 
 #define HEADER_SCRATCH_SIZE \
@@ -137,9 +140,10 @@ static MemoryContext xloginsert_cxt;
 static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
 									   XLogRecPtr RedoRecPtr, bool doPageWrites,
 									   XLogRecPtr *fpw_lsn, int *num_fpi,
+									   uint64 *fpi_bytes,
 									   bool *topxid_included);
-static bool XLogCompressBackupBlock(const char *page, uint16 hole_offset,
-									uint16 hole_length, char *dest, uint16 *dlen);
+static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
+									uint16 hole_length, void *dest, uint16 *dlen);
 
 /*
  * Begin constructing a WAL record. This must be called before the
@@ -258,7 +262,8 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	 */
 #ifdef USE_ASSERT_CHECKING
 	if (!(flags & REGBUF_NO_CHANGE))
-		Assert(BufferIsExclusiveLocked(buffer) && BufferIsDirty(buffer));
+		Assert(BufferIsLockedByMeInMode(buffer, BUFFER_LOCK_EXCLUSIVE) &&
+			   BufferIsDirty(buffer));
 #endif
 
 	if (block_id >= max_registered_block_id)
@@ -307,7 +312,7 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
  */
 void
 XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
-				  BlockNumber blknum, const char *page, uint8 flags)
+				  BlockNumber blknum, const PageData *page, uint8 flags)
 {
 	registered_buffer *regbuf;
 
@@ -361,7 +366,7 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
  * XLogRecGetData().
  */
 void
-XLogRegisterData(const char *data, uint32 len)
+XLogRegisterData(const void *data, uint32 len)
 {
 	XLogRecData *rdata;
 
@@ -402,7 +407,7 @@ XLogRegisterData(const char *data, uint32 len)
  * limited)
  */
 void
-XLogRegisterBufData(uint8 block_id, const char *data, uint32 len)
+XLogRegisterBufData(uint8 block_id, const void *data, uint32 len)
 {
 	registered_buffer *regbuf;
 	XLogRecData *rdata;
@@ -509,6 +514,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 		XLogRecPtr	fpw_lsn;
 		XLogRecData *rdt;
 		int			num_fpi = 0;
+		uint64		fpi_bytes = 0;
 
 		/*
 		 * Get values needed to decide whether to do full-page writes. Since
@@ -518,15 +524,79 @@ XLogInsert(RmgrId rmid, uint8 info)
 		GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
 
 		rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
-								 &fpw_lsn, &num_fpi, &topxid_included);
+								 &fpw_lsn, &num_fpi, &fpi_bytes,
+								 &topxid_included);
 
 		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi,
-								  topxid_included);
-	} while (EndPos == InvalidXLogRecPtr);
+								  fpi_bytes, topxid_included);
+	} while (!XLogRecPtrIsValid(EndPos));
 
 	XLogResetInsertion();
 
 	return EndPos;
+}
+
+/*
+ * Simple wrapper to XLogInsert to insert a WAL record with elementary
+ * contents (only an int64 is supported as value currently).
+ */
+XLogRecPtr
+XLogSimpleInsertInt64(RmgrId rmid, uint8 info, int64 value)
+{
+	XLogBeginInsert();
+	XLogRegisterData(&value, sizeof(value));
+	return XLogInsert(rmid, info);
+}
+
+/*
+ * XLogGetFakeLSN - get a fake LSN for an index page that isn't WAL-logged.
+ *
+ * Some index AMs use LSNs to detect concurrent page modifications, but not
+ * all index pages are WAL-logged.  This function provides a sequence of fake
+ * LSNs for that purpose.
+ */
+XLogRecPtr
+XLogGetFakeLSN(Relation rel)
+{
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+	{
+		/*
+		 * Temporary relations are only accessible in our session, so a simple
+		 * backend-local counter will do.
+		 */
+		static XLogRecPtr counter = FirstNormalUnloggedLSN;
+
+		return counter++;
+	}
+	else if (rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED)
+	{
+		/*
+		 * Unlogged relations are accessible from other backends, and survive
+		 * (clean) restarts.  GetFakeLSNForUnloggedRel() handles that for us.
+		 */
+		return GetFakeLSNForUnloggedRel();
+	}
+	else
+	{
+		/*
+		 * WAL-logging on this relation will start after commit, so its LSNs
+		 * must be distinct numbers smaller than the LSN at the next commit.
+		 * Emit a dummy WAL record if insert-LSN hasn't advanced after the
+		 * last call.
+		 */
+		static XLogRecPtr lastlsn = InvalidXLogRecPtr;
+		XLogRecPtr	currlsn = GetXLogInsertEndRecPtr();
+
+		Assert(!RelationNeedsWAL(rel));
+		Assert(RelationIsPermanent(rel));
+
+		/* No need for an actual record if we already have a distinct LSN */
+		if (XLogRecPtrIsValid(lastlsn) && lastlsn == currlsn)
+			currlsn = XLogAssignLSN();
+
+		lastlsn = currlsn;
+		return currlsn;
+	}
 }
 
 /*
@@ -547,7 +617,8 @@ XLogInsert(RmgrId rmid, uint8 info)
 static XLogRecData *
 XLogRecordAssemble(RmgrId rmid, uint8 info,
 				   XLogRecPtr RedoRecPtr, bool doPageWrites,
-				   XLogRecPtr *fpw_lsn, int *num_fpi, bool *topxid_included)
+				   XLogRecPtr *fpw_lsn, int *num_fpi, uint64 *fpi_bytes,
+				   bool *topxid_included)
 {
 	XLogRecData *rdt;
 	uint64		total_len = 0;
@@ -620,7 +691,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			needs_backup = (page_lsn <= RedoRecPtr);
 			if (!needs_backup)
 			{
-				if (*fpw_lsn == InvalidXLogRecPtr || page_lsn < *fpw_lsn)
+				if (!XLogRecPtrIsValid(*fpw_lsn) || page_lsn < *fpw_lsn)
 					*fpw_lsn = page_lsn;
 			}
 		}
@@ -648,7 +719,7 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 		if (include_image)
 		{
-			const char *page = regbuf->page;
+			const PageData *page = regbuf->page;
 			uint16		compressed_len = 0;
 
 			/*
@@ -658,8 +729,8 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			if (regbuf->flags & REGBUF_STANDARD)
 			{
 				/* Assume we can omit data between pd_lower and pd_upper */
-				uint16		lower = ((PageHeader) page)->pd_lower;
-				uint16		upper = ((PageHeader) page)->pd_upper;
+				uint16		lower = ((const PageHeaderData *) page)->pd_lower;
+				uint16		upper = ((const PageHeaderData *) page)->pd_upper;
 
 				if (lower >= SizeOfPageHeaderData &&
 					upper > lower &&
@@ -783,6 +854,9 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			}
 
 			total_len += bimg.length;
+
+			/* Track the WAL full page images in bytes */
+			*fpi_bytes += bimg.length;
 		}
 
 		if (needs_data)
@@ -839,11 +913,11 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 	/* followed by the record's origin, if any */
 	if ((curinsert_flags & XLOG_INCLUDE_ORIGIN) &&
-		replorigin_session_origin != InvalidRepOriginId)
+		replorigin_xact_state.origin != InvalidReplOriginId)
 	{
 		*(scratch++) = (char) XLR_BLOCK_ID_ORIGIN;
-		memcpy(scratch, &replorigin_session_origin, sizeof(replorigin_session_origin));
-		scratch += sizeof(replorigin_session_origin);
+		memcpy(scratch, &replorigin_xact_state.origin, sizeof(replorigin_xact_state.origin));
+		scratch += sizeof(replorigin_xact_state.origin);
 	}
 
 	/* followed by toplevel XID, if not already included in previous record */
@@ -869,8 +943,8 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			if (mainrdata_len > PG_UINT32_MAX)
 				ereport(ERROR,
 						(errmsg_internal("too much WAL data"),
-						 errdetail_internal("Main data length is %llu bytes for a maximum of %u bytes.",
-											(unsigned long long) mainrdata_len,
+						 errdetail_internal("Main data length is %" PRIu64 " bytes for a maximum of %u bytes.",
+											mainrdata_len,
 											PG_UINT32_MAX)));
 
 			mainrdata_len_4b = (uint32) mainrdata_len;
@@ -915,8 +989,8 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 	if (total_len > XLogRecordMaxSize)
 		ereport(ERROR,
 				(errmsg_internal("oversized WAL record"),
-				 errdetail_internal("WAL record would be %llu bytes (of maximum %u bytes); rmid %u flags %u.",
-									(unsigned long long) total_len, XLogRecordMaxSize, rmid, info)));
+				 errdetail_internal("WAL record would be %" PRIu64 " bytes (of maximum %u bytes); rmid %u flags %u.",
+									total_len, XLogRecordMaxSize, rmid, info)));
 
 	/*
 	 * Fill in the fields in the record header. Prev-link is filled in later,
@@ -941,13 +1015,13 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
  * the length of compressed block image.
  */
 static bool
-XLogCompressBackupBlock(const char *page, uint16 hole_offset, uint16 hole_length,
-						char *dest, uint16 *dlen)
+XLogCompressBackupBlock(const PageData *page, uint16 hole_offset, uint16 hole_length,
+						void *dest, uint16 *dlen)
 {
 	int32		orig_len = BLCKSZ - hole_length;
 	int32		len = -1;
 	int32		extra_bytes = 0;
-	const char *source;
+	const void *source;
 	PGAlignedBlock tmp;
 
 	if (hole_length != 0)
@@ -1044,7 +1118,10 @@ XLogCheckBufferNeedsBackup(Buffer buffer)
  * Write a backup block if needed when we are setting a hint. Note that
  * this may be called for a variety of page types, not just heaps.
  *
- * Callable while holding just share lock on the buffer content.
+ * Callable while holding just a share-exclusive lock on the buffer
+ * content. That suffices to prevent concurrent modifications of the
+ * buffer. The buffer already needs to have been marked dirty by
+ * MarkBufferDirtyHint().
  *
  * We can't use the plain backup block mechanism since that relies on the
  * Buffer being exclusively locked. Since some modifications (setting LSN, hint
@@ -1055,11 +1132,6 @@ XLogCheckBufferNeedsBackup(Buffer buffer)
  * We only need to do something if page has not yet been full page written in
  * this checkpoint round. The LSN of the inserted wal record is returned if we
  * had to write, InvalidXLogRecPtr otherwise.
- *
- * It is possible that multiple concurrent backends could attempt to write WAL
- * records. In that case, multiple copies of the same block would be recorded
- * in separate WAL records by different backends, though that is still OK from
- * a correctness perspective.
  */
 XLogRecPtr
 XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
@@ -1068,23 +1140,26 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
 	XLogRecPtr	lsn;
 	XLogRecPtr	RedoRecPtr;
 
-	/*
-	 * Ensure no checkpoint can change our view of RedoRecPtr.
-	 */
-	Assert((MyProc->delayChkptFlags & DELAY_CHKPT_START) != 0);
+	/* this also verifies that we hold an appropriate lock */
+	Assert(BufferIsDirty(buffer));
 
 	/*
-	 * Update RedoRecPtr so that we can make the right decision
+	 * Update RedoRecPtr so that we can make the right decision. It's possible
+	 * that a new checkpoint will start just after GetRedoRecPtr(), but that
+	 * is ok, as the buffer is already dirty, ensuring that any BufferSync()
+	 * started after the buffer was marked dirty cannot complete without
+	 * flushing this buffer.  If a checkpoint started between marking the
+	 * buffer dirty and this check, we will emit an unnecessary WAL record (as
+	 * the buffer will be written out as part of the checkpoint), but the
+	 * window for that is not big.
 	 */
 	RedoRecPtr = GetRedoRecPtr();
 
 	/*
 	 * We assume page LSN is first data on *every* page that can be passed to
-	 * XLogInsert, whether it has the standard page layout or not. Since we're
-	 * only holding a share-lock on the page, we must take the buffer header
-	 * lock when we look at the LSN.
+	 * XLogInsert, whether it has the standard page layout or not.
 	 */
-	lsn = BufferGetLSNAtomic(buffer);
+	lsn = PageGetLSN(BufferGetPage(buffer));
 
 	if (lsn <= RedoRecPtr)
 	{
@@ -1333,11 +1408,12 @@ log_newpage_range(Relation rel, ForkNumber forknum,
 		recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
 
 		for (i = 0; i < nbufs; i++)
-		{
 			PageSetLSN(BufferGetPage(bufpack[i]), recptr);
-			UnlockReleaseBuffer(bufpack[i]);
-		}
+
 		END_CRIT_SECTION();
+
+		for (i = 0; i < nbufs; i++)
+			UnlockReleaseBuffer(bufpack[i]);
 	}
 }
 

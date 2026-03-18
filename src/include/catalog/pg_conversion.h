@@ -3,7 +3,7 @@
  * pg_conversion.h
  *	  definition of the "conversion" system catalog (pg_conversion)
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_conversion.h
@@ -19,13 +19,15 @@
 
 #include "catalog/genbki.h"
 #include "catalog/objectaddress.h"
-#include "catalog/pg_conversion_d.h"
+#include "catalog/pg_conversion_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_conversion definition.  cpp turns this into
  *		typedef struct FormData_pg_conversion
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_conversion,2607,ConversionRelationId)
 {
 	/* oid */
@@ -52,6 +54,8 @@ CATALOG(pg_conversion,2607,ConversionRelationId)
 	/* true if this is a default conversion */
 	bool		condefault BKI_DEFAULT(t);
 } FormData_pg_conversion;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_conversion corresponds to a pointer to a tuple with

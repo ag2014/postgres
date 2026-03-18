@@ -4,7 +4,7 @@
  *	  definition of the "constraint" system catalog (pg_constraint)
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_constraint.h
@@ -20,7 +20,7 @@
 
 #include "catalog/dependency.h"
 #include "catalog/genbki.h"
-#include "catalog/pg_constraint_d.h"
+#include "catalog/pg_constraint_d.h"	/* IWYU pragma: export */
 #include "nodes/pg_list.h"
 
 /* ----------------
@@ -28,6 +28,8 @@
  *		typedef struct FormData_pg_constraint
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_constraint,2606,ConstraintRelationId)
 {
 	Oid			oid;			/* oid */
@@ -51,6 +53,7 @@ CATALOG(pg_constraint,2606,ConstraintRelationId)
 	char		contype;		/* constraint type; see codes below */
 	bool		condeferrable;	/* deferrable constraint? */
 	bool		condeferred;	/* deferred by default? */
+	bool		conenforced;	/* enforced constraint? */
 	bool		convalidated;	/* constraint has been validated? */
 
 	/*
@@ -166,6 +169,8 @@ CATALOG(pg_constraint,2606,ConstraintRelationId)
 #endif
 } FormData_pg_constraint;
 
+END_CATALOG_STRUCT
+
 /* ----------------
  *		Form_pg_constraint corresponds to a pointer to a tuple with
  *		the format of pg_constraint relation.
@@ -222,6 +227,7 @@ extern Oid	CreateConstraintEntry(const char *constraintName,
 								  char constraintType,
 								  bool isDeferrable,
 								  bool isDeferred,
+								  bool isEnforced,
 								  bool isValidated,
 								  Oid parentConstrId,
 								  Oid relId,
@@ -261,8 +267,8 @@ extern HeapTuple findNotNullConstraintAttnum(Oid relid, AttrNumber attnum);
 extern HeapTuple findNotNullConstraint(Oid relid, const char *colname);
 extern HeapTuple findDomainNotNullConstraint(Oid typid);
 extern AttrNumber extractNotNullColumn(HeapTuple constrTup);
-extern bool AdjustNotNullInheritance(Oid relid, AttrNumber attnum,
-									 bool is_local, bool is_no_inherit);
+extern bool AdjustNotNullInheritance(Oid relid, AttrNumber attnum, const char *new_conname,
+									 bool is_local, bool is_no_inherit, bool is_notvalid);
 extern List *RelationGetNotNullConstraints(Oid relid, bool cooked,
 										   bool include_noinh);
 
@@ -288,7 +294,8 @@ extern void DeconstructFkConstraintRow(HeapTuple tuple, int *numfks,
 									   int *num_fk_del_set_cols, AttrNumber *fk_del_set_cols);
 extern void FindFKPeriodOpers(Oid opclass,
 							  Oid *containedbyoperoid,
-							  Oid *aggedcontainedbyoperoid);
+							  Oid *aggedcontainedbyoperoid,
+							  Oid *intersectoperoid);
 
 extern bool check_functional_grouping(Oid relid,
 									  Index varno, Index varlevelsup,

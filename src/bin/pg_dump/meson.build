@@ -1,4 +1,4 @@
-# Copyright (c) 2022-2024, PostgreSQL Global Development Group
+# Copyright (c) 2022-2026, PostgreSQL Global Development Group
 
 pg_dump_common_sources = files(
   'compress_gzip.c',
@@ -6,6 +6,7 @@ pg_dump_common_sources = files(
   'compress_lz4.c',
   'compress_none.c',
   'compress_zstd.c',
+  'connectdb.c',
   'dumputils.c',
   'filter.c',
   'parallel.c',
@@ -90,9 +91,9 @@ tests += {
   'bd': meson.current_build_dir(),
   'tap': {
     'env': {
-      'GZIP_PROGRAM': gzip.found() ? gzip.path() : '',
-      'LZ4': program_lz4.found() ? program_lz4.path() : '',
-      'ZSTD': program_zstd.found() ? program_zstd.path() : '',
+      'GZIP_PROGRAM': gzip.found() ? gzip.full_path() : '',
+      'LZ4': program_lz4.found() ? program_lz4.full_path() : '',
+      'ZSTD': program_zstd.found() ? program_zstd.full_path() : '',
       'with_icu': icu.found() ? 'yes' : 'no',
     },
     'tests': [
@@ -101,6 +102,8 @@ tests += {
       't/003_pg_dump_with_server.pl',
       't/004_pg_dump_parallel.pl',
       't/005_pg_dump_filterfile.pl',
+      't/006_pg_dump_compress.pl',
+	  't/007_pg_dumpall.pl',
       't/010_dump_connstr.pl',
     ],
   },

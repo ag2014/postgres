@@ -4,7 +4,7 @@
  *	  definition of the "collation" system catalog (pg_collation)
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_collation.h
@@ -19,13 +19,15 @@
 #define PG_COLLATION_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_collation_d.h"
+#include "catalog/pg_collation_d.h" /* IWYU pragma: export */
 
 /* ----------------
  *		pg_collation definition.  cpp turns this into
  *		typedef struct FormData_pg_collation
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_collation,3456,CollationRelationId)
 {
 	Oid			oid;			/* oid */
@@ -49,6 +51,8 @@ CATALOG(pg_collation,3456,CollationRelationId)
 													 * data */
 #endif
 } FormData_pg_collation;
+
+END_CATALOG_STRUCT
 
 /* ----------------
  *		Form_pg_collation corresponds to a pointer to a row with

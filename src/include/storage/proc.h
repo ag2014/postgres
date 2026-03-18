@@ -4,7 +4,7 @@
  *	  per-process shared memory data structures
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/proc.h
@@ -17,6 +17,7 @@
 #include "access/clog.h"
 #include "access/xlogdefs.h"
 #include "lib/ilist.h"
+#include "miscadmin.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
 #include "storage/pg_sema.h"
@@ -86,9 +87,18 @@ struct XidCache
  */
 extern PGDLLIMPORT int FastPathLockGroupsPerBackend;
 
+/*
+ * Define the maximum number of fast-path locking groups per backend.
+ * This must be a power-of-two value.  The actual number of fast-path
+ * lock groups is calculated in InitializeFastPathLocks() based on
+ * max_locks_per_transaction.  1024 is an arbitrary upper limit (matching
+ * max_locks_per_transaction = 16k).  Values over 1024 are unlikely to be
+ * beneficial as there are bottlenecks we'll hit way before that.
+ */
 #define		FP_LOCK_GROUPS_PER_BACKEND_MAX	1024
 #define		FP_LOCK_SLOTS_PER_GROUP		16	/* don't change */
-#define		FP_LOCK_SLOTS_PER_BACKEND	(FP_LOCK_SLOTS_PER_GROUP * FastPathLockGroupsPerBackend)
+#define		FastPathLockSlotsPerBackend() \
+	(FP_LOCK_SLOTS_PER_GROUP * FastPathLockGroupsPerBackend)
 
 /*
  * Flags for PGPROC.delayChkptFlags
@@ -109,10 +119,10 @@ extern PGDLLIMPORT int FastPathLockGroupsPerBackend;
  * is inserted prior to the new redo point, the corresponding data changes will
  * also be flushed to disk before the checkpoint can complete. (In the
  * extremely common case where the data being modified is in shared buffers
- * and we acquire an exclusive content lock on the relevant buffers before
- * writing WAL, this mechanism is not needed, because phase 2 will block
- * until we release the content lock and then flush the modified data to
- * disk.)
+ * and we acquire an exclusive content lock and MarkBufferDirty() on the
+ * relevant buffers before writing WAL, this mechanism is not needed, because
+ * phase 2 will block until we release the content lock and then flush the
+ * modified data to disk.  See transam/README and SyncOneBuffer().)
  *
  * Setting DELAY_CHKPT_COMPLETE prevents the system from moving from phase 2
  * to phase 3. This is useful if we are performing a WAL-logged operation that
@@ -121,9 +131,17 @@ extern PGDLLIMPORT int FastPathLockGroupsPerBackend;
  * the checkpoint are actually destroyed on disk. Replay can cope with a file
  * or block that doesn't exist, but not with a block that has the wrong
  * contents.
+ *
+ * Setting DELAY_CHKPT_IN_COMMIT is similar to setting DELAY_CHKPT_START, but
+ * it explicitly indicates that the reason for delaying the checkpoint is due
+ * to a transaction being within a critical commit section. We need this new
+ * flag to ensure all the transactions that have acquired commit timestamp are
+ * finished before we allow the logical replication client to advance its xid
+ * which is used to hold back dead rows for conflict detection.
  */
 #define DELAY_CHKPT_START		(1<<0)
 #define DELAY_CHKPT_COMPLETE	(1<<1)
+#define DELAY_CHKPT_IN_COMMIT	(DELAY_CHKPT_START | 1<<2)
 
 typedef enum
 {
@@ -136,10 +154,6 @@ typedef enum
  * Each backend has a PGPROC struct in shared memory.  There is also a list of
  * currently-unused PGPROC structs that will be reallocated to new backends.
  *
- * links: list link for any list the PGPROC is in.  When waiting for a lock,
- * the PGPROC is linked into that lock's waitProcs queue.  A recycled PGPROC
- * is linked into ProcGlobal's freeProcs list.
- *
  * Note: twophase.c also sets up a dummy PGPROC struct for each currently
  * prepared transaction.  These PGPROCs appear in the ProcArray data structure
  * so that the prepared transactions appear to be still running and are
@@ -149,7 +163,7 @@ typedef enum
  * but its myProcLocks[] lists are valid.
  *
  * We allow many fields of this struct to be accessed without locks, such as
- * delayChkptFlags and isBackgroundWorker. However, keep in mind that writing
+ * delayChkptFlags and backendType. However, keep in mind that writing
  * mirrored ones (see below) requires holding ProcArrayLock or XidGenLock in
  * at least shared mode, so that pgxactoff does not change concurrently.
  *
@@ -164,31 +178,45 @@ typedef enum
  *
  * See PROC_HDR for details.
  */
-struct PGPROC
+typedef struct PGPROC
 {
-	dlist_node	links;			/* list link if process is in a list */
+	/*
+	 * Align the struct at cache line boundaries.  This is just for
+	 * performance, to avoid false sharing.
+	 */
+	alignas(PG_CACHE_LINE_SIZE)
 	dlist_head *procgloballist; /* procglobal list that owns this PGPROC */
+	dlist_node	freeProcsLink;	/* link in procgloballist, when in recycled
+								 * state */
 
-	PGSemaphore sem;			/* ONE semaphore to sleep on */
-	ProcWaitStatus waitStatus;
+	/************************************************************************
+	 * Backend identity
+	 ************************************************************************/
 
-	Latch		procLatch;		/* generic latch for process */
-
-
-	TransactionId xid;			/* id of top-level transaction currently being
-								 * executed by this proc, if running and XID
-								 * is assigned; else InvalidTransactionId.
-								 * mirrored in ProcGlobal->xids[pgxactoff] */
-
-	TransactionId xmin;			/* minimal running XID as it was when we were
-								 * starting our xact, excluding LAZY VACUUM:
-								 * vacuum must not remove tuples deleted by
-								 * xid >= xmin ! */
-
+	/*
+	 * These fields that don't change after backend startup, or only very
+	 * rarely
+	 */
 	int			pid;			/* Backend's process ID; 0 if prepared xact */
+	BackendType backendType;	/* what kind of process is this? */
+
+	/* These fields are zero while a backend is still starting up: */
+	Oid			databaseId;		/* OID of database this backend is using */
+	Oid			roleId;			/* OID of role using this backend */
+
+	Oid			tempNamespaceId;	/* OID of temp schema this backend is
+									 * using */
 
 	int			pgxactoff;		/* offset into various ProcGlobal->arrays with
 								 * data mirrored from this PGPROC */
+
+	uint8		statusFlags;	/* this backend's status flags, see PROC_*
+								 * above. mirrored in
+								 * ProcGlobal->statusFlags[pgxactoff] */
+
+	/************************************************************************
+	 * Transactions and snapshots
+	 ************************************************************************/
 
 	/*
 	 * Currently running top-level transaction's virtual xid. Together these
@@ -209,23 +237,52 @@ struct PGPROC
 									 * InvalidLocalTransactionId */
 	}			vxid;
 
-	/* These fields are zero while a backend is still starting up: */
-	Oid			databaseId;		/* OID of database this backend is using */
-	Oid			roleId;			/* OID of role using this backend */
+	TransactionId xid;			/* id of top-level transaction currently being
+								 * executed by this proc, if running and XID
+								 * is assigned; else InvalidTransactionId.
+								 * mirrored in ProcGlobal->xids[pgxactoff] */
 
-	Oid			tempNamespaceId;	/* OID of temp schema this backend is
-									 * using */
+	TransactionId xmin;			/* minimal running XID as it was when we were
+								 * starting our xact, excluding LAZY VACUUM:
+								 * vacuum must not remove tuples deleted by
+								 * xid >= xmin ! */
 
-	bool		isBackgroundWorker; /* true if background worker. */
+	XidCacheStatus subxidStatus;	/* mirrored with
+									 * ProcGlobal->subxidStates[i] */
+	struct XidCache subxids;	/* cache for subtransaction XIDs */
+
+
+	/************************************************************************
+	 * Inter-process signaling
+	 ************************************************************************/
+
+	Latch		procLatch;		/* generic latch for process */
+
+	PGSemaphore sem;			/* ONE semaphore to sleep on */
+
+	int			delayChkptFlags;	/* for DELAY_CHKPT_* flags */
 
 	/*
 	 * While in hot standby mode, shows that a conflict signal has been sent
 	 * for the current transaction. Set/cleared while holding ProcArrayLock,
 	 * though not required. Accessed without lock, if needed.
+	 *
+	 * This is a bitmask; each bit corresponds to a RecoveryConflictReason
+	 * enum value.
 	 */
-	bool		recoveryConflictPending;
+	pg_atomic_uint32 pendingRecoveryConflicts;
 
-	/* Info about LWLock the process is currently waiting for, if any. */
+	/************************************************************************
+	 * LWLock waiting
+	 ************************************************************************/
+
+	/*
+	 * Info about LWLock the process is currently waiting for, if any.
+	 *
+	 * This is currently used both for lwlocks and buffer content locks, which
+	 * is acceptable, although not pretty, because a backend can't wait for
+	 * both types of locks at the same time.
+	 */
 	uint8		lwWaiting;		/* see LWLockWaitState */
 	uint8		lwWaitMode;		/* lwlock mode being waited for */
 	proclist_node lwWaitLink;	/* position in LW lock wait list */
@@ -233,21 +290,50 @@ struct PGPROC
 	/* Support for condition variables. */
 	proclist_node cvWaitLink;	/* position in CV wait list */
 
+	/************************************************************************
+	 * Lock manager data
+	 ************************************************************************/
+
+	/*
+	 * Support for lock groups.  Use LockHashPartitionLockByProc on the group
+	 * leader to get the LWLock protecting these fields.
+	 */
+	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
+	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
+	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
+
 	/* Info about lock the process is currently waiting for, if any. */
 	/* waitLock and waitProcLock are NULL if not currently waiting. */
 	LOCK	   *waitLock;		/* Lock object we're sleeping on ... */
+	dlist_node	waitLink;		/* position in waitLock->waitProcs queue */
 	PROCLOCK   *waitProcLock;	/* Per-holder info for awaited lock */
 	LOCKMODE	waitLockMode;	/* type of lock we're waiting for */
 	LOCKMASK	heldLocks;		/* bitmask for lock types already held on this
 								 * lock object by this backend */
+
 	pg_atomic_uint64 waitStart; /* time at which wait for lock acquisition
 								 * started */
 
-	int			delayChkptFlags;	/* for DELAY_CHKPT_* flags */
+	ProcWaitStatus waitStatus;
 
-	uint8		statusFlags;	/* this backend's status flags, see PROC_*
-								 * above. mirrored in
-								 * ProcGlobal->statusFlags[pgxactoff] */
+	/*
+	 * All PROCLOCK objects for locks held or awaited by this backend are
+	 * linked into one of these lists, according to the partition number of
+	 * their lock.
+	 */
+	dlist_head	myProcLocks[NUM_LOCK_PARTITIONS];
+
+	/*-- recording fast-path locks taken by this backend. --*/
+	LWLock		fpInfoLock;		/* protects per-backend fast-path state */
+	uint64	   *fpLockBits;		/* lock modes held for each fast-path slot */
+	Oid		   *fpRelId;		/* slots for rel oids */
+	bool		fpVXIDLock;		/* are we holding a fast-path VXID lock? */
+	LocalTransactionId fpLocalTransactionId;	/* lxid for fast-path VXID
+												 * lock */
+
+	/************************************************************************
+	 * Synchronous replication waiting
+	 ************************************************************************/
 
 	/*
 	 * Info to allow us to wait for synchronous replication, if needed.
@@ -259,18 +345,10 @@ struct PGPROC
 	int			syncRepState;	/* wait state for sync rep */
 	dlist_node	syncRepLinks;	/* list link if process is in syncrep queue */
 
-	/*
-	 * All PROCLOCK objects for locks held or awaited by this backend are
-	 * linked into one of these lists, according to the partition number of
-	 * their lock.
-	 */
-	dlist_head	myProcLocks[NUM_LOCK_PARTITIONS];
+	/************************************************************************
+	 * Support for group XID clearing
+	 ************************************************************************/
 
-	XidCacheStatus subxidStatus;	/* mirrored with
-									 * ProcGlobal->subxidStates[i] */
-	struct XidCache subxids;	/* cache for subtransaction XIDs */
-
-	/* Support for group XID clearing. */
 	/* true, if member of ProcArray group waiting for XID clear */
 	bool		procArrayGroupMember;
 	/* next ProcArray group member waiting for XID clear */
@@ -282,9 +360,10 @@ struct PGPROC
 	 */
 	TransactionId procArrayGroupMemberXid;
 
-	uint32		wait_event_info;	/* proc's wait information */
+	/************************************************************************
+	 * Support for group transaction status update
+	 ************************************************************************/
 
-	/* Support for group transaction status update. */
 	bool		clogGroupMember;	/* true, if member of clog group */
 	pg_atomic_uint32 clogGroupNext; /* next clog group member */
 	TransactionId clogGroupMemberXid;	/* transaction id of clog group member */
@@ -295,40 +374,15 @@ struct PGPROC
 	XLogRecPtr	clogGroupMemberLsn; /* WAL location of commit record for clog
 									 * group member */
 
-	/* Lock manager data, recording fast-path locks taken by this backend. */
-	LWLock		fpInfoLock;		/* protects per-backend fast-path state */
-	uint64	   *fpLockBits;		/* lock modes held for each fast-path slot */
-	Oid		   *fpRelId;		/* slots for rel oids */
-	bool		fpVXIDLock;		/* are we holding a fast-path VXID lock? */
-	LocalTransactionId fpLocalTransactionId;	/* lxid for fast-path VXID
-												 * lock */
+	/************************************************************************
+	 * Status reporting
+	 ************************************************************************/
 
-	/*
-	 * Support for lock groups.  Use LockHashPartitionLockByProc on the group
-	 * leader to get the LWLock protecting these fields.
-	 */
-	PGPROC	   *lockGroupLeader;	/* lock group leader, if I'm a member */
-	dlist_head	lockGroupMembers;	/* list of members, if I'm a leader */
-	dlist_node	lockGroupLink;	/* my member link, if I'm a member */
-};
-
-/* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */
-
+	uint32		wait_event_info;	/* proc's wait information */
+}
+PGPROC;
 
 extern PGDLLIMPORT PGPROC *MyProc;
-
-/* Proc number of this backend. Equal to GetNumberFromPGProc(MyProc). */
-extern PGDLLIMPORT ProcNumber MyProcNumber;
-
-/* Our parallel session leader, or INVALID_PROC_NUMBER if none */
-extern PGDLLIMPORT ProcNumber ParallelLeaderProcNumber;
-
-/*
- * The proc number to use for our session's temp relations is normally our own,
- * but parallel workers should use their leader's ID.
- */
-#define ProcNumberForTempRelations() \
-	(ParallelLeaderProcNumber == INVALID_PROC_NUMBER ? MyProcNumber : ParallelLeaderProcNumber)
 
 /*
  * There is one ProcGlobal struct for the whole database cluster.
@@ -406,14 +460,25 @@ typedef struct PROC_HDR
 
 	/* Length of allProcs array */
 	uint32		allProcCount;
+
+	/*
+	 * This spinlock protects the below freelists of PGPROC structures.  We
+	 * cannot use an LWLock because the LWLock manager depends on already
+	 * having a PGPROC and a wait semaphore!  But these structures are touched
+	 * relatively infrequently (only at backend startup or shutdown) and not
+	 * for very long, so a spinlock is okay.
+	 */
+	slock_t		freeProcsLock;
+
 	/* Head of list of free PGPROC structures */
 	dlist_head	freeProcs;
-	/* Head of list of autovacuum's free PGPROC structures */
+	/* Head of list of autovacuum & special worker free PGPROC structures */
 	dlist_head	autovacFreeProcs;
 	/* Head of list of bgworker free PGPROC structures */
 	dlist_head	bgworkerFreeProcs;
 	/* Head of list of walsender free PGPROC structures */
 	dlist_head	walsenderFreeProcs;
+
 	/* First pgproc waiting for group XID clear */
 	pg_atomic_uint32 procArrayGroupFirst;
 	/* First pgproc waiting for group transaction status update */
@@ -443,15 +508,28 @@ extern PGDLLIMPORT PGPROC *PreparedXactProcs;
 #define GetNumberFromPGProc(proc) ((proc) - &ProcGlobal->allProcs[0])
 
 /*
+ * We set aside some extra PGPROC structures for "special worker" processes,
+ * which are full-fledged backends (they can run transactions)
+ * but are unique animals that there's never more than one of.
+ * Currently there are two such processes: the autovacuum launcher
+ * and the slotsync worker.
+ */
+#define NUM_SPECIAL_WORKER_PROCS	2
+
+/*
  * We set aside some extra PGPROC structures for auxiliary processes,
- * ie things that aren't full-fledged backends but need shmem access.
+ * ie things that aren't full-fledged backends (they cannot run transactions
+ * or take heavyweight locks) but need shmem access.
  *
  * Background writer, checkpointer, WAL writer, WAL summarizer, and archiver
  * run during normal operation.  Startup process and WAL receiver also consume
  * 2 slots, but WAL writer is launched only after startup has exited, so we
  * only need 6 slots.
  */
-#define NUM_AUXILIARY_PROCS		6
+#define MAX_IO_WORKERS          32
+#define NUM_AUXILIARY_PROCS		(6 + MAX_IO_WORKERS)
+
+#define FIRST_PREPARED_XACT_PROC_NUMBER	(MaxBackends + NUM_AUXILIARY_PROCS)
 
 /* configurable options */
 extern PGDLLIMPORT int DeadlockTimeout;
@@ -463,7 +541,6 @@ extern PGDLLIMPORT int IdleSessionTimeout;
 extern PGDLLIMPORT bool log_lock_waits;
 
 #ifdef EXEC_BACKEND
-extern PGDLLIMPORT slock_t *ProcStructLock;
 extern PGDLLIMPORT PGPROC *AuxiliaryProcs;
 #endif
 
@@ -491,6 +568,10 @@ extern void ProcWakeup(PGPROC *proc, ProcWaitStatus waitStatus);
 extern void ProcLockWakeup(LockMethod lockMethodTable, LOCK *lock);
 extern void CheckDeadLockAlert(void);
 extern void LockErrorCleanup(void);
+extern void GetLockHoldersAndWaiters(LOCALLOCK *locallock,
+									 StringInfo lock_holders_sbuf,
+									 StringInfo lock_waiters_sbuf,
+									 int *lockHoldersNum);
 
 extern void ProcWaitForSignal(uint32 wait_event_info);
 extern void ProcSendSignal(ProcNumber procNumber);

@@ -807,8 +807,10 @@ rfmtlong(long lng_val, const char *fmt, char *outbuf)
 	if (strchr(fmt, (int) '(') && strchr(fmt, (int) ')'))
 		brackets_ok = 1;
 
-	/* get position of the right-most dot in the format-string */
-	/* and fill the temp-string wit '0's up to there. */
+	/*
+	 * get position of the right-most dot in the format-string and fill the
+	 * temp-string with '0's up to there.
+	 */
 	dotpos = getRightMostDot(fmt);
 
 	/* start to parse the format-string */
@@ -1035,7 +1037,7 @@ ECPG_informix_reset_sqlca(void)
 	if (sqlca == NULL)
 		return;
 
-	memcpy((char *) sqlca, (char *) &sqlca_init, sizeof(struct sqlca_t));
+	memcpy(sqlca, &sqlca_init, sizeof(struct sqlca_t));
 }
 
 int

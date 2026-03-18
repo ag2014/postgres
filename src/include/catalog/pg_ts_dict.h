@@ -4,7 +4,7 @@
  *	  definition of the "text search dictionary" system catalog (pg_ts_dict)
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_ts_dict.h
@@ -19,13 +19,15 @@
 #define PG_TS_DICT_H
 
 #include "catalog/genbki.h"
-#include "catalog/pg_ts_dict_d.h"
+#include "catalog/pg_ts_dict_d.h"	/* IWYU pragma: export */
 
 /* ----------------
  *		pg_ts_dict definition.  cpp turns this into
  *		typedef struct FormData_pg_ts_dict
  * ----------------
  */
+BEGIN_CATALOG_STRUCT
+
 CATALOG(pg_ts_dict,3600,TSDictionaryRelationId)
 {
 	/* oid */
@@ -48,6 +50,8 @@ CATALOG(pg_ts_dict,3600,TSDictionaryRelationId)
 	text		dictinitoption;
 #endif
 } FormData_pg_ts_dict;
+
+END_CATALOG_STRUCT
 
 typedef FormData_pg_ts_dict *Form_pg_ts_dict;
 

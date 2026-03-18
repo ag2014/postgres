@@ -4,7 +4,7 @@
  *	  Helper functions for table AMs implementing compressed or
  *    out-of-line storage of varlena attributes.
  *
- * Copyright (c) 2000-2024, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2026, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/access/table/toast_helper.c
@@ -49,8 +49,8 @@ toast_tuple_init(ToastTupleContext *ttc)
 	for (i = 0; i < numAttrs; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(tupleDesc, i);
-		struct varlena *old_value;
-		struct varlena *new_value;
+		varlena    *old_value;
+		varlena    *new_value;
 
 		ttc->ttc_attr[i].tai_colflags = 0;
 		ttc->ttc_attr[i].tai_oldexternal = NULL;
@@ -62,9 +62,9 @@ toast_tuple_init(ToastTupleContext *ttc)
 			 * For UPDATE get the old and new values of this attribute
 			 */
 			old_value =
-				(struct varlena *) DatumGetPointer(ttc->ttc_oldvalues[i]);
+				(varlena *) DatumGetPointer(ttc->ttc_oldvalues[i]);
 			new_value =
-				(struct varlena *) DatumGetPointer(ttc->ttc_values[i]);
+				(varlena *) DatumGetPointer(ttc->ttc_values[i]);
 
 			/*
 			 * If the old value is stored on disk, check if it has changed so
@@ -75,7 +75,7 @@ toast_tuple_init(ToastTupleContext *ttc)
 			{
 				if (ttc->ttc_isnull[i] ||
 					!VARATT_IS_EXTERNAL_ONDISK(new_value) ||
-					memcmp((char *) old_value, (char *) new_value,
+					memcmp(old_value, new_value,
 						   VARSIZE_EXTERNAL(old_value)) != 0)
 				{
 					/*
@@ -102,7 +102,7 @@ toast_tuple_init(ToastTupleContext *ttc)
 			/*
 			 * For INSERT simply get the new value
 			 */
-			new_value = (struct varlena *) DatumGetPointer(ttc->ttc_values[i]);
+			new_value = (varlena *) DatumGetPointer(ttc->ttc_values[i]);
 		}
 
 		/*
@@ -324,13 +324,13 @@ toast_delete_external(Relation rel, const Datum *values, const bool *isnull,
 
 	for (i = 0; i < numAttrs; i++)
 	{
-		if (TupleDescAttr(tupleDesc, i)->attlen == -1)
+		if (TupleDescCompactAttr(tupleDesc, i)->attlen == -1)
 		{
 			Datum		value = values[i];
 
 			if (isnull[i])
 				continue;
-			else if (VARATT_IS_EXTERNAL_ONDISK(value))
+			else if (VARATT_IS_EXTERNAL_ONDISK(DatumGetPointer(value)))
 				toast_delete_datum(rel, value, is_speculative);
 		}
 	}

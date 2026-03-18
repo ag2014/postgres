@@ -19,7 +19,7 @@
  * not provided.
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/execnodes.h
@@ -29,35 +29,44 @@
 #ifndef EXECNODES_H
 #define EXECNODES_H
 
-#include "access/tupconvert.h"
-#include "executor/instrument.h"
+#include "access/htup.h"
+#include "executor/instrument_node.h"
 #include "fmgr.h"
 #include "lib/ilist.h"
-#include "lib/pairingheap.h"
 #include "nodes/miscnodes.h"
 #include "nodes/params.h"
 #include "nodes/plannodes.h"
-#include "nodes/tidbitmap.h"
 #include "partitioning/partdefs.h"
-#include "storage/condition_variable.h"
-#include "utils/hsearch.h"
-#include "utils/queryenvironment.h"
+#include "storage/buf.h"
 #include "utils/reltrigger.h"
-#include "utils/sharedtuplestore.h"
-#include "utils/snapshot.h"
-#include "utils/sortsupport.h"
-#include "utils/tuplesort.h"
-#include "utils/tuplestore.h"
 
-struct PlanState;				/* forward references in this file */
-struct ParallelHashJoinState;
-struct ExecRowMark;
-struct ExprState;
-struct ExprContext;
-struct RangeTblEntry;			/* avoid including parsenodes.h here */
-struct ExprEvalStep;			/* avoid including execExpr.h everywhere */
-struct CopyMultiInsertBuffer;
-struct LogicalTapeSet;
+
+/*
+ * forward references in this file
+ */
+typedef struct BufferUsage BufferUsage;
+typedef struct ExecRowMark ExecRowMark;
+typedef struct ExprState ExprState;
+typedef struct ExprContext ExprContext;
+typedef struct HTAB HTAB;
+typedef struct Instrumentation Instrumentation;
+typedef struct pairingheap pairingheap;
+typedef struct PlanState PlanState;
+typedef struct QueryEnvironment QueryEnvironment;
+typedef struct RelationData *Relation;
+typedef Relation *RelationPtr;
+typedef struct ScanKeyData ScanKeyData;
+typedef struct SnapshotData *Snapshot;
+typedef struct SortSupportData *SortSupport;
+typedef struct TIDBitmap TIDBitmap;
+typedef struct TupleConversionMap TupleConversionMap;
+typedef struct TupleDescData *TupleDesc;
+typedef struct Tuplesortstate Tuplesortstate;
+typedef struct Tuplestorestate Tuplestorestate;
+typedef struct TupleTableSlot TupleTableSlot;
+typedef struct TupleTableSlotOps TupleTableSlotOps;
+typedef struct WalUsage WalUsage;
+typedef struct WorkerInstrumentation WorkerInstrumentation;
 
 
 /* ----------------
@@ -67,18 +76,27 @@ struct LogicalTapeSet;
  * It contains instructions (in ->steps) to evaluate the expression.
  * ----------------
  */
-typedef Datum (*ExprStateEvalFunc) (struct ExprState *expression,
-									struct ExprContext *econtext,
+typedef Datum (*ExprStateEvalFunc) (ExprState *expression,
+									ExprContext *econtext,
 									bool *isNull);
 
 /* Bits in ExprState->flags (see also execExpr.h for private flag bits): */
 /* expression is for use with ExecQual() */
 #define EEO_FLAG_IS_QUAL					(1 << 0)
+/* expression refers to OLD table columns */
+#define EEO_FLAG_HAS_OLD					(1 << 1)
+/* expression refers to NEW table columns */
+#define EEO_FLAG_HAS_NEW					(1 << 2)
+/* OLD table row is NULL in RETURNING list */
+#define EEO_FLAG_OLD_IS_NULL				(1 << 3)
+/* NEW table row is NULL in RETURNING list */
+#define EEO_FLAG_NEW_IS_NULL				(1 << 4)
 
 typedef struct ExprState
 {
 	NodeTag		type;
 
+#define FIELDNO_EXPRSTATE_FLAGS 1
 	uint8		flags;			/* bitmask of EEO_FLAG_* bits, see above */
 
 	/*
@@ -122,7 +140,7 @@ typedef struct ExprState
 	int			steps_alloc;	/* allocated length of steps array */
 
 #define FIELDNO_EXPRSTATE_PARENT 11
-	struct PlanState *parent;	/* parent PlanState node, if any */
+	PlanState  *parent;			/* parent PlanState node, if any */
 	ParamListInfo ext_params;	/* for compiling PARAM_EXTERN nodes */
 
 	Datum	   *innermost_caseval;
@@ -148,34 +166,6 @@ typedef struct ExprState
  *		entries for a particular index.  Used for both index_build and
  *		retail creation of index entries.
  *
- *		NumIndexAttrs		total number of columns in this index
- *		NumIndexKeyAttrs	number of key columns in index
- *		IndexAttrNumbers	underlying-rel attribute numbers used as keys
- *							(zeroes indicate expressions). It also contains
- * 							info about included columns.
- *		Expressions			expr trees for expression entries, or NIL if none
- *		ExpressionsState	exec state for expressions, or NIL if none
- *		Predicate			partial-index predicate, or NIL if none
- *		PredicateState		exec state for predicate, or NIL if none
- *		ExclusionOps		Per-column exclusion operators, or NULL if none
- *		ExclusionProcs		Underlying function OIDs for ExclusionOps
- *		ExclusionStrats		Opclass strategy numbers for ExclusionOps
- *		UniqueOps			These are like Exclusion*, but for unique indexes
- *		UniqueProcs
- *		UniqueStrats
- *		Unique				is it a unique index?
- *		OpclassOptions		opclass-specific options, or NULL if none
- *		ReadyForInserts		is it valid for inserts?
- *		CheckedUnchanged	IndexUnchanged status determined yet?
- *		IndexUnchanged		aminsert hint, cached for retail inserts
- *		Concurrent			are we doing a concurrent index build?
- *		BrokenHotChain		did we detect any broken HOT chains?
- *		Summarizing			is it a summarizing index?
- *		ParallelWorkers		# of workers requested (excludes leader)
- *		Am					Oid of index AM
- *		AmCache				private cache area for index AM
- *		Context				memory context holding this IndexInfo
- *
  * ii_Concurrent, ii_BrokenHotChain, and ii_ParallelWorkers are used only
  * during index build; they're conventionally zeroed otherwise.
  * ----------------
@@ -183,31 +173,67 @@ typedef struct ExprState
 typedef struct IndexInfo
 {
 	NodeTag		type;
-	int			ii_NumIndexAttrs;	/* total number of columns in index */
-	int			ii_NumIndexKeyAttrs;	/* number of key columns in index */
+
+	/* total number of columns in index */
+	int			ii_NumIndexAttrs;
+	/* number of key columns in index */
+	int			ii_NumIndexKeyAttrs;
+
+	/*
+	 * Underlying-rel attribute numbers used as keys (zeroes indicate
+	 * expressions). It also contains info about included columns.
+	 */
 	AttrNumber	ii_IndexAttrNumbers[INDEX_MAX_KEYS];
+
+	/* expr trees for expression entries, or NIL if none */
 	List	   *ii_Expressions; /* list of Expr */
+	/* exec state for expressions, or NIL if none */
 	List	   *ii_ExpressionsState;	/* list of ExprState */
+
+	/* partial-index predicate, or NIL if none */
 	List	   *ii_Predicate;	/* list of Expr */
+	/* exec state for expressions, or NIL if none */
 	ExprState  *ii_PredicateState;
+
+	/* Per-column exclusion operators, or NULL if none */
 	Oid		   *ii_ExclusionOps;	/* array with one entry per column */
+	/* Underlying function OIDs for ExclusionOps */
 	Oid		   *ii_ExclusionProcs;	/* array with one entry per column */
+	/* Opclass strategy numbers for ExclusionOps */
 	uint16	   *ii_ExclusionStrats; /* array with one entry per column */
+
+	/* These are like Exclusion*, but for unique indexes */
 	Oid		   *ii_UniqueOps;	/* array with one entry per column */
 	Oid		   *ii_UniqueProcs; /* array with one entry per column */
 	uint16	   *ii_UniqueStrats;	/* array with one entry per column */
+
+	/* is it a unique index? */
 	bool		ii_Unique;
+	/* is NULLS NOT DISTINCT? */
 	bool		ii_NullsNotDistinct;
+	/* is it valid for inserts? */
 	bool		ii_ReadyForInserts;
+	/* IndexUnchanged status determined yet? */
 	bool		ii_CheckedUnchanged;
+	/* aminsert hint, cached for retail inserts */
 	bool		ii_IndexUnchanged;
+	/* are we doing a concurrent index build? */
 	bool		ii_Concurrent;
+	/* did we detect any broken HOT chains? */
 	bool		ii_BrokenHotChain;
+	/* is it a summarizing index? */
 	bool		ii_Summarizing;
+	/* is it a WITHOUT OVERLAPS index? */
 	bool		ii_WithoutOverlaps;
+	/* # of workers requested (excludes leader) */
 	int			ii_ParallelWorkers;
+
+	/* Oid of index AM */
 	Oid			ii_Am;
+	/* private cache area for index AM */
 	void	   *ii_AmCache;
+
+	/* memory context holding this IndexInfo */
 	MemoryContext ii_Context;
 } IndexInfo;
 
@@ -289,6 +315,12 @@ typedef struct ExprContext
 	Datum		domainValue_datum;
 #define FIELDNO_EXPRCONTEXT_DOMAINNULL 13
 	bool		domainValue_isNull;
+
+	/* Tuples that OLD/NEW Var nodes in RETURNING may refer to */
+#define FIELDNO_EXPRCONTEXT_OLDTUPLE 14
+	TupleTableSlot *ecxt_oldtuple;
+#define FIELDNO_EXPRCONTEXT_NEWTUPLE 15
+	TupleTableSlot *ecxt_newtuple;
 
 	/* Link to containing EState (NULL if a standalone ExprContext) */
 	struct EState *ecxt_estate;
@@ -401,19 +433,20 @@ typedef struct JunkFilter
 } JunkFilter;
 
 /*
- * OnConflictSetState
+ * OnConflictActionState
  *
- * Executor state of an ON CONFLICT DO UPDATE operation.
+ * Executor state of an ON CONFLICT DO SELECT/UPDATE operation.
  */
-typedef struct OnConflictSetState
+typedef struct OnConflictActionState
 {
 	NodeTag		type;
 
 	TupleTableSlot *oc_Existing;	/* slot to store existing target tuple in */
 	TupleTableSlot *oc_ProjSlot;	/* CONFLICT ... SET ... projection target */
 	ProjectionInfo *oc_ProjInfo;	/* for ON CONFLICT DO UPDATE SET */
+	LockClauseStrength oc_LockStrength; /* lock strength for DO SELECT */
 	ExprState  *oc_WhereClause; /* state for the WHERE clause */
-} OnConflictSetState;
+} OnConflictActionState;
 
 /* ----------------
  *	 MergeActionState information
@@ -475,6 +508,8 @@ typedef struct ResultRelInfo
 
 	/* For UPDATE, attnums of generated columns to be computed */
 	Bitmapset  *ri_extraUpdatedCols;
+	/* true if the above has been computed */
+	bool		ri_extraUpdatedCols_valid;
 
 	/* Projection to generate new tuple in an INSERT/UPDATE */
 	ProjectionInfo *ri_projectNew;
@@ -504,6 +539,7 @@ typedef struct ResultRelInfo
 	TupleTableSlot *ri_ReturningSlot;	/* for trigger output tuples */
 	TupleTableSlot *ri_TrigOldSlot; /* for a trigger's old tuple */
 	TupleTableSlot *ri_TrigNewSlot; /* for a trigger's new tuple */
+	TupleTableSlot *ri_AllNullSlot; /* for RETURNING OLD/NEW */
 
 	/* FDW callback functions, if foreign table */
 	struct FdwRoutine *ri_FdwRoutine;
@@ -527,8 +563,14 @@ typedef struct ResultRelInfo
 	/* list of WithCheckOption expr states */
 	List	   *ri_WithCheckOptionExprs;
 
-	/* array of constraint-checking expr states */
-	ExprState **ri_ConstraintExprs;
+	/* array of expr states for checking check constraints */
+	ExprState **ri_CheckConstraintExprs;
+
+	/*
+	 * array of expr states for checking not-null constraints on virtual
+	 * generated columns
+	 */
+	ExprState **ri_GenVirtualNotNullConstraintExprs;
 
 	/*
 	 * Arrays of stored generated columns ExprStates for INSERT/UPDATE/MERGE.
@@ -549,8 +591,8 @@ typedef struct ResultRelInfo
 	/* list of arbiter indexes to use to check conflicts */
 	List	   *ri_onConflictArbiterIndexes;
 
-	/* ON CONFLICT evaluation state */
-	OnConflictSetState *ri_onConflict;
+	/* ON CONFLICT evaluation state for DO SELECT/UPDATE */
+	OnConflictActionState *ri_onConflict;
 
 	/* for MERGE, lists of MergeActionState (one per MergeMatchKind) */
 	List	   *ri_MergeActions[NUM_MERGE_MATCH_KINDS];
@@ -577,15 +619,13 @@ typedef struct ResultRelInfo
 	bool		ri_RootToChildMapValid;
 
 	/*
-	 * Information needed by tuple routing target relations
+	 * Other information needed by child result relations
 	 *
-	 * RootResultRelInfo gives the target relation mentioned in the query, if
-	 * it's a partitioned table. It is not set if the target relation
-	 * mentioned in the query is an inherited table, nor when tuple routing is
-	 * not needed.
+	 * ri_RootResultRelInfo gives the target relation mentioned in the query.
+	 * Used as the root for tuple routing and/or transition capture.
 	 *
-	 * PartitionTupleSlot is non-NULL if RootToChild conversion is needed and
-	 * the relation is a partition.
+	 * ri_PartitionTupleSlot is non-NULL if the relation is a partition to
+	 * route tuples into and ri_RootToChildMap conversion is needed.
 	 */
 	struct ResultRelInfo *ri_RootResultRelInfo;
 	TupleTableSlot *ri_PartitionTupleSlot;
@@ -608,8 +648,8 @@ typedef struct ResultRelInfo
  */
 typedef struct AsyncRequest
 {
-	struct PlanState *requestor;	/* Node that wants a tuple */
-	struct PlanState *requestee;	/* Node from which a tuple is wanted */
+	PlanState  *requestor;		/* Node that wants a tuple */
+	PlanState  *requestee;		/* Node from which a tuple is wanted */
 	int			request_index;	/* Scratch space for requestor */
 	bool		callback_pending;	/* Callback is needed */
 	bool		request_complete;	/* Request complete, result valid */
@@ -635,10 +675,17 @@ typedef struct EState
 	Index		es_range_table_size;	/* size of the range table arrays */
 	Relation   *es_relations;	/* Array of per-range-table-entry Relation
 								 * pointers, or NULL if not yet opened */
-	struct ExecRowMark **es_rowmarks;	/* Array of per-range-table-entry
-										 * ExecRowMarks, or NULL if none */
+	ExecRowMark **es_rowmarks;	/* Array of per-range-table-entry
+								 * ExecRowMarks, or NULL if none */
 	List	   *es_rteperminfos;	/* List of RTEPermissionInfo */
 	PlannedStmt *es_plannedstmt;	/* link to top of plan tree */
+	List	   *es_part_prune_infos;	/* List of PartitionPruneInfo */
+	List	   *es_part_prune_states;	/* List of PartitionPruneState */
+	List	   *es_part_prune_results;	/* List of Bitmapset */
+	Bitmapset  *es_unpruned_relids; /* PlannedStmt.unprunableRelids + RT
+									 * indexes of leaf partitions that survive
+									 * initial pruning; see
+									 * ExecDoInitialPruning() */
 	const char *es_sourceText;	/* Source text from QueryDesc */
 
 	JunkFilter *es_junkFilter;	/* top-level junk filter, if any */
@@ -795,24 +842,29 @@ typedef struct ExecAuxRowMark
  *
  * All-in-memory tuple hash tables are used for a number of purposes.
  *
- * Note: tab_hash_funcs are for the key datatype(s) stored in the table,
- * and tab_eq_func are non-cross-type equality operators for those types.
- * Normally these are the only functions used, but FindTupleHashEntry()
- * supports searching a hashtable using cross-data-type hashing.  For that,
- * the caller must supply hash functions for the LHS datatype as well as
- * the cross-type equality operators to use.  in_hash_funcs and cur_eq_func
- * are set to point to the caller's function arrays while doing such a search.
- * During LookupTupleHashEntry(), they point to tab_hash_funcs and
- * tab_eq_func respectively.
+ * Note: tab_hash_expr is for hashing the key datatype(s) stored in the table,
+ * and tab_eq_func is a non-cross-type ExprState for equality checks on those
+ * types.  Normally these are the only ExprStates used, but
+ * FindTupleHashEntry() supports searching a hashtable using cross-data-type
+ * hashing.  For that, the caller must supply an ExprState to hash the LHS
+ * datatype as well as the cross-type equality ExprState to use.  in_hash_expr
+ * and cur_eq_func are set to point to the caller's hash and equality
+ * ExprStates while doing such a search.  During LookupTupleHashEntry(), they
+ * point to tab_hash_expr and tab_eq_func respectively.
  * ----------------------------------------------------------------
  */
 typedef struct TupleHashEntryData *TupleHashEntry;
 typedef struct TupleHashTableData *TupleHashTable;
 
+/*
+ * TupleHashEntryData is a slot in the tuplehash_hash table.  If it's
+ * populated, it contains a pointer to a MinimalTuple that can also have
+ * associated "additional data".  That's stored in the TupleHashTable's
+ * tuplescxt.
+ */
 typedef struct TupleHashEntryData
 {
-	MinimalTuple firstTuple;	/* copy of first tuple in this group */
-	void	   *additional;		/* user data */
+	MinimalTuple firstTuple;	/* -> copy of first tuple in this group */
 	uint32		status;			/* hash status */
 	uint32		hash;			/* hash value (cached) */
 } TupleHashEntryData;
@@ -827,23 +879,22 @@ typedef struct TupleHashEntryData
 
 typedef struct TupleHashTableData
 {
-	tuplehash_hash *hashtab;	/* underlying hash table */
+	tuplehash_hash *hashtab;	/* underlying simplehash hash table */
 	int			numCols;		/* number of columns in lookup key */
 	AttrNumber *keyColIdx;		/* attr numbers of key columns */
-	FmgrInfo   *tab_hash_funcs; /* hash functions for table datatype(s) */
+	ExprState  *tab_hash_expr;	/* ExprState for hashing table datatype(s) */
 	ExprState  *tab_eq_func;	/* comparator for table datatype(s) */
 	Oid		   *tab_collations; /* collations for hash and comparison */
-	MemoryContext tablecxt;		/* memory context containing table */
+	MemoryContext tuplescxt;	/* memory context storing hashed tuples */
 	MemoryContext tempcxt;		/* context for function evaluations */
-	Size		entrysize;		/* actual size to make each hash entry */
+	Size		additionalsize; /* size of additional data */
 	TupleTableSlot *tableslot;	/* slot for referencing table entries */
 	/* The following fields are set transiently for each table search: */
 	TupleTableSlot *inputslot;	/* current input tuple's slot */
-	FmgrInfo   *in_hash_funcs;	/* hash functions for input datatype(s) */
+	ExprState  *in_hash_expr;	/* ExprState for hashing input datatype(s) */
 	ExprState  *cur_eq_func;	/* comparator for input vs. table */
-	uint32		hash_iv;		/* hash-function IV */
 	ExprContext *exprcontext;	/* expression context */
-}			TupleHashTableData;
+} TupleHashTableData;
 
 typedef tuplehash_iterator TupleHashIterator;
 
@@ -971,8 +1022,8 @@ typedef struct SubPlanState
 {
 	NodeTag		type;
 	SubPlan    *subplan;		/* expression plan node */
-	struct PlanState *planstate;	/* subselect plan's state tree */
-	struct PlanState *parent;	/* parent plan node's state tree */
+	PlanState  *planstate;		/* subselect plan's state tree */
+	PlanState  *parent;			/* parent plan node's state tree */
 	ExprState  *testexpr;		/* state of combining expression */
 	HeapTuple	curTuple;		/* copy of most recent tuple from subplan */
 	Datum		curArray;		/* most recent array from ARRAY() subplan */
@@ -984,8 +1035,7 @@ typedef struct SubPlanState
 	TupleHashTable hashnulls;	/* hash table for rows with null(s) */
 	bool		havehashrows;	/* true if hashtable is not empty */
 	bool		havenullrows;	/* true if hashnulls is not empty */
-	MemoryContext hashtablecxt; /* memory context containing hash tables */
-	MemoryContext hashtempcxt;	/* temp memory context for hash tables */
+	MemoryContext tuplesContext;	/* context containing hash tables' tuples */
 	ExprContext *innerecontext; /* econtext for computing inner tuples */
 	int			numCols;		/* number of columns being hashed */
 	/* each of the remaining fields is an array of length numCols: */
@@ -994,7 +1044,7 @@ typedef struct SubPlanState
 									 * datatype(s) */
 	Oid		   *tab_collations; /* collations for hash and comparison */
 	FmgrInfo   *tab_hash_funcs; /* hash functions for table datatype(s) */
-	FmgrInfo   *lhs_hash_funcs; /* hash functions for lefthand datatype(s) */
+	ExprState  *lhs_hash_expr;	/* hash expr for lefthand datatype(s) */
 	FmgrInfo   *cur_eq_funcs;	/* equality functions for LHS vs. table */
 	ExprState  *cur_eq_comp;	/* equality comparator for LHS vs. table */
 } SubPlanState;
@@ -1109,7 +1159,7 @@ typedef struct JsonExprState
  * if no more tuples are available.
  * ----------------
  */
-typedef TupleTableSlot *(*ExecProcNodeMtd) (struct PlanState *pstate);
+typedef TupleTableSlot *(*ExecProcNodeMtd) (PlanState *pstate);
 
 /* ----------------
  *		PlanState node
@@ -1146,8 +1196,8 @@ typedef struct PlanState
 	 * subPlan list, which does not exist in the plan tree).
 	 */
 	ExprState  *qual;			/* boolean qual condition */
-	struct PlanState *lefttree; /* input plan tree(s) */
-	struct PlanState *righttree;
+	PlanState  *lefttree;		/* input plan tree(s) */
+	PlanState  *righttree;
 
 	List	   *initPlan;		/* Init SubPlanState nodes (un-correlated expr
 								 * subselects) */
@@ -1423,6 +1473,15 @@ typedef struct ModifyTableState
 	double		mt_merge_inserted;
 	double		mt_merge_updated;
 	double		mt_merge_deleted;
+
+	/*
+	 * Lists of valid updateColnosLists, mergeActionLists, and
+	 * mergeJoinConditions.  These contain only entries for unpruned
+	 * relations, filtered from the corresponding lists in ModifyTable.
+	 */
+	List	   *mt_updateColnosLists;
+	List	   *mt_mergeActionLists;
+	List	   *mt_mergeJoinConditions;
 } ModifyTableState;
 
 /* ----------------
@@ -1525,7 +1584,7 @@ typedef struct RecursiveUnionState
 	FmgrInfo   *hashfunctions;	/* per-grouping-field hash fns */
 	MemoryContext tempContext;	/* short-term context for comparisons */
 	TupleHashTable hashtable;	/* hash table for tuples already seen */
-	MemoryContext tableContext; /* memory context containing hash table */
+	MemoryContext tuplesContext;	/* context containing hash table's tuples */
 } RecursiveUnionState;
 
 /* ----------------
@@ -1615,14 +1674,14 @@ typedef struct SampleScanState
  */
 typedef struct
 {
-	struct ScanKeyData *scan_key;	/* scankey to put value into */
+	ScanKeyData *scan_key;		/* scankey to put value into */
 	ExprState  *key_expr;		/* expr to evaluate to get value */
 	bool		key_toastable;	/* is expr's result a toastable datatype? */
 } IndexRuntimeKeyInfo;
 
 typedef struct
 {
-	struct ScanKeyData *scan_key;	/* scankey to put value into */
+	ScanKeyData *scan_key;		/* scankey to put value into */
 	ExprState  *array_expr;		/* expr to evaluate to get array value */
 	int			next_elem;		/* next array element to use */
 	int			num_elems;		/* number of elems in current array value */
@@ -1645,6 +1704,8 @@ typedef struct
  *		RuntimeContext	   expr context for evaling runtime Skeys
  *		RelationDesc	   index relation descriptor
  *		ScanDesc		   index scan descriptor
+ *		Instrument		   local index scan instrumentation
+ *		SharedInfo		   parallel worker instrumentation (no leader entry)
  *
  *		ReorderQueue	   tuples that need reordering due to re-check
  *		ReachedEnd		   have we fetched all tuples from index already?
@@ -1661,9 +1722,9 @@ typedef struct IndexScanState
 	ScanState	ss;				/* its first field is NodeTag */
 	ExprState  *indexqualorig;
 	List	   *indexorderbyorig;
-	struct ScanKeyData *iss_ScanKeys;
+	ScanKeyData *iss_ScanKeys;
 	int			iss_NumScanKeys;
-	struct ScanKeyData *iss_OrderByKeys;
+	ScanKeyData *iss_OrderByKeys;
 	int			iss_NumOrderByKeys;
 	IndexRuntimeKeyInfo *iss_RuntimeKeys;
 	int			iss_NumRuntimeKeys;
@@ -1671,6 +1732,8 @@ typedef struct IndexScanState
 	ExprContext *iss_RuntimeContext;
 	Relation	iss_RelationDesc;
 	struct IndexScanDescData *iss_ScanDesc;
+	IndexScanInstrumentation iss_Instrument;
+	SharedIndexScanInstrumentation *iss_SharedInfo;
 
 	/* These are needed for re-checking ORDER BY expr ordering */
 	pairingheap *iss_ReorderQueue;
@@ -1697,6 +1760,8 @@ typedef struct IndexScanState
  *		RuntimeContext	   expr context for evaling runtime Skeys
  *		RelationDesc	   index relation descriptor
  *		ScanDesc		   index scan descriptor
+ *		Instrument		   local index scan instrumentation
+ *		SharedInfo		   parallel worker instrumentation (no leader entry)
  *		TableSlot		   slot for holding tuples fetched from the table
  *		VMBuffer		   buffer in use for visibility map testing, if any
  *		PscanLen		   size of parallel index-only scan descriptor
@@ -1708,9 +1773,9 @@ typedef struct IndexOnlyScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
 	ExprState  *recheckqual;
-	struct ScanKeyData *ioss_ScanKeys;
+	ScanKeyData *ioss_ScanKeys;
 	int			ioss_NumScanKeys;
-	struct ScanKeyData *ioss_OrderByKeys;
+	ScanKeyData *ioss_OrderByKeys;
 	int			ioss_NumOrderByKeys;
 	IndexRuntimeKeyInfo *ioss_RuntimeKeys;
 	int			ioss_NumRuntimeKeys;
@@ -1718,6 +1783,8 @@ typedef struct IndexOnlyScanState
 	ExprContext *ioss_RuntimeContext;
 	Relation	ioss_RelationDesc;
 	struct IndexScanDescData *ioss_ScanDesc;
+	IndexScanInstrumentation ioss_Instrument;
+	SharedIndexScanInstrumentation *ioss_SharedInfo;
 	TupleTableSlot *ioss_TableSlot;
 	Buffer		ioss_VMBuffer;
 	Size		ioss_PscanLen;
@@ -1739,13 +1806,15 @@ typedef struct IndexOnlyScanState
  *		RuntimeContext	   expr context for evaling runtime Skeys
  *		RelationDesc	   index relation descriptor
  *		ScanDesc		   index scan descriptor
+ *		Instrument		   local index scan instrumentation
+ *		SharedInfo		   parallel worker instrumentation (no leader entry)
  * ----------------
  */
 typedef struct BitmapIndexScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
 	TIDBitmap  *biss_result;
-	struct ScanKeyData *biss_ScanKeys;
+	ScanKeyData *biss_ScanKeys;
 	int			biss_NumScanKeys;
 	IndexRuntimeKeyInfo *biss_RuntimeKeys;
 	int			biss_NumRuntimeKeys;
@@ -1755,116 +1824,37 @@ typedef struct BitmapIndexScanState
 	ExprContext *biss_RuntimeContext;
 	Relation	biss_RelationDesc;
 	struct IndexScanDescData *biss_ScanDesc;
+	IndexScanInstrumentation biss_Instrument;
+	SharedIndexScanInstrumentation *biss_SharedInfo;
 } BitmapIndexScanState;
 
-/* ----------------
- *	 BitmapHeapScanInstrumentation information
- *
- *		exact_pages		   total number of exact pages retrieved
- *		lossy_pages		   total number of lossy pages retrieved
- * ----------------
- */
-typedef struct BitmapHeapScanInstrumentation
-{
-	uint64		exact_pages;
-	uint64		lossy_pages;
-} BitmapHeapScanInstrumentation;
-
-/* ----------------
- *	 SharedBitmapState information
- *
- *		BM_INITIAL		TIDBitmap creation is not yet started, so first worker
- *						to see this state will set the state to BM_INPROGRESS
- *						and that process will be responsible for creating
- *						TIDBitmap.
- *		BM_INPROGRESS	TIDBitmap creation is in progress; workers need to
- *						sleep until it's finished.
- *		BM_FINISHED		TIDBitmap creation is done, so now all workers can
- *						proceed to iterate over TIDBitmap.
- * ----------------
- */
-typedef enum
-{
-	BM_INITIAL,
-	BM_INPROGRESS,
-	BM_FINISHED,
-} SharedBitmapState;
-
-/* ----------------
- *	 ParallelBitmapHeapState information
- *		tbmiterator				iterator for scanning current pages
- *		prefetch_iterator		iterator for prefetching ahead of current page
- *		mutex					mutual exclusion for the prefetching variable
- *								and state
- *		prefetch_pages			# pages prefetch iterator is ahead of current
- *		prefetch_target			current target prefetch distance
- *		state					current state of the TIDBitmap
- *		cv						conditional wait variable
- * ----------------
- */
-typedef struct ParallelBitmapHeapState
-{
-	dsa_pointer tbmiterator;
-	dsa_pointer prefetch_iterator;
-	slock_t		mutex;
-	int			prefetch_pages;
-	int			prefetch_target;
-	SharedBitmapState state;
-	ConditionVariable cv;
-} ParallelBitmapHeapState;
-
-/* ----------------
- *	 Instrumentation data for a parallel bitmap heap scan.
- *
- * A shared memory struct that each parallel worker copies its
- * BitmapHeapScanInstrumentation information into at executor shutdown to
- * allow the leader to display the information in EXPLAIN ANALYZE.
- * ----------------
- */
-typedef struct SharedBitmapHeapInstrumentation
-{
-	int			num_workers;
-	BitmapHeapScanInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
-} SharedBitmapHeapInstrumentation;
 
 /* ----------------
  *	 BitmapHeapScanState information
  *
  *		bitmapqualorig	   execution state for bitmapqualorig expressions
  *		tbm				   bitmap obtained from child index scan(s)
- *		pvmbuffer		   buffer for visibility-map lookups of prefetched pages
  *		stats			   execution statistics
- *		prefetch_iterator  iterator for prefetching ahead of current page
- *		prefetch_pages	   # pages prefetch iterator is ahead of current
- *		prefetch_target    current target prefetch distance
- *		prefetch_maximum   maximum value for prefetch_target
  *		initialized		   is node is ready to iterate
- *		shared_prefetch_iterator shared iterator for prefetching
  *		pstate			   shared state for parallel bitmap scan
  *		sinstrument		   statistics for parallel workers
  *		recheck			   do current page's tuples need recheck
- *		blockno			   used to validate pf and current block stay in sync
- *		prefetch_blockno   used to validate pf stays ahead of current block
  * ----------------
  */
+
+/* this struct is defined in nodeBitmapHeapscan.c */
+typedef struct ParallelBitmapHeapState ParallelBitmapHeapState;
+
 typedef struct BitmapHeapScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
 	ExprState  *bitmapqualorig;
 	TIDBitmap  *tbm;
-	Buffer		pvmbuffer;
 	BitmapHeapScanInstrumentation stats;
-	TBMIterator *prefetch_iterator;
-	int			prefetch_pages;
-	int			prefetch_target;
-	int			prefetch_maximum;
 	bool		initialized;
-	TBMSharedIterator *shared_prefetch_iterator;
 	ParallelBitmapHeapState *pstate;
 	SharedBitmapHeapInstrumentation *sinstrument;
 	bool		recheck;
-	BlockNumber blockno;
-	BlockNumber prefetch_blockno;
 } BitmapHeapScanState;
 
 /* ----------------
@@ -1894,6 +1884,7 @@ typedef struct TidScanState
  *		trss_mintid			the lowest TID in the scan range
  *		trss_maxtid			the highest TID in the scan range
  *		trss_inScan			is a scan currently in progress?
+ *		trss_pscanlen		size of parallel heap scan descriptor
  * ----------------
  */
 typedef struct TidRangeScanState
@@ -1903,6 +1894,7 @@ typedef struct TidRangeScanState
 	ItemPointerData trss_mintid;
 	ItemPointerData trss_maxtid;
 	bool		trss_inScan;
+	Size		trss_pscanlen;
 } TidRangeScanState;
 
 /* ----------------
@@ -2267,31 +2259,6 @@ struct MemoizeEntry;
 struct MemoizeTuple;
 struct MemoizeKey;
 
-typedef struct MemoizeInstrumentation
-{
-	uint64		cache_hits;		/* number of rescans where we've found the
-								 * scan parameter values to be cached */
-	uint64		cache_misses;	/* number of rescans where we've not found the
-								 * scan parameter values to be cached. */
-	uint64		cache_evictions;	/* number of cache entries removed due to
-									 * the need to free memory */
-	uint64		cache_overflows;	/* number of times we've had to bypass the
-									 * cache when filling it due to not being
-									 * able to free enough space to store the
-									 * current scan's tuples. */
-	uint64		mem_peak;		/* peak memory usage in bytes */
-} MemoizeInstrumentation;
-
-/* ----------------
- *	 Shared memory container for per-worker memoize information
- * ----------------
- */
-typedef struct SharedMemoizeInfo
-{
-	int			num_workers;
-	MemoizeInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
-} SharedMemoizeInfo;
-
 /* ----------------
  *	 MemoizeState information
  *
@@ -2348,16 +2315,6 @@ typedef struct PresortedKeyData
 } PresortedKeyData;
 
 /* ----------------
- *	 Shared memory container for per-worker sort information
- * ----------------
- */
-typedef struct SharedSortInfo
-{
-	int			num_workers;
-	TuplesortInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
-} SharedSortInfo;
-
-/* ----------------
  *	 SortState information
  * ----------------
  */
@@ -2376,40 +2333,6 @@ typedef struct SortState
 	SharedSortInfo *shared_info;	/* one entry per worker */
 } SortState;
 
-/* ----------------
- *	 Instrumentation information for IncrementalSort
- * ----------------
- */
-typedef struct IncrementalSortGroupInfo
-{
-	int64		groupCount;
-	int64		maxDiskSpaceUsed;
-	int64		totalDiskSpaceUsed;
-	int64		maxMemorySpaceUsed;
-	int64		totalMemorySpaceUsed;
-	bits32		sortMethods;	/* bitmask of TuplesortMethod */
-} IncrementalSortGroupInfo;
-
-typedef struct IncrementalSortInfo
-{
-	IncrementalSortGroupInfo fullsortGroupInfo;
-	IncrementalSortGroupInfo prefixsortGroupInfo;
-} IncrementalSortInfo;
-
-/* ----------------
- *	 Shared memory container for per-worker incremental sort information
- * ----------------
- */
-typedef struct SharedIncrementalSortInfo
-{
-	int			num_workers;
-	IncrementalSortInfo sinfo[FLEXIBLE_ARRAY_MEMBER];
-} SharedIncrementalSortInfo;
-
-/* ----------------
- *	 IncrementalSortState information
- * ----------------
- */
 typedef enum
 {
 	INCSORT_LOADFULLSORT,
@@ -2451,27 +2374,6 @@ typedef struct GroupState
 	ExprState  *eqfunction;		/* equality function */
 	bool		grp_done;		/* indicates completion of Group scan */
 } GroupState;
-
-/* ---------------------
- *	per-worker aggregate information
- * ---------------------
- */
-typedef struct AggregateInstrumentation
-{
-	Size		hash_mem_peak;	/* peak hash table memory usage */
-	uint64		hash_disk_used; /* kB of disk space used */
-	int			hash_batches_used;	/* batches used during entire execution */
-} AggregateInstrumentation;
-
-/* ----------------
- *	 Shared memory container for per-worker aggregate information
- * ----------------
- */
-typedef struct SharedAggInfo
-{
-	int			num_workers;
-	AggregateInstrumentation sinstrument[FLEXIBLE_ARRAY_MEMBER];
-} SharedAggInfo;
 
 /* ---------------------
  *	AggState information
@@ -2536,7 +2438,8 @@ typedef struct AggState
 	/* these fields are used in AGG_HASHED and AGG_MIXED modes: */
 	bool		table_filled;	/* hash table filled yet? */
 	int			num_hashes;
-	MemoryContext hash_metacxt; /* memory for hash table itself */
+	MemoryContext hash_metacxt; /* memory for hash table bucket array */
+	MemoryContext hash_tuplescxt;	/* memory for hash table tuples */
 	struct LogicalTapeSet *hash_tapeset;	/* tape set for hash spill tapes */
 	struct HashAggSpill *hash_spills;	/* HashAggSpill for each grouping set,
 										 * exists only during first pass */
@@ -2562,7 +2465,7 @@ typedef struct AggState
 										 * per-group pointers */
 
 	/* support for evaluation of agg input expressions: */
-#define FIELDNO_AGGSTATE_ALL_PERGROUPS 53
+#define FIELDNO_AGGSTATE_ALL_PERGROUPS 54
 	AggStatePerGroup *all_pergroups;	/* array of first ->pergroups, than
 										 * ->hash_pergroup */
 	SharedAggInfo *shared_info; /* one entry per worker */
@@ -2749,29 +2652,6 @@ typedef struct GatherMergeState
 } GatherMergeState;
 
 /* ----------------
- *	 Values displayed by EXPLAIN ANALYZE
- * ----------------
- */
-typedef struct HashInstrumentation
-{
-	int			nbuckets;		/* number of buckets at end of execution */
-	int			nbuckets_original;	/* planned number of buckets */
-	int			nbatch;			/* number of batches at end of execution */
-	int			nbatch_original;	/* planned number of batches */
-	Size		space_peak;		/* peak memory usage in bytes */
-} HashInstrumentation;
-
-/* ----------------
- *	 Shared memory container for per-worker hash information
- * ----------------
- */
-typedef struct SharedHashInfo
-{
-	int			num_workers;
-	HashInstrumentation hinstrument[FLEXIBLE_ARRAY_MEMBER];
-} SharedHashInfo;
-
-/* ----------------
  *	 HashState information
  * ----------------
  */
@@ -2806,29 +2686,36 @@ typedef struct HashState
 /* ----------------
  *	 SetOpState information
  *
- *		Even in "sorted" mode, SetOp nodes are more complex than a simple
- *		Unique, since we have to count how many duplicates to return.  But
- *		we also support hashing, so this is really more like a cut-down
- *		form of Agg.
+ *		SetOp nodes support either sorted or hashed de-duplication.
+ *		The sorted mode is a bit like MergeJoin, the hashed mode like Agg.
  * ----------------
  */
-/* this struct is private in nodeSetOp.c: */
-typedef struct SetOpStatePerGroupData *SetOpStatePerGroup;
+typedef struct SetOpStatePerInput
+{
+	TupleTableSlot *firstTupleSlot; /* first tuple of current group */
+	int64		numTuples;		/* number of tuples in current group */
+	TupleTableSlot *nextTupleSlot;	/* next input tuple, if already read */
+	bool		needGroup;		/* do we need to load a new group? */
+} SetOpStatePerInput;
 
 typedef struct SetOpState
 {
 	PlanState	ps;				/* its first field is NodeTag */
-	ExprState  *eqfunction;		/* equality comparator */
+	bool		setop_done;		/* indicates completion of output scan */
+	int64		numOutput;		/* number of dups left to output */
+	int			numCols;		/* number of grouping columns */
+
+	/* these fields are used in SETOP_SORTED mode: */
+	SortSupport sortKeys;		/* per-grouping-field sort data */
+	SetOpStatePerInput leftInput;	/* current outer-relation input state */
+	SetOpStatePerInput rightInput;	/* current inner-relation input state */
+	bool		need_init;		/* have we read the first tuples yet? */
+
+	/* these fields are used in SETOP_HASHED mode: */
 	Oid		   *eqfuncoids;		/* per-grouping-field equality fns */
 	FmgrInfo   *hashfunctions;	/* per-grouping-field hash fns */
-	bool		setop_done;		/* indicates completion of output scan */
-	long		numOutput;		/* number of dups left to output */
-	/* these fields are used in SETOP_SORTED mode: */
-	SetOpStatePerGroup pergroup;	/* per-group working state */
-	HeapTuple	grp_firstTuple; /* copy of first tuple of current group */
-	/* these fields are used in SETOP_HASHED mode: */
 	TupleHashTable hashtable;	/* hash table with one entry per group */
-	MemoryContext tableContext; /* memory context containing hash table */
+	MemoryContext tuplesContext;	/* context containing hash table's tuples */
 	bool		table_filled;	/* hash table filled yet? */
 	TupleHashIterator hashiter; /* for iterating through hash table */
 } SetOpState;

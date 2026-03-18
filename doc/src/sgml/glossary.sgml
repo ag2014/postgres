@@ -81,6 +81,46 @@
    </glossdef>
   </glossentry>
 
+  <glossentry id="glossary-application-time">
+   <glossterm>Application time</glossterm>
+   <glossdef>
+    <para>
+     In a <glossterm linkend="glossary-temporal-table">temporal table</glossterm>,
+     the dimension of time that represents when the entity described by the table
+     changed (as opposed to the table itself).
+    </para>
+    <para>
+     For more information, see
+     <xref linkend="ddl-temporal-tables"/>.
+    </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry id="glossary-aio">
+   <glossterm>Asynchronous <acronym>I/O</acronym></glossterm>
+   <acronym>AIO</acronym>
+   <indexterm>
+    <primary>Asynchronous <acronym>I/O</acronym></primary>
+   </indexterm>
+   <glossdef>
+    <para>
+     Asynchronous <acronym>I/O</acronym> (<acronym>AIO</acronym>) describes
+     performing <acronym>I/O</acronym> in a non-blocking way (asynchronously),
+     in contrast to synchronous <acronym>I/O</acronym>, which blocks for the
+     entire duration of the <acronym>I/O</acronym>.
+    </para>
+    <para>
+     With <acronym>AIO</acronym>, starting an <acronym>I/O</acronym> operation
+     is separated from waiting for the result of the operation, allowing
+     multiple <acronym>I/O</acronym> operations to be initiated concurrently,
+     as well as performing <acronym>CPU</acronym> heavy operations
+     concurrently with <acronym>I/O</acronym>. The price for that increased
+     concurrency is increased complexity.
+    </para>
+    <glossseealso otherterm="glossary-io" />
+   </glossdef>
+  </glossentry>
+
   <glossentry id="glossary-atomic">
    <glossterm>Atomic</glossterm>
    <glossdef>
@@ -851,6 +891,11 @@
    </glossdef>
   </glossentry>
 
+  <glossentry>
+   <glossterm>GMT</glossterm>
+   <glosssee otherterm="glossary-utc" />
+  </glossentry>
+
   <glossentry id="glossary-grant">
    <glossterm>Grant</glossterm>
    <glossdef>
@@ -863,6 +908,23 @@
     <para>
      For more information, see
      <xref linkend="sql-grant"/>.
+    </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry id="glossary-guc">
+   <glossterm>GUC</glossterm>
+   <glossdef>
+    <para>
+     Based on a short-hand for Grand Unified Configuration, the subsystem
+     which controls server configuration, it is now a commonly used term
+     for the individual configuration parameters themselves. Typically meant
+     to refer to user settable parameters, it can also refer to internal or
+     build-time parameters.
+    </para>
+    <para>
+     For information on working with configuration parameters, see
+     <xref linkend="config-setting"/>.
     </para>
    </glossdef>
   </glossentry>
@@ -930,6 +992,20 @@
     <para>
      For more information, see <xref linkend="backup-incremental-backup"/>.
     </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry id="glossary-io">
+   <glossterm>Input/Output</glossterm>
+   <acronym>I/O</acronym>
+   <glossdef>
+    <para>
+     Input/Output (<acronym>I/O</acronym>) describes the communication between
+     a program and peripheral devices. In the context of database systems,
+     <acronym>I/O</acronym> commonly, but not exclusively, refers to
+     interaction with storage devices or the network.
+    </para>
+    <glossseealso otherterm="glossary-aio" />
    </glossdef>
   </glossentry>
 
@@ -1375,11 +1451,15 @@
    <glossterm>Relation</glossterm>
    <glossdef>
     <para>
-     The generic term for all objects in a
-     <glossterm linkend="glossary-database">database</glossterm>
-     that have a name and a list of
-     <glossterm linkend="glossary-attribute">attributes</glossterm>
-     defined in a specific order.
+     Mathematically, a <firstterm>relation</firstterm> is a set of
+     <glossterm linkend="glossary-tuple">tuples</glossterm>;
+     this is the sense meant in the term "relational database".
+    </para>
+
+    <para>
+     In <productname>PostgreSQL</productname>, "relation" is commonly used to
+     mean an <glossterm linkend="glossary-sql-object">SQL object</glossterm>
+     that has a name and a list of attributes defined in a specific order.
      <glossterm linkend="glossary-table">Tables</glossterm>,
      <glossterm linkend="glossary-sequence">sequences</glossterm>,
      <glossterm linkend="glossary-view">views</glossterm>,
@@ -1387,15 +1467,14 @@
      <glossterm linkend="glossary-materialized-view">materialized views</glossterm>,
      composite types, and
      <glossterm linkend="glossary-index">indexes</glossterm> are all relations.
+     A relation in this sense is a container or a descriptor for a set of tuples.
     </para>
+
     <para>
-     More generically, a relation is a set of tuples; for example,
-     the result of a query is also a relation.
-    </para>
-    <para>
-     In <productname>PostgreSQL</productname>,
-     <firstterm>Class</firstterm> is an archaic synonym for
-     <firstterm>relation</firstterm>.
+     <firstterm>Class</firstterm> is an alternative but archaic term.
+     The system catalog
+     <link linkend="catalog-pg-class"><structname>pg_class</structname></link>
+     holds an entry for each <productname>PostgreSQL</productname> relation.
     </para>
    </glossdef>
   </glossentry>
@@ -1800,6 +1879,22 @@
    </glossdef>
   </glossentry>
 
+  <glossentry id="glossary-system-time">
+   <glossterm>System time</glossterm>
+   <glossdef>
+    <para>
+     In a <glossterm linkend="glossary-temporal-table">temporal table</glossterm>,
+     the dimension of time that represents when the table itself was changed
+     (as opposed to the entity the table describes).
+     Often used for auditing, compliance, and debugging.
+    </para>
+    <para>
+     For more information, see
+     <xref linkend="ddl-temporal-tables"/>.
+    </para>
+   </glossdef>
+  </glossentry>
+
   <glossentry id="glossary-table">
    <glossterm>Table</glossterm>
    <glossdef>
@@ -1834,6 +1929,22 @@
     <para>
      For more information, see
      <xref linkend="manage-ag-tablespaces"/>.
+    </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry id="glossary-temporal-table">
+   <glossterm>Temporal table</glossterm>
+   <glossdef>
+    <para>
+     <glossterm linkend="glossary-table">Tables</glossterm>
+     that track <glossterm linkend="glossary-application-time">application time</glossterm>
+     or <glossterm linkend="glossary-system-time">system time</glossterm> (or both).
+     Not to be confused with <glossterm linkend="glossary-temporary-table">temporary tables</glossterm>.
+    </para>
+    <para>
+     For more information, see
+     <xref linkend="ddl-temporal-tables"/>.
     </para>
    </glossdef>
   </glossentry>
@@ -2043,6 +2154,17 @@
     <para>
      For more information, see
      <xref linkend="sql-createusermapping"/>.
+    </para>
+   </glossdef>
+  </glossentry>
+
+  <glossentry id="glossary-utc">
+   <glossterm>UTC</glossterm>
+   <glossdef>
+    <para>
+     Universal Coordinated Time, the primary global time reference,
+     approximately the time prevailing at the zero meridian of longitude.
+     Often but inaccurately referred to as GMT (Greenwich Mean Time).
     </para>
    </glossdef>
   </glossentry>

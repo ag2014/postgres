@@ -4,7 +4,7 @@
  *	  postgres transaction access method support code
  *
  *
- * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/transam.h
@@ -255,6 +255,72 @@ typedef struct TransamVariablesData
 } TransamVariablesData;
 
 
+
+/*
+ * TransactionIdPrecedes --- is id1 logically < id2?
+ */
+static inline bool
+TransactionIdPrecedes(TransactionId id1, TransactionId id2)
+{
+	/*
+	 * If either ID is a permanent XID then we can just do unsigned
+	 * comparison.  If both are normal, do a modulo-2^32 comparison.
+	 */
+	int32		diff;
+
+	if (!TransactionIdIsNormal(id1) || !TransactionIdIsNormal(id2))
+		return (id1 < id2);
+
+	diff = (int32) (id1 - id2);
+	return (diff < 0);
+}
+
+/*
+ * TransactionIdPrecedesOrEquals --- is id1 logically <= id2?
+ */
+static inline bool
+TransactionIdPrecedesOrEquals(TransactionId id1, TransactionId id2)
+{
+	int32		diff;
+
+	if (!TransactionIdIsNormal(id1) || !TransactionIdIsNormal(id2))
+		return (id1 <= id2);
+
+	diff = (int32) (id1 - id2);
+	return (diff <= 0);
+}
+
+/*
+ * TransactionIdFollows --- is id1 logically > id2?
+ */
+static inline bool
+TransactionIdFollows(TransactionId id1, TransactionId id2)
+{
+	int32		diff;
+
+	if (!TransactionIdIsNormal(id1) || !TransactionIdIsNormal(id2))
+		return (id1 > id2);
+
+	diff = (int32) (id1 - id2);
+	return (diff > 0);
+}
+
+/*
+ * TransactionIdFollowsOrEquals --- is id1 logically >= id2?
+ */
+static inline bool
+TransactionIdFollowsOrEquals(TransactionId id1, TransactionId id2)
+{
+	int32		diff;
+
+	if (!TransactionIdIsNormal(id1) || !TransactionIdIsNormal(id2))
+		return (id1 >= id2);
+
+	diff = (int32) (id1 - id2);
+	return (diff >= 0);
+}
+
+
 /* ----------------
  *		extern declarations
  * ----------------
@@ -274,10 +340,6 @@ extern bool TransactionIdDidAbort(TransactionId transactionId);
 extern void TransactionIdCommitTree(TransactionId xid, int nxids, TransactionId *xids);
 extern void TransactionIdAsyncCommitTree(TransactionId xid, int nxids, TransactionId *xids, XLogRecPtr lsn);
 extern void TransactionIdAbortTree(TransactionId xid, int nxids, TransactionId *xids);
-extern bool TransactionIdPrecedes(TransactionId id1, TransactionId id2);
-extern bool TransactionIdPrecedesOrEquals(TransactionId id1, TransactionId id2);
-extern bool TransactionIdFollows(TransactionId id1, TransactionId id2);
-extern bool TransactionIdFollowsOrEquals(TransactionId id1, TransactionId id2);
 extern TransactionId TransactionIdLatest(TransactionId mainxid,
 										 int nxids, const TransactionId *xids);
 extern XLogRecPtr TransactionIdGetCommitLSN(TransactionId xid);
@@ -368,6 +430,49 @@ FullTransactionIdNewer(FullTransactionId a, FullTransactionId b)
 	if (FullTransactionIdFollows(a, b))
 		return a;
 	return b;
+}
+
+/*
+ * Compute FullTransactionId for the given TransactionId, assuming xid was
+ * between [oldestXid, nextXid] at the time when TransamVariables->nextXid was
+ * nextFullXid.  When adding calls, evaluate what prevents xid from preceding
+ * oldestXid if SetTransactionIdLimit() runs between the collection of xid and
+ * the collection of nextFullXid.
+ */
+static inline FullTransactionId
+FullTransactionIdFromAllowableAt(FullTransactionId nextFullXid,
+								 TransactionId xid)
+{
+	uint32		epoch;
+
+	/* Special transaction ID. */
+	if (!TransactionIdIsNormal(xid))
+		return FullTransactionIdFromEpochAndXid(0, xid);
+
+	Assert(TransactionIdPrecedesOrEquals(xid,
+										 XidFromFullTransactionId(nextFullXid)));
+
+	/*
+	 * The 64 bit result must be <= nextFullXid, since nextFullXid hadn't been
+	 * issued yet when xid was in the past.  The xid must therefore be from
+	 * the epoch of nextFullXid or the epoch before.  We know this because we
+	 * must remove (by freezing) an XID before assigning the XID half an epoch
+	 * ahead of it.
+	 *
+	 * The unlikely() branch hint is dubious.  It's perfect for the first 2^32
+	 * XIDs of a cluster's life.  Right at 2^32 XIDs, misprediction shoots to
+	 * 100%, then improves until perfection returns 2^31 XIDs later.  Since
+	 * current callers pass relatively-recent XIDs, expect >90% prediction
+	 * accuracy overall.  This favors average latency over tail latency.
+	 */
+	epoch = EpochFromFullTransactionId(nextFullXid);
+	if (unlikely(xid > XidFromFullTransactionId(nextFullXid)))
+	{
+		Assert(epoch != 0);
+		epoch--;
+	}
+
+	return FullTransactionIdFromEpochAndXid(epoch, xid);
 }
 
 #endif							/* FRONTEND */
